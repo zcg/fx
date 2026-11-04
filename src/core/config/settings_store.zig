@@ -132,6 +132,9 @@ pub const UserSettingsPatch = struct {
     /// itself is never here: a local runtime reads it from the named
     /// environment variable, and one with a keychain stores it there.
     provider_definition: ?ConfiguredProviderPatch = null,
+    /// Removes a named connection and, with it, any stored key. Distinct from a
+    /// null `provider_definition`, which means "leave unchanged".
+    remove_provider: ?[]const u8 = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -161,7 +164,8 @@ pub const UserSettingsPatch = struct {
             self.provider_strict == null and
             self.context == null and
             self.remove == null and
-            self.provider_definition == null;
+            self.provider_definition == null and
+            self.remove_provider == null;
     }
 };
 
@@ -1273,6 +1277,9 @@ fn applyUserPatchToRoot(
     if (patch.provider_definition) |definition| {
         application.changed = try putConfiguredProvider(arena, &root.object, definition) or application.changed;
     }
+    if (patch.remove_provider) |name| {
+        application.changed = removeConfiguredProvider(&root.object, name) or application.changed;
+    }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", value.label()) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
@@ -1963,6 +1970,24 @@ fn putConfiguredProvider(
     } else {
         try providers.put(arena, definition.name, .{ .object = body });
         changed = true;
+    }
+    return changed;
+}
+
+/// Removes one named connection. The `providers` object itself is left in place
+/// even when it empties, so a settings file does not lose a section the user may
+/// add to again; the model saved for that connection is removed with it.
+fn removeConfiguredProvider(root: *std.json.ObjectMap, name: []const u8) bool {
+    var changed = false;
+    if (root.getPtr("providers")) |value| {
+        if (value.* == .object) {
+            if (value.object.orderedRemove(name)) changed = true;
+        }
+    }
+    if (root.getPtr("models")) |value| {
+        if (value.* == .object) {
+            if (value.object.orderedRemove(name)) changed = true;
+        }
     }
     return changed;
 }

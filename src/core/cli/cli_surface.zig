@@ -1171,6 +1171,53 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
     });
 }
 
+/// Deletes a configured connection, its saved model, and its stored key. The
+/// built-in providers are refused: `gateway`, `codex`, and `grok` are not
+/// connections the profile defines, so there is nothing to delete.
+fn removeConfiguredProviderCommand(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    name: []const u8,
+) !RunResult {
+    _ = cfg;
+    if (name.len == 0 or name.len > 64) {
+        try writeStderr(deps, "fx provider remove: expected a configured provider name\n");
+        return usage_failure;
+    }
+    if (provider_catalog.parse(name) != null) {
+        try writeStderr(deps, "fx provider remove: the built-in providers cannot be removed\n");
+        return usage_failure;
+    }
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{ .remove_provider = name });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => {
+            try writeStderr(deps, "fx provider remove: the settings could not be saved\n");
+            return .handled_failure;
+        },
+        .outcome => |outcome| {
+            if (outcome == .unchanged) {
+                const message = try alloc.print("fx provider remove: no configured provider named {s}\n", .{name});
+                defer alloc.free(message);
+                try writeStderr(deps, message);
+                return .handled_failure;
+            }
+        },
+    }
+    // The stored key goes with the connection; a key left behind would be
+    // unreachable and would outlive the reason it was stored.
+    if (comptime provider_key_store.enabled) {
+        provider_key_store.clear(alloc, name) catch |err| {
+            debug_trace.logf("config", "provider key clear failed err={s}", .{@errorName(err)});
+        };
+    }
+    const message = try alloc.print("Removed provider {s}.\n", .{name});
+    defer alloc.free(message);
+    try writeStdout(deps, message);
+    return .handled_success;
+}
+
 /// The first model a configured provider offers, or null when its catalog
 /// cannot be read. Used when a provider is selected before any model of its own
 /// was saved, so switching to a freshly added provider works instead of asking
@@ -1775,8 +1822,14 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .provider => |rest| {
+            // `fx provider remove <name>` deletes a configured connection and the
+            // key stored with it. The built-in providers are not removable, so
+            // the subcommand applies only to a configured name.
+            if (rest.len == 2 and std.mem.eql(u8, rest[0], "remove")) {
+                return removeConfiguredProviderCommand(alloc, cfg, deps, rest[1]);
+            }
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <name>\n");
+                try writeStderr(deps, "usage: fx provider <name>\n       fx provider remove <name>\n");
                 return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
