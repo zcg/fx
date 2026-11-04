@@ -2744,6 +2744,18 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Hands the typed key to the caller and clears it from the draft, so the
+    /// secret leaves the runtime exactly once. The caller zeroes it.
+    pub fn takeAddProviderKey(self: *Self, alloc: Allocator) ?[]u8 {
+        var draft = &(self.add_provider_draft orelse return null);
+        if (draft.key.items.len == 0) return null;
+        const owned = alloc.dupe(u8, draft.key.items) catch return null;
+        const allocated = draft.key.allocatedSlice();
+        secret.zeroAndFree(alloc, allocated);
+        draft.key = .empty;
+        return owned;
+    }
+
     /// Advances to the next field. Returns the completed field when Enter
     /// finished the last one, so the caller saves from the draft; null on a
     /// normal step or when a required value is still empty.

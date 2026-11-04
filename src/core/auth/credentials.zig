@@ -7,6 +7,7 @@ const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const provider_key_store = @import("provider_key_store.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const oauth = @import("oauth.zig");
@@ -386,8 +387,20 @@ pub fn resolveForProvider(
         const bound = try provider.bind(registry);
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
+            // A key pasted into fx's add-provider flow has no environment
+            // variable to live in, so it is kept encrypted under the profile and
+            // read before the environment. An exported variable still wins when
+            // it is set, because that is the more deliberate of the two.
+            .bearer => |env| blk: {
+                if (io_mod.getenv(env)) |_| {
+                    break :blk .{ .credential = try loadEnvCredential(alloc, env, .configured) };
+                }
+                if (try provider_key_store.load(alloc, bound.label())) |stored| {
+                    break :blk .{ .credential = .{ .token = stored, .source = .configured } };
+                }
+                break :blk .{ .credential = try loadEnvCredential(alloc, env, .configured) };
+            },
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
-            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
         };
     }
     if (provider != .gateway) {

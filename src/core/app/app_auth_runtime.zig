@@ -13,6 +13,8 @@ const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const provider_key_store = @import("../auth/provider_key_store.zig");
+const secret_mod = @import("../auth/secret.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -959,7 +961,8 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Writes the finished draft into settings.
+        /// Writes the finished draft into settings and, when a key was typed,
+        /// stores it encrypted under the profile.
         fn saveAddProviderDraft(app: *App, draft: auth_runtime.AddProviderProjection) !void {
             const name = try app.alloc.dupe(u8, draft.name);
             defer app.alloc.free(name);
@@ -986,12 +989,37 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.cancelAddProvider(app.alloc);
                 return;
             };
+            // A pasted key has no environment variable to live in, so it is kept
+            // encrypted under the profile. A platform whose keychain holds it
+            // reports the store as unsupported, and the definition's environment
+            // variable remains the only source, which is what the flow said.
+            var key_stored = false;
+            if (app.auth.takeAddProviderKey(app.alloc)) |key| {
+                defer secret_mod.zeroAndFree(app.alloc, key);
+                // A platform whose keychain holds the key reports the store as
+                // unsupported. Gating at comptime keeps that branch out of the
+                // binary entirely, and keeps this call from having to name an
+                // error the platform cannot produce.
+                if (comptime provider_key_store.enabled) {
+                    provider_key_store.store(app.alloc, name, key) catch |err| {
+                        debug_trace.logf("auth", "add provider key store failed err={s}", .{@errorName(err)});
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = try app.alloc.print("Saved provider {s}, but the API key could not be stored. Export {s} and try again.", .{ name, env }),
+                        }, true);
+                        app.auth.cancelAddProvider(app.alloc);
+                        return;
+                    };
+                    key_stored = true;
+                }
+            }
             app.auth.cancelAddProvider(app.alloc);
-            try app.writeDomainNotice(.{
-                .topic = "auth",
-                .tone = .neutral,
-                .body = try std.mem.concat(app.alloc, u8, &.{ "Saved provider ", name, ". Its models are listed the next time it is selected." }),
-            }, true);
+            const body = if (key_stored)
+                try app.alloc.print("Saved provider {s} with its API key. Its models are listed the next time it is selected.", .{name})
+            else
+                try app.alloc.print("Saved provider {s}. Its models are listed the next time it is selected.", .{name});
+            try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
         }
 
         /// Polled from the event loop so a save that blocks on a locked key store
