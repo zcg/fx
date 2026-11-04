@@ -171,7 +171,7 @@ fn signalE2ELockContention(fx_dir: std.Io.Dir) void {
     if (!std.mem.eql(u8, enabled, "1")) return;
     var file = fx_dir.createFile(io_mod.getIo(), e2e_lock_contention_file_name, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     }) catch return;
     defer file.close(io_mod.getIo());
     file.writeStreamingAll(io_mod.getIo(), "contended\n") catch {};
@@ -312,7 +312,7 @@ fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
         debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
         return .unusable;
     };
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
     }
@@ -682,7 +682,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
     defer file.close(io_mod.getIo());
 
     const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
     }
@@ -824,15 +824,15 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
 
     const initial_stat = try dir.stat(io_mod.getIo());
     if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) {
+    if (io_mod.inaccessibleToWrite(initial_stat.permissions)) {
         return error.PrivateStatePermissionsUnsupported;
     }
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
+    io_mod.setPermissions(dir, io_mod.permissionsForMode(0o700)) catch {
         return error.PrivateStatePermissionsUnsupported;
     };
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (io_mod.modeMismatch(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
     return .{ .dir = dir };
@@ -1134,7 +1134,7 @@ const FakeOAuthKeychain = struct {
 fn writeTestAuthFile(dir: std.Io.Dir, contents: []const u8) !void {
     var file = try dir.createFile(std.testing.io, auth_file_name, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     });
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, contents);
@@ -1241,8 +1241,8 @@ test "OAuth refresh preflight honors file authority after Keychain migration fai
     try writeTestAuthFile(tmp.dir, test_session_json);
     var file = try tmp.dir.openFile(std.testing.io, auth_file_name, .{});
     defer file.close(std.testing.io);
-    try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o400));
-    defer file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o600)) catch {};
+    try io_mod.setPermissions(file, io_mod.permissionsForMode(0o400));
+    defer io_mod.setPermissions(file, io_mod.permissionsForMode(0o600)) catch {};
     var fake = FakeOAuthKeychain{ .alloc = alloc, .fail_store = true };
     defer fake.deinit();
     var mutation = try testKeychainMutation(tmp.dir, fake.backend());
@@ -1386,7 +1386,7 @@ test "oauth session loading propagates allocation failures" {
     defer tmp.cleanup();
 
     var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     });
     try file.writeStreamingAll(
         std.testing.io,
@@ -1417,7 +1417,7 @@ test "OAuth mutation distinguishes an invalid session from an absent session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     });
     try file.writeStreamingAll(std.testing.io, "{\"version\":2}\n");
     file.close(std.testing.io);

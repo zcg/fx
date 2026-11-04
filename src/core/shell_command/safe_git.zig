@@ -340,7 +340,7 @@ const SentinelRepo = struct {
 
     fn writeExecutable(self: SentinelRepo, absolute: []const u8) !void {
         const script = try self.arena.print("#!/bin/sh\necho ran >> '{s}'\ncat\n", .{self.log});
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = absolute, .data = script, .flags = .{ .permissions = .fromMode(0o755) } });
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = absolute, .data = script, .flags = .{ .permissions = io_mod.permissionsForMode(0o755) } });
     }
 
     fn write(self: SentinelRepo, sub_path: []const u8, data: []const u8) !void {

@@ -202,7 +202,7 @@ test "provider version cache rejects directories symlinks and hardlinks" {
                 .data = "{\"version\":\"1.2.3\",\"checked_at_ms\":500}",
             });
             switch (kind) {
-                .directory => try tmp.dir.createDir(std.testing.io, name, .fromMode(0o700)),
+                .directory => try tmp.dir.createDir(std.testing.io, name, io_mod.permissionsForMode(0o700)),
                 .symlink => try tmp.dir.symLink(std.testing.io, "target", name, .{}),
                 .hardlink => {
                     const name_z = try alloc.dupeSentinel(u8, name, 0);

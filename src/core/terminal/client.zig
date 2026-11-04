@@ -602,9 +602,16 @@ pub const Runtime = struct {
         const home = self.profile_home orelse io_mod.homeDir() orelse
             return error.HomeNotSet;
 
-        const pid = std.c.getpid();
+        const pid_number = io_mod.currentProcessId();
+        const pid: std.posix.pid_t = if (comptime builtin.target.os.tag == .windows)
+            // A Windows `pid_t` is a handle, and the launcher's protocol carries
+            // the owning process as a number, so it is rebuilt from the value
+            // `GetCurrentProcessId` reported.
+            @ptrFromInt(@as(usize, @intCast(pid_number)))
+        else
+            @intCast(pid_number);
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid});
+        const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid_number});
         const token = try self.process_provider.captureToken(alloc, pid_text);
         var instance_bytes: [16]u8 = undefined;
         zio.random(&instance_bytes);
@@ -612,7 +619,7 @@ pub const Runtime = struct {
 
         const backend = try alloc.create(Backend);
         errdefer alloc.destroy(backend);
-        backend.process_owner = try contracts.ProcessOwner.init(pid, token.view());
+        backend.process_owner = try contracts.ProcessOwner.init(@intCast(pid_number), token.view());
         const owner_identity = try terminal_store.formatOwnerIdentity(
             &backend.owner_identity_bytes,
             &instance,
@@ -634,7 +641,7 @@ pub const Runtime = struct {
         debug_trace.logf(
             "terminal_client",
             "terminal backend opened pid={d}",
-            .{pid},
+            .{io_mod.pidAsNumber(pid)},
         );
         return backend;
     }
@@ -1323,6 +1330,7 @@ fn processGoneWithin(pid: std.posix.pid_t, timeout_ms: i64) bool {
 }
 
 test "in-process registry starts writes to and stops a real terminal" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
     defer fixture.deinit();

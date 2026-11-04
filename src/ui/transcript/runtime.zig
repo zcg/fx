@@ -3311,7 +3311,7 @@ test "historical command detail keeps artifact handles after command block attac
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -4875,7 +4875,14 @@ pub const TranscriptSlot = blk: {
 };
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    /// Where the screen is drawn.
+    ///
+    /// It cannot default to `io_mod.stdoutFile()`: on Windows that handle comes
+    /// from the process environment block, which Zig cannot read at comptime,
+    /// and a field default must be comptime-known. `initBacking` fills it in for
+    /// a runtime that was not handed a sink, so the default is only ever
+    /// observed through a runtime that has been initialized.
+    stdout_file: std.Io.File = .{ .handle = undefined, .flags = .{ .nonblocking = false } },
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
@@ -5044,6 +5051,11 @@ pub const TranscriptRuntime = struct {
     pub noinline fn init() TranscriptRuntime {
         var result: TranscriptRuntime = .{
             .notebook = .{ .compact_transcript_source_cache = undefined },
+            // The screen writes here, so it names a real stream from the start.
+            // The field itself cannot carry this default: on Windows the handle
+            // comes from the process environment block, which Zig cannot read at
+            // comptime, and a field default must be comptime-known.
+            .stdout_file = io_mod.stdoutFile(),
         };
         for (&result.notebook.compact_transcript_source_cache.entries) |*entry| {
             entry.* = null;

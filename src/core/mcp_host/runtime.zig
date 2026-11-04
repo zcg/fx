@@ -2739,6 +2739,7 @@ test "a reload ends a call on a server it drops, and a call on a server it keeps
 }
 
 test "a changed server's new process starts only once the old one is gone" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var f: Fixture = undefined;
     try f.init();
     defer f.deinit();

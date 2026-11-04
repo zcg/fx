@@ -50,8 +50,7 @@ pub fn detectTheme(_: std.mem.Allocator, terminal_state: *const shell_runtime.Te
 /// query then costs one round trip instead of the whole timeout, which stays
 /// only for terminals that answer neither.
 fn queryTerminalBackground(terminal_state: *const shell_runtime.TerminalState) ?TerminalBackground {
-    var stdout_file = std.Io.File.stdout();
-    stdout_file.writeStreamingAll(io_mod.getIo(), terminal_sequences.theme_background_query_with_fence) catch return null;
+    io_mod.writeFd(io_mod.stdoutHandle(), terminal_sequences.theme_background_query_with_fence) catch return null;
 
     // Room for the longest background reply plus a full device attributes list.
     var buf: [192]u8 = undefined;

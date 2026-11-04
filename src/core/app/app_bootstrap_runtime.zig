@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 const agents = @import("../agents/agents.zig");
 const build_options = @import("build_options");
 const app_lifecycle = @import("app_lifecycle.zig");
@@ -410,7 +411,6 @@ pub fn Runtime(comptime App: type) type {
             launch_overrides: LaunchOverrides,
         ) !void {
             errdefer app.deinit();
-
             var startup = try deps.bootstrap_interactive_app(.{
                 .alloc = app.alloc,
                 .terminal = &app.terminal,
@@ -1124,7 +1124,7 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         4,
         "default-model",
         24,
-        resizeHandlerForTest,
+        test_resize_handler,
         testDeps(),
         .{},
     );
@@ -1144,13 +1144,25 @@ fn runBootstrapWithOverridesForTest(app: *TestApp, capture: *TestCapture, overri
         4,
         "default-model",
         24,
-        resizeHandlerForTest,
+        test_resize_handler,
         testDeps(),
         overrides,
     );
 }
 
+/// A resize handler for the tests that drive bootstrap.
+///
+/// POSIX delivers a resize as a signal, so the handler takes the signal number.
+/// Windows has no signal at all and its `std.posix.SIG` is `void`, so the same
+/// role is filled by a handler that takes nothing.
 fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
+
+fn resizeHandlerForTestNoSignal() callconv(.c) void {}
+
+const test_resize_handler: app_lifecycle.ResizeHandler = if (std.posix.Sigaction == void)
+    resizeHandlerForTestNoSignal
+else
+    resizeHandlerForTest;
 
 test "app_bootstrap_runtime applies interactive launch flag overrides" {
     const alloc = std.testing.allocator;

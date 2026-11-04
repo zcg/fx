@@ -142,8 +142,7 @@ fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime det
 }
 
 fn processId() i64 {
-    if (comptime builtin.target.os.tag == .wasi) return 0;
-    return std.c.getpid();
+    return @intCast(io_mod.currentProcessId());
 }
 
 // ---------------------------------------------------------------------------
@@ -4313,7 +4312,7 @@ fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
 
 fn copyOpenedFile(source: *std.Io.File, to: std.Io.Dir, name: []const u8) !void {
     const io = io_mod.getIo();
-    var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600), .resolve_beneath = true });
+    var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = io_mod.permissionsForMode(0o600), .resolve_beneath = true });
     defer target.close(io);
     var buffer: [16 * 1024]u8 = undefined;
     var offset: u64 = 0;
@@ -7770,10 +7769,10 @@ test "recover copies the folders outside the manager, never a link, and says whe
         defer root.close();
         var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, id);
         defer owner.close();
-        try owner.dir.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
+        try owner.dir.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = io_mod.permissionsForMode(0o600) } });
         var nested = try io_mod.openOrCreateVerifiedPrivateDirFromDir(owner.dir, "nested");
         defer nested.close();
-        try nested.dir.writeFile(io, .{ .sub_path = "inner.txt", .data = "inner", .flags = .{ .permissions = .fromMode(0o600) } });
+        try nested.dir.writeFile(io, .{ .sub_path = "inner.txt", .data = "inner", .flags = .{ .permissions = io_mod.permissionsForMode(0o600) } });
         try owner.dir.symLink(io, "/etc/hosts", "link", .{});
     }
 
@@ -7792,7 +7791,7 @@ test "recover copies the folders outside the manager, never a link, and says whe
     defer testing.allocator.free(inner);
     try testing.expectEqualStrings("inner", inner);
     const stat = try dir.statFile(io, "nested/inner.txt", .{});
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
 
     // The copy is a root session of its own; the source is unchanged.
@@ -7812,12 +7811,12 @@ test "a resume makes a hand-made ~/.fx private instead of refusing the session" 
     defer testing.allocator.free(id);
     try OldSideFolder.commitTurn(&t, s);
     s.close();
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), ".fx", .fromMode(0o755), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), ".fx", io_mod.permissionsForMode(0o755), .{});
 
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
     r.close();
     const stat = try t.tmp.dir.statFile(io_mod.getIo(), ".fx", .{ .follow_symlinks = false });
-    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 /// The side folder an older v2 session kept (D27), with one body of each
@@ -8040,7 +8039,7 @@ test "a web-fetch download on v2 is a read-only blob the model opens by its path
     const len = try file.readPositionalAll(io_mod.getIo(), &buffer, 0);
     try testing.expectEqualStrings("%PDF-1.7 a download", buffer[0..len]);
     const stat = try file.stat(io_mod.getIo());
-    try testing.expectEqual(@as(u32, 0o400), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(u32, 0o400), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
     try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
 }
 
@@ -8366,8 +8365,8 @@ test "a turn the store cannot start keeps its prompt images inline and does not 
     try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
     var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
     defer root.close(io);
-    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
-    defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    io_mod.setPermissions(root, io_mod.permissionsForMode(0o500)) catch return error.SkipZigTest;
+    defer io_mod.setPermissions(root, io_mod.permissionsForMode(0o700)) catch {};
     try s.savePromptImages(arena.allocator(), &images);
     try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
     try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
@@ -8489,14 +8488,14 @@ const V1Home = struct {
             };
             switch (entry.kind) {
                 // Another kind may have made it.
-                .directory => fx.dir.createDir(io, entry.path, .fromMode(0o700)) catch |err| switch (err) {
+                .directory => fx.dir.createDir(io, entry.path, io_mod.permissionsForMode(0o700)) catch |err| switch (err) {
                     error.PathAlreadyExists => {},
                     else => return err,
                 },
                 .file => try fx.dir.writeFile(io, .{
                     .sub_path = entry.path,
                     .data = try source.readFileAlloc(io, entry.path, a, .limited(1 << 24)),
-                    .flags = .{ .permissions = .fromMode(0o600) },
+                    .flags = .{ .permissions = io_mod.permissionsForMode(0o600) },
                 }),
                 else => return error.UnexpectedFixtureEntry,
             }
@@ -8531,7 +8530,7 @@ const V1Home = struct {
         defer dir.close();
         var target = if (folder) |sub| try io_mod.openOrCreateVerifiedPrivateDir(&dir, sub) else null;
         defer if (target) |*value| value.close();
-        try (if (target) |value| value.dir else dir.dir).writeFile(io_mod.getIo(), .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+        try (if (target) |value| value.dir else dir.dir).writeFile(io_mod.getIo(), .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = io_mod.permissionsForMode(0o600) } });
     }
 
     /// v1's `session.json` of `id`. The arena's.
@@ -8809,7 +8808,7 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
         defer alloc.free(path);
         var dir = try t.tmp.dir.openDir(io, path, .{});
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        io_mod.setPermissions(dir, io_mod.permissionsForMode(0o755)) catch return error.SkipZigTest;
     }
 
     const s = try openConverted(&t, id);
@@ -8824,7 +8823,7 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
     const moved = try std.Io.Dir.path.join(alloc, &.{ ".fx", terminal_dir_name, id, terminal_dir_name, "state" });
     defer alloc.free(moved);
     const stat = try t.tmp.dir.statFile(io, moved, .{ .follow_symlinks = false });
-    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "a v1 session whose hosted terminal state holds an entry the copy can't take converts without it, and its v1 folder keeps it (D56, D62)" {
@@ -9283,7 +9282,7 @@ test "-c says the remembered session cannot be read when v1's bookmark is not a 
     var entries = bookmarks.iterate();
     const name = try v1.arena.allocator().dupe(u8, (try entries.next(io)).?.name);
     try bookmarks.deleteFile(io, name);
-    try bookmarks.createDir(io, name, .fromMode(0o700));
+    try bookmarks.createDir(io, name, io_mod.permissionsForMode(0o700));
     try testing.expectError(error.RememberedSessionUnavailable, Session.resumeSession(testing.allocator, &t.store, .last_opened, v1.workspace, .app));
 }
 
@@ -9663,8 +9662,8 @@ test "fx sessions convert says a v1 subagent's own subagent stays with a parent 
     try nestThirdChild(&v1, family);
     var parent = try t.tmp.dir.openDir(io, try v1.sessionPath(family[1], "."), .{});
     defer parent.close(io);
-    parent.setFilePermissions(io, "session.json", .fromMode(0o000), .{}) catch return error.SkipZigTest;
-    defer parent.setFilePermissions(io, "session.json", .fromMode(0o600), .{}) catch {};
+    parent.setFilePermissions(io, "session.json", io_mod.permissionsForMode(0o000), .{}) catch return error.SkipZigTest;
+    defer parent.setFilePermissions(io, "session.json", io_mod.permissionsForMode(0o600), .{}) catch {};
     // Not when the file still opens, as it does for root.
     if (parent.readFileAlloc(io, "session.json", alloc, .limited(1 << 20))) |bytes| {
         alloc.free(bytes);
@@ -9887,7 +9886,7 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     for ([_][]const u8{ ".fx", ".fx/sessions", try v1.sessionPath(v1_open_id, "") }) |path| {
         var dir = try t.tmp.dir.openDir(io, path, .{});
         defer dir.close(io);
-        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+        io_mod.setPermissions(dir, io_mod.permissionsForMode(0o755)) catch return error.SkipZigTest;
     }
     const s = try openConverted(&t, v1_open_id);
     defer s.close();
@@ -10272,8 +10271,8 @@ test "a new session never takes an id v1's folder could not be checked for (D61)
     try t.tmp.dir.createDirPath(io, ".fx/sessions");
     var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
     defer sessions.close(io);
-    sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
-    defer sessions.setPermissions(io, .fromMode(0o700)) catch {};
+    io_mod.setPermissions(sessions, io_mod.permissionsForMode(0o000)) catch return error.SkipZigTest;
+    defer io_mod.setPermissions(sessions, io_mod.permissionsForMode(0o700)) catch {};
     var model = "m".*;
     try testing.expectError(error.SessionStoreUnavailable, Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model)));
 }
@@ -10343,7 +10342,7 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     for (roots) |id| {
         var commands = try t.tmp.dir.createDirPathOpen(io, try v1.sessionPath(id, "logs/commands"), .{});
         defer commands.close(io);
-        try commands.writeFile(io, .{ .sub_path = "small.bin", .data = "kept", .flags = .{ .permissions = .fromMode(0o600) } });
+        try commands.writeFile(io, .{ .sub_path = "small.bin", .data = "kept", .flags = .{ .permissions = io_mod.permissionsForMode(0o600) } });
         var file = try commands.createFile(io, "replay.bin", .{});
         defer file.close(io);
         // Sparse: no disk for the hole.

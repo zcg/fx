@@ -18,6 +18,7 @@
 //! model.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const readiness = @import("../shared/readiness.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
@@ -174,7 +175,7 @@ fn startLocked(io: std.Io) !void {
     errdefer gpa.free(dir_path);
     const socket_path = try gpa.print("{s}/s", .{dir_path});
     errdefer gpa.free(socket_path);
-    try std.Io.Dir.cwd().createDir(io, dir_path, .fromMode(0o700));
+    try std.Io.Dir.cwd().createDir(io, dir_path, io_mod.permissionsForMode(0o700));
     errdefer std.Io.Dir.cwd().deleteDir(io, dir_path) catch {};
     const address = try std.Io.net.UnixAddress.init(socket_path);
     var listener = try address.listen(io, .{});
@@ -238,12 +239,11 @@ fn acceptLoop() void {
     const io = io_mod.getIo();
     const listener = &bridge.listener.?;
     while (!bridge.stop.load(.acquire)) {
-        var fds = [_]posix.pollfd{.{ .fd = listener.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, poll_ms) catch |err| {
+        const wait = readiness.waitReadable(listener.socket.handle, .{ .milliseconds = poll_ms }) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept loop ended err={s}", .{@errorName(err)});
             return;
         };
-        if (ready == 0) continue;
+        if (wait == .timeout) continue;
         const stream = listener.accept(io) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept failed err={s}", .{@errorName(err)});
             continue;

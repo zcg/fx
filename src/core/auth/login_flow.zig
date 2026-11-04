@@ -8,6 +8,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const readiness = @import("../shared/readiness.zig");
+const term_mode = @import("../shared/term_mode.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
@@ -1165,7 +1167,7 @@ const BrowserOpenPrompt = struct {
     opened: bool = false,
 
     fn init(url: []const u8) !BrowserOpenPrompt {
-        const stdin_is_tty = try std.Io.File.stdin().isTty(io_mod.getIo());
+        const stdin_is_tty = try io_mod.stdinFile().isTty(io_mod.getIo());
         return .{
             .url = url,
             .enabled = browserOpenEnabled(io_mod.getenv("FX_NO_OPEN_BROWSER") != null, stdin_is_tty, host.current()),
@@ -1223,14 +1225,12 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
 }
 
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
-    var fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-    const ready = std.posix.poll(&fds, timeout) catch return false;
-    if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return false;
+    const timeout: readiness.Timeout = if (timeout_ms > std.math.maxInt(u32))
+        .forever
+    else
+        .{ .milliseconds = @intCast(timeout_ms) };
+    const result = readiness.waitReadable(io_mod.stdinHandle(), timeout) catch return false;
+    if (!result.any()) return false;
     discardStdinLine();
     return true;
 }
@@ -1238,7 +1238,7 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 fn discardStdinLine() void {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+        const n = io_mod.readFd(io_mod.stdinHandle(), &buf) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1401,8 +1401,8 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 }
 
 fn canUseInteractiveTeamPicker() bool {
-    const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
-    return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
+    const stdin_tty = io_mod.stdinFile().isTty(io_mod.getIo()) catch false;
+    return stdin_tty and io_mod.stdoutIsTty();
 }
 
 fn renderTeamPicker(
@@ -1437,21 +1437,16 @@ const TeamPickerKey = union(enum) {
 
 fn readTeamPickerKey() !TeamPickerKey {
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
+    const first_read = try io_mod.readFd(io_mod.stdinHandle(), buf[0..1]);
     if (first_read == 0) return .ignored;
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
-            var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try std.posix.poll(&fds, 25);
-            if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+            const ready = readiness.waitReadable(io_mod.stdinHandle(), .{ .milliseconds = 25 }) catch break;
+            if (!ready.any()) break;
+            const n = try io_mod.readFd(io_mod.stdinHandle(), buf[len .. len + 1]);
             if (n == 0) break;
             len += n;
         }
@@ -1490,47 +1485,23 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 }
 
 const TeamPickerRawMode = struct {
-    original: std.posix.termios = undefined,
+    saved: term_mode.Saved = undefined,
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
+        if (!io_mod.stdinIsTty() or !io_mod.stdoutIsTty()) {
             return error.NotATerminal;
         }
-
         var self = TeamPickerRawMode{};
-        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
-        var raw = self.original;
-
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.iflag.IXON = false;
-        raw.iflag.IXOFF = false;
-
-        raw.cflag.CSIZE = .CS8;
-
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-
-        const vmin_idx = vminIndex();
-        const vtime_idx = vtimeIndex();
-        if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
-            raw.cc[vmin_idx] = 1;
-            raw.cc[vtime_idx] = 0;
-        }
-
-        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        self.saved = try term_mode.capture(io_mod.stdinHandle(), io_mod.stdoutHandle());
+        try term_mode.enableRaw(self.saved, io_mod.stdinHandle(), io_mod.stdoutHandle());
         self.active = true;
         return self;
     }
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        term_mode.restore(self.saved, io_mod.stdinHandle(), io_mod.stdoutHandle());
         self.active = false;
     }
 };
@@ -1743,13 +1714,13 @@ test "login session transfer cleans up allocation failures" {
 
 fn readLine(alloc: Allocator) ![]u8 {
     var read_buf: [1024]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buf);
+    var reader = io_mod.stdinFile().reader(io_mod.getIo(), &read_buf);
     const line = reader.interface.takeDelimiter('\n') catch return try alloc.dupe(u8, "");
     return try alloc.dupe(u8, line orelse "");
 }
 
 fn writeStdout(text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stdoutHandle(), text);
 }
 
 fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {

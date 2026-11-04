@@ -631,11 +631,13 @@ fn abandonMcpStore(
         .watch => {},
     };
     if (reaped) return;
-    std.posix.kill(pid, .KILL) catch |err| {
+    io_mod.killProcess(pid) catch |err| {
         debug_trace.logf("keychain", "store abandon kill failed err={s}", .{@errorName(err)});
     };
-    while (std.c.waitpid(pid, null, 0) == -1) {
-        if (std.posix.errno(-1) != .INTR) break;
+    if (comptime builtin.target.os.tag == .windows) return;
+    while (true) {
+        if (io_mod.waitProcess(pid, true) != null) return;
+        if (std.posix.errno(-1) != .INTR) return;
     }
 }
 

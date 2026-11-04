@@ -7,6 +7,7 @@
 //! `tests/tla/usage/UsageModel.tla`.
 
 const std = @import("std");
+const io_mod = @import("../core/shared/io.zig");
 const report = @import("report.zig");
 const codex = @import("codex.zig");
 const grok = @import("grok.zig");
@@ -266,7 +267,7 @@ pub fn own(gpa: Allocator, identity: Identity, entry: Entry) !Owned {
 /// started over from less. Never writes what `read` would reject, so a bad
 /// fetch leaves the file as it was. Returns the merged entry. Caller owns it.
 pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched: Entry, now_ms: i64, held: ?Entry) !Owned {
-    fx_dir.createDir(io, dir_name, .fromMode(0o700)) catch |err| switch (err) {
+    fx_dir.createDir(io, dir_name, io_mod.permissionsForMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -277,7 +278,7 @@ pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched
     var lock = try dir.createFile(io, fileName(&name_buf, identity, ".lock"), .{
         .truncate = false,
         .lock = .exclusive,
-        .permissions = .fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     });
     defer lock.close(io);
 
@@ -291,7 +292,7 @@ pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched
     defer gpa.free(bytes);
     var tmp_buf: [80]u8 = undefined;
     const tmp_name = fileName(&tmp_buf, identity, ".tmp");
-    try dir.writeFile(io, .{ .sub_path = tmp_name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+    try dir.writeFile(io, .{ .sub_path = tmp_name, .data = bytes, .flags = .{ .permissions = io_mod.permissionsForMode(0o600) } });
     try dir.rename(tmp_name, dir, fileName(&name_buf, identity, ".json"), io);
 
     return decode(gpa, identity, bytes) orelse error.InvalidCache;

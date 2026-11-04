@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const readiness = @import("../shared/readiness.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -171,18 +173,12 @@ fn listenerReady(
     cancel_flag: Cancellation,
 ) !bool {
     if (cancel_flag.cancelled()) return error.Cancelled;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, poll_ms);
+    const result = readiness.waitReadable(listener.socket.handle, .{ .milliseconds = poll_ms }) catch |err| switch (err) {
+        error.Unsupported => return error.OAuthCallbackListenerFailed,
+        else => |e| return e,
+    };
     if (cancel_flag.cancelled()) return error.Cancelled;
-    if (ready == 0) return false;
-    if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-        return error.OAuthCallbackListenerFailed;
-    }
-    return true;
+    return (result.any());
 }
 
 fn requestReadable(
@@ -193,18 +189,13 @@ fn requestReadable(
     while (true) {
         if (cancel_flag.cancelled()) return error.Cancelled;
         const remaining_ms = deadline_ms - io_mod.milliTimestamp();
-        const wait_ms: i32 = if (remaining_ms <= 0)
+        const wait_ms: u32 = if (remaining_ms <= 0)
             0
         else
-            @intCast(@min(remaining_ms, poll_ms));
-        var fds = [_]std.posix.pollfd{.{
-            .fd = socket,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&fds, wait_ms);
+            @intCast(@min(remaining_ms, @as(i64, poll_ms)));
+        const result = try readiness.waitReadable(socket, .{ .milliseconds = wait_ms });
         if (cancel_flag.cancelled()) return error.Cancelled;
-        if (ready != 0) return true;
+        if (result.any()) return true;
         if (remaining_ms <= 0) return false;
     }
 }
@@ -443,7 +434,50 @@ fn writePreflightResponse(stream: std.Io.net.Stream, origin: []const u8) !void {
     try writer.interface.flush();
 }
 
+const windows_socket = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const sol_socket: c_int = 0xFFFF; // SOL_SOCKET
+    const so_rcvtimeo: c_int = 0x1006;
+    const so_sndtimeo: c_int = 0x1005;
+
+    extern "ws2_32" fn setsockopt(
+        s: std.posix.socket_t,
+        level: c_int,
+        optname: c_int,
+        optval: [*]const u8,
+        optlen: c_int,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+
+    const setSockOpt = setsockopt;
+    const lastError = WSAGetLastError;
+};
+
 fn setSocketTimeouts(socket: std.posix.socket_t) void {
+    if (comptime builtin.target.os.tag == .windows) {
+        // A Windows socket takes the same option with a `DWORD` of milliseconds
+        // rather than a `timeval`. `WSAGetLastError` is how an error is read
+        // there, so the diagnostic reports the numeric code.
+        var milliseconds: u32 = socket_timeout_seconds * 1000;
+        if (windows_socket.setSockOpt(
+            socket,
+            windows_socket.sol_socket,
+            windows_socket.so_rcvtimeo,
+            @ptrCast(&milliseconds),
+            @sizeOf(u32),
+        ) != 0) {
+            debug_trace.logf("auth", "OAuth callback receive timeout setup failed code={d}", .{windows_socket.lastError()});
+        }
+        if (windows_socket.setSockOpt(
+            socket,
+            windows_socket.sol_socket,
+            windows_socket.so_sndtimeo,
+            @ptrCast(&milliseconds),
+            @sizeOf(u32),
+        ) != 0) {
+            debug_trace.logf("auth", "OAuth callback send timeout setup failed code={d}", .{windows_socket.lastError()});
+        }
+        return;
+    }
     const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
     const receive_rc = std.c.setsockopt(
         socket,

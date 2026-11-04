@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -551,13 +552,31 @@ fn commandInPathValue(alloc: Allocator, command_name: []const u8, path_env: []co
             continue;
         };
 
-        if (pathExists(candidate)) {
-            return true;
+        if (pathExists(candidate)) return true;
+
+        // Windows stores a program under an extension from `PATHEXT`, so `gh` on
+        // the path is the file `gh.exe`, `gh.cmd`, `gh.bat`, or `gh.com`. Asking
+        // for the bare name would report a program that is installed as missing.
+        if (comptime builtin.target.os.tag == .windows) {
+            for (windows_program_extensions) |extension| {
+                var with_extension_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const with_extension = std.mem.print(
+                    &with_extension_buf,
+                    "{s}" ++ std.Io.Dir.path.sep_str ++ "{s}{s}",
+                    .{ entry, command_name, extension },
+                ) catch continue;
+                if (pathExists(with_extension)) return true;
+            }
         }
     }
 
     return false;
 }
+
+/// The extensions Windows gives an executable, in the order `cmd` looks for
+/// them. A user's `PATHEXT` may add more; these cover the ones a program is
+/// installed under.
+const windows_program_extensions = [_][]const u8{ ".exe", ".cmd", ".bat", ".com" };
 
 fn pathExists(path: []const u8) bool {
     if (comptime @import("builtin").target.os.tag != .windows) {

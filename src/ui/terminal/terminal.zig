@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
@@ -34,14 +35,8 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
 }
 
 pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(fd, req, &ws);
-    if (rc == -1 or ws.row == 0 or ws.col == 0) {
-        return error.UnableToReadTerminalSize;
-    }
-    return layoutFromSize(ws.row, ws.col, footer_rows);
+    const size = io_mod.terminalSize(fd) catch return error.UnableToReadTerminalSize;
+    return layoutFromSize(size.rows, size.columns, footer_rows);
 }
 
 pub fn layoutFromSize(rows: u16, cols: u16, footer_rows: u16) !types.Layout {

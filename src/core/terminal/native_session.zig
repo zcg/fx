@@ -18,6 +18,8 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const execution_router = @import("../execution/router.zig");
 const io_mod = @import("../shared/io.zig");
+const readiness = @import("../shared/readiness.zig");
+const term_mode = @import("../shared/term_mode.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -46,7 +48,7 @@ const marker_ack_timeout_ms: i64 = 15_000;
 const command_release_byte: u8 = 2;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.permissionsForMode(0o600);
 const default_dimensions: contracts.Dimensions = .{
     .rows = 24,
     .columns = 80,
@@ -103,21 +105,17 @@ const LauncherWatchdog = struct {
     host_closed: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *LauncherWatchdog) void {
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
+        var watches = [_]readiness.Watch{.{ .fd = io_mod.stdinHandle() }};
         while (!self.done.load(.acquire)) {
-            poll_fds[0].revents = 0;
-            _ = std.posix.poll(&poll_fds, control_poll_ms) catch {
+            watches[0].events = .{};
+            _ = readiness.pollDescriptors(&watches, .{ .milliseconds = control_poll_ms }) catch {
                 self.host_closed.store(true, .release);
-                _ = std.c.kill(-self.child_pid, std.c.SIG.KILL);
+                self.terminateChild();
                 return;
             };
-            if (poll_fds[0].revents == 0) continue;
+            if (!watches[0].events.any()) continue;
             var byte: [1]u8 = undefined;
-            const count = std.posix.read(std.posix.STDIN_FILENO, &byte) catch 0;
+            const count = io_mod.readFd(io_mod.stdinHandle(), &byte) catch 0;
             if (count != 0) {
                 if (byte[0] == command_release_byte) {
                     self.command_released.store(true, .release);
@@ -125,11 +123,19 @@ const LauncherWatchdog = struct {
                 continue;
             }
             self.host_closed.store(true, .release);
-            if (!self.done.load(.acquire)) {
-                _ = std.c.kill(-self.child_pid, std.c.SIG.KILL);
-            }
+            if (!self.done.load(.acquire)) self.terminateChild();
             return;
         }
+    }
+
+    /// Ends the launcher's child. Windows has no process group to signal, so
+    /// the child is terminated directly through fx's portable helper.
+    fn terminateChild(self: *LauncherWatchdog) void {
+        if (comptime builtin.target.os.tag == .windows) {
+            io_mod.killProcess(self.child_pid) catch {};
+            return;
+        }
+        std.posix.kill(-self.child_pid, std.posix.SIG.KILL) catch {};
     }
 };
 
@@ -158,15 +164,11 @@ const LauncherControl = struct {
     }
 
     fn runInner(self: *LauncherControl) !void {
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = self.server.socket.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
+        var watches = [_]readiness.Watch{.{ .fd = self.server.socket.handle }};
         while (!self.done.load(.acquire)) {
-            poll_fds[0].revents = 0;
-            _ = try std.posix.poll(&poll_fds, control_poll_ms);
-            if (poll_fds[0].revents == 0) continue;
+            watches[0].events = .{};
+            _ = readiness.pollDescriptors(&watches, .{ .milliseconds = control_poll_ms }) catch continue;
+            if (!watches[0].events.any()) continue;
 
             var stream = self.server.accept(io_mod.getIo()) catch |err| switch (err) {
                 error.ConnectionAborted, error.WouldBlock => continue,
@@ -212,13 +214,13 @@ const LauncherControl = struct {
         switch (kind) {
             .shell_ready => {
                 if (self.phase != .awaiting_shell) return false;
-                setEcho(std.posix.STDOUT_FILENO, true) catch {};
+                setEcho(io_mod.stdoutHandle(), true) catch {};
                 std.Io.Dir.deleteFileAbsolute(
                     io_mod.getIo(),
                     self.bootstrap_path,
                 ) catch {};
                 try writeControlFd(
-                    std.posix.STDERR_FILENO,
+                    io_mod.stderrHandle(),
                     .shell_ready,
                     @intCast(self.child_pid),
                 );
@@ -232,7 +234,7 @@ const LauncherControl = struct {
                     self.command_path.?,
                 ) catch {};
                 try writeControlFd(
-                    std.posix.STDERR_FILENO,
+                    io_mod.stderrHandle(),
                     .command_started,
                     @intCast(self.child_pid),
                 );
@@ -349,14 +351,14 @@ pub fn runLauncher(alloc: Allocator) !void {
     if (comptime !isSupported()) return error.TerminalHostUnsupported;
 
     var length_bytes: [4]u8 = undefined;
-    try readExactFd(std.posix.STDIN_FILENO, &length_bytes);
+    try readExactFd(io_mod.stdinHandle(), &length_bytes);
     const config_len = std.mem.readInt(u32, &length_bytes, .little);
     if (config_len == 0 or config_len > launcher_config_bytes) {
         return error.InvalidLauncherConfig;
     }
     const config_bytes = try alloc.alloc(u8, config_len);
     defer alloc.free(config_bytes);
-    try readExactFd(std.posix.STDIN_FILENO, config_bytes);
+    try readExactFd(io_mod.stdinHandle(), config_bytes);
     var parsed = try json_decode.parseFromSlice(
         LauncherConfig,
         alloc,
@@ -421,19 +423,19 @@ pub fn runLauncher(alloc: Allocator) !void {
 
     if (std.c.setsid() < 0) return error.SessionCreationFailed;
     if (std.c.ioctl(
-        std.posix.STDOUT_FILENO,
+        io_mod.stdoutHandle(),
         ioctl_set_controlling_terminal,
         @as(c_int, 0),
     ) < 0) return error.ControllingTerminalFailed;
-    try resizeFd(std.posix.STDOUT_FILENO, parsed.value.dimensions);
-    try writeControlFd(std.posix.STDERR_FILENO, .prepared, 0);
+    try resizeFd(io_mod.stdoutHandle(), parsed.value.dimensions);
+    try writeControlFd(io_mod.stderrHandle(), .prepared, 0);
 
     var release: [1]u8 = undefined;
-    try readExactFd(std.posix.STDIN_FILENO, &release);
+    try readExactFd(io_mod.stdinHandle(), &release);
     if (release[0] != 1) return error.InvalidLauncherRelease;
 
     const terminal_file = std.Io.File{
-        .handle = std.posix.STDOUT_FILENO,
+        .handle = io_mod.stdoutHandle(),
         .flags = .{ .nonblocking = false },
     };
     var child = std.process.spawn(io_mod.getIo(), .{
@@ -442,10 +444,10 @@ pub fn runLauncher(alloc: Allocator) !void {
         .stdout = .{ .file = terminal_file },
         .stderr = .{ .file = terminal_file },
         .cwd = .{ .path = parsed.value.cwd },
-        .pgid = 0,
+        .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
     }) catch {
         try writeControlFd(
-            std.posix.STDERR_FILENO,
+            io_mod.stderrHandle(),
             .startup_failed,
             @backingInt(StartupFailure.shell_unavailable),
         );
@@ -454,7 +456,7 @@ pub fn runLauncher(alloc: Allocator) !void {
     var child_running = true;
     errdefer if (child_running) child.kill(io_mod.getIo());
     const child_pid = child.id orelse return error.ChildIdentityMissing;
-    if (tcsetpgrp(std.posix.STDOUT_FILENO, child_pid) != 0) {
+    if (tcsetpgrp(io_mod.stdoutHandle(), child_pid) != 0) {
         return error.ForegroundProcessGroupFailed;
     }
     var watchdog = LauncherWatchdog{ .child_pid = child_pid };
@@ -497,10 +499,10 @@ pub fn runLauncher(alloc: Allocator) !void {
     control.done.store(true, .release);
     watchdog_thread.join();
     control_thread.join();
-    closeFd(std.posix.STDOUT_FILENO);
+    closeFd(io_mod.stdoutHandle());
     if (control.failed) {
         try writeControlFd(
-            std.posix.STDERR_FILENO,
+            io_mod.stderrHandle(),
             .startup_failed,
             @backingInt(StartupFailure.control_failed),
         );
@@ -510,7 +512,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         (control.phase == .shell_ready and parsed.value.command == null);
     if (!trusted_term) {
         try writeControlFd(
-            std.posix.STDERR_FILENO,
+            io_mod.stderrHandle(),
             .startup_failed,
             @backingInt(StartupFailure.profile_failed),
         );
@@ -518,17 +520,17 @@ pub fn runLauncher(alloc: Allocator) !void {
     }
     switch (term) {
         .exited => |code| try writeControlFd(
-            std.posix.STDERR_FILENO,
+            io_mod.stderrHandle(),
             .command_exited,
             code,
         ),
         .signal => |signal| try writeControlFd(
-            std.posix.STDERR_FILENO,
+            io_mod.stderrHandle(),
             .command_signal,
             @backingInt(signal),
         ),
         .stopped, .unknown => try writeControlFd(
-            std.posix.STDERR_FILENO,
+            io_mod.stderrHandle(),
             .invalid_term,
             0,
         ),
@@ -555,6 +557,7 @@ fn launcherStatusToTerm(raw_status: u32) std.process.Child.Term {
 }
 
 test "launcher wait status classifies terminal results before stops" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     try std.testing.expectEqual(
         std.process.Child.Term{ .exited = 23 },
         launcherStatusToTerm(23 << 8),
@@ -575,6 +578,20 @@ test "launcher wait status classifies terminal results before stops" {
 
 fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
     const pid = child.id orelse return error.ChildIdentityMissing;
+    // Windows has no job control: a child is never stopped by a foreground
+    // terminal race, so one wait ends it and the stopped states below cannot
+    // occur.
+    if (comptime builtin.target.os.tag == .windows) {
+        const outcome = io_mod.waitProcess(pid, true) orelse return error.ChildWaitFailed;
+        std.debug.assert(child.stdin == null);
+        std.debug.assert(child.stdout == null);
+        std.debug.assert(child.stderr == null);
+        child.id = null;
+        return switch (outcome) {
+            .exited => |code| .{ .exited = @intCast(code) },
+            .signaled => |signal| .{ .signal = @fromBackingInt(signal) },
+        };
+    }
     var observe_stops = true;
     while (true) {
         var status: c_int = undefined;
@@ -3518,6 +3535,7 @@ fn openPty() !Pty {
 }
 
 test "PTY output drains use a nonblocking master" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !isSupported()) return;
     const pty = try openPty();
     defer closeFd(pty.master);
@@ -3549,9 +3567,8 @@ fn resizeFd(fd: std.posix.fd_t, dimensions: contracts.Dimensions) !void {
 }
 
 fn setEcho(fd: std.posix.fd_t, enabled: bool) !void {
-    var termios = try io_mod.tcgetattr(fd);
-    termios.lflag.ECHO = enabled;
-    try io_mod.tcsetattr(fd, .NOW, termios);
+    const saved = try term_mode.capture(fd, fd);
+    try term_mode.setEcho(saved, fd, enabled);
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
@@ -3564,7 +3581,7 @@ fn closeFd(fd: std.posix.fd_t) void {
 fn readExactFd(fd: std.posix.fd_t, destination: []u8) !void {
     var offset: usize = 0;
     while (offset < destination.len) {
-        const count = try std.posix.read(fd, destination[offset..]);
+        const count = try io_mod.readFd(fd, destination[offset..]);
         if (count == 0) return error.EndOfStream;
         offset += count;
     }
@@ -3749,23 +3766,19 @@ fn readAvailableFd(
     var total: usize = 0;
     var poll_timeout = timeout_ms;
     while (total < buffer.len) {
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        _ = try std.posix.poll(&poll_fds, poll_timeout);
-        const revents = poll_fds[0].revents;
-        if (revents == 0) break;
-        if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) == 0) {
+        var watches = [_]readiness.Watch{.{ .fd = fd }};
+        _ = readiness.pollDescriptors(&watches, .{
+            .milliseconds = @intCast(@max(poll_timeout, 0)),
+        }) catch break;
+        const events = watches[0].events;
+        if (!events.any()) break;
+        if (!events.readable and !events.hung_up and !events.errored) {
             if (total == 0) return error.EndOfStream;
             break;
         }
-        const count = std.posix.read(fd, buffer[total..]) catch |err| {
+        const count = io_mod.readFd(fd, buffer[total..]) catch |err| {
             if (err == error.WouldBlock) {
-                if (total == 0 and
-                    revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0)
-                {
+                if (total == 0 and (events.hung_up or events.errored)) {
                     return error.EndOfStream;
                 }
                 break;
@@ -3784,6 +3797,7 @@ fn readAvailableFd(
 }
 
 test "terminal output drain reads final bytes after peer close" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !isSupported()) return;
     var handles: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(
@@ -3985,6 +3999,7 @@ test "write payload encoding preserves text paste keys and controls" {
 }
 
 test "terminal outcomes preserve exact exit and signal status" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     try std.testing.expectEqual(
         contracts.ReturnOutcome{ .exited = 23 },
         outcomeFromTerm(.{ .exited = 23 }).?,

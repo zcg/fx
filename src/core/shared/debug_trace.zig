@@ -406,8 +406,12 @@ fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
         .lock = .exclusive,
     }) catch return;
     defer file.close(zio);
-    _ = std.c.lseek(file.handle, 0, std.posix.SEEK.END);
-    file.writeStreamingAll(zio, line) catch {};
+    // Write at the current end of the file. `lseek` cannot serve: Windows has no
+    // such call, and `writePositionalAll` is the portable way to name an offset.
+    // A positional write also leaves the file's own offset alone, which is what
+    // appending from several writers needs.
+    const end = file.length(zio) catch return;
+    file.writePositionalAll(zio, line, end) catch {};
 }
 
 fn loadOptionsFromEnv(alloc: Allocator, workspace_root: []const u8) !Options {

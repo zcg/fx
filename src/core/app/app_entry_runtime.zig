@@ -42,7 +42,15 @@ else
 
 const Allocator = std.mem.Allocator;
 
-const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
+/// Installs and removes the guard that turns Ctrl+C into a graceful exit.
+///
+/// WASI has no signals. Windows has no `sigaction` either: its `std.posix`
+/// leaves the type `void`, so every field below would fail. A Windows console
+/// delivers Ctrl+C as an input event instead, which the screen's input loop
+/// handles, so the guard has nothing to install there.
+const has_sigaction = std.posix.Sigaction != void;
+
+const GracefulExitSigintGuard = if (host_target.is_wasm or !has_sigaction) struct {
     fn install(_: bool) @This() {
         return .{};
     }
@@ -543,11 +551,11 @@ fn getenvDefault(_: ?*anyopaque, key: []const u8) ?[]const u8 {
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    return io_mod.writeFd(io_mod.stderrHandle(), text);
 }
 
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    return io_mod.writeFd(io_mod.stdoutHandle(), text);
 }
 
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
@@ -1053,6 +1061,11 @@ test "app entry writes exact resume handoff after interactive teardown" {
 }
 
 test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    // The guard exists because a POSIX signal handler is process-global. A
+    // platform without `sigaction` has nothing to install, so there is no
+    // lifetime to bound.
+    if (comptime std.posix.Sigaction == void) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var original_action: std.posix.Sigaction = undefined;
     const test_action: std.posix.Sigaction = .{

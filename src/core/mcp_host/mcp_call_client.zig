@@ -97,7 +97,7 @@ fn readArguments(arena: Allocator, io: std.Io, err: *Writer, arguments: ?[]const
         const raw = arguments orelse break :blk "{}";
         if (!std.mem.eql(u8, raw, "-")) break :blk raw;
         var stdin_buffer: [4096]u8 = undefined;
-        var stdin = std.Io.File.stdin().reader(io, &stdin_buffer);
+        var stdin = io_mod.stdinFile().reader(io, &stdin_buffer);
         break :blk stdin.interface.allocRemaining(arena, .limited(wire.max_request_bytes)) catch |e| switch (e) {
             error.StreamTooLong => {
                 try err.print("fx mcp call: the arguments on stdin are larger than {d} bytes.\n", .{wire.max_request_bytes});
@@ -175,7 +175,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
 /// Whether this process's stdout is a terminal, where the data is already in
 /// view and needs no summary.
 fn stdoutIsTerminal(io: std.Io) bool {
-    return std.Io.File.stdout().isTty(io) catch false;
+    return io_mod.stdoutFile().isTty(io) catch false;
 }
 
 /// The most a shape summary prints.

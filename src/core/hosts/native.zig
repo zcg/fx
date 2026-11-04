@@ -81,7 +81,14 @@ fn collect_clipboard_process_output(
     return multi_reader.toOwnedSlice(1);
 }
 
+/// Reads an exit code into the term shape `std.process.Child` uses.
+///
+/// POSIX decodes a status word into exit, signal, or stop. Windows reports an
+/// exit code and no signal, so every outcome there is an exit.
 fn clipboard_process_term(status: c_int) std.process.Child.Term {
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        return .{ .exited = @intCast(@as(u32, @bitCast(status))) };
+    }
     const raw_status: u32 = @bitCast(status);
     return if (std.c.W.IFEXITED(raw_status))
         .{ .exited = std.c.W.EXITSTATUS(raw_status) }
@@ -105,13 +112,12 @@ fn close_clipboard_process_streams(child: *std.process.Child) void {
 
 fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
     const pid = child.id orelse return error.WaitFailed;
-    var status: c_int = undefined;
-    const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-    if (waited == 0) return null;
-    if (waited != pid) return error.WaitFailed;
-
+    const outcome = io_mod.waitProcess(pid, false) orelse return null;
     child.id = null;
-    return clipboard_process_term(status);
+    return switch (outcome) {
+        .exited => |code| .{ .exited = @intCast(code) },
+        .signaled => |signal| .{ .signal = @backingInt(@as(std.posix.SIG, @fromBackingInt(signal))) },
+    };
 }
 
 fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {

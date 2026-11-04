@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const term_mode = @import("../shared/term_mode.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -2458,8 +2459,7 @@ fn writePasteFailure(alloc: Allocator, deps: RunDeps, command: []const u8, probl
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
-    return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
-        std.c.isatty(std.posix.STDERR_FILENO) != 0;
+    return io_mod.stdinIsTty() and io_mod.stderrIsTty();
 }
 
 fn readMaskedKeyDefault(
@@ -2478,7 +2478,7 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        if (try io_mod.readFd(io_mod.stdinHandle(), &byte) == 0) return error.SetupCancelled;
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2506,50 +2506,23 @@ fn readMaskedKeyDefault(
 }
 
 const MaskedKeyRawMode = struct {
-    original: std.posix.termios = undefined,
+    saved: term_mode.Saved = undefined,
     active: bool = false,
 
     fn enable() !MaskedKeyRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
-            std.c.isatty(std.posix.STDERR_FILENO) == 0)
-        {
+        if (!io_mod.stdinIsTty() or !io_mod.stderrIsTty()) {
             return error.NotATerminal;
         }
-
         var self: MaskedKeyRawMode = .{};
-        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
-        var raw = self.original;
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.iflag.IXON = false;
-        raw.iflag.IXOFF = false;
-        raw.cflag.CSIZE = .CS8;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-        const vmin_idx = switch (builtin.target.os.tag) {
-            .linux => 6,
-            else => 16,
-        };
-        const vtime_idx = switch (builtin.target.os.tag) {
-            .linux => 5,
-            else => 17,
-        };
-        if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
-            raw.cc[vmin_idx] = 1;
-            raw.cc[vtime_idx] = 0;
-        }
-        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        self.saved = try term_mode.capture(io_mod.stdinHandle(), io_mod.stderrHandle());
+        try term_mode.enableRaw(self.saved, io_mod.stdinHandle(), io_mod.stderrHandle());
         self.active = true;
         return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        term_mode.restore(self.saved, io_mod.stdinHandle(), io_mod.stderrHandle());
         self.active = false;
     }
 };
@@ -2689,16 +2662,16 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
 
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(std.posix.STDOUT_FILENO, text);
+        return writeFdAll(io_mod.stdoutHandle(), text);
     }
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stdoutHandle(), text);
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
     if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(std.posix.STDERR_FILENO, text);
+        return writeFdAll(io_mod.stderrHandle(), text);
     }
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stderrHandle(), text);
 }
 
 fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {

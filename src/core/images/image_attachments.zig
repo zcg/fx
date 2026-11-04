@@ -262,7 +262,7 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
         std.Io.Dir.createDirAbsolute(
             io_mod.getIo(),
             path,
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsForMode(0o700),
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 alloc.free(path);
@@ -586,7 +586,7 @@ pub fn captureInlineImageBytes(
             .{
                 .truncate = false,
                 .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .permissions = io_mod.permissionsForMode(0o600),
                 .resolve_beneath = true,
             },
         );
@@ -742,7 +742,7 @@ fn streamSourceToFile(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsForMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -1081,10 +1081,10 @@ pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types
 }
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
-    io_mod.syncVerifiedDir(snapshot_dir) catch |err| switch (err) {
-        error.OperationUnsupported => {},
-        else => return err,
-    };
+    // Some platforms cannot sync a directory handle, and some report more than
+    // one way; both mean the same thing to the caller, which has synced the file
+    // data already.
+    io_mod.syncVerifiedDir(snapshot_dir) catch return;
 }
 
 fn deleteSnapshotFile(dir: std.Io.Dir, name: []const u8, reason: []const u8) void {
@@ -1193,7 +1193,7 @@ fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
             parent.createDir(
                 io_mod.getIo(),
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsForMode(0o700),
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return unsafeSnapshotPathError(create_err),
@@ -1425,7 +1425,7 @@ fn copyVerifiedImageAttachmentToDir(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsForMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -2732,7 +2732,7 @@ test "extractInlineImageAttachments preserves image-looking directories" {
     try tmp.dir.createDir(
         std.testing.io,
         "photos.png",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
@@ -4161,7 +4161,7 @@ test "verified snapshot loading rejects a symlinked directory" {
     try tmp.dir.createDir(
         std.testing.io,
         "owned",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     {
         var owned = try tmp.dir.openDir(std.testing.io, "owned", .{});

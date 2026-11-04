@@ -705,10 +705,26 @@ fn now(io: Io) i64 {
 /// Whether the server closed or reset a kept connection while it sat idle.
 /// Nothing is due on one between requests, so anything to read, its end
 /// included, means it can't carry another.
+///
+/// A zero-deadline read is the portable question: both platforms answer it with
+/// a byte count, zero for a closed connection, or `WouldBlock` while it is still
+/// open and silent. This replaces a zero-timeout `poll`, which Zig refuses to
+/// compile on Windows because a Windows stream is not a pollable descriptor.
 fn closedByServer(kept: *std.http.Client.Connection) bool {
     if (kept.reader().bufferedLen() > 0 or kept.stream_reader.interface.bufferedLen() > 0) return true;
-    var ready = [_]std.posix.pollfd{.{ .fd = kept.stream_reader.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-    return (std.posix.poll(&ready, 0) catch return true) > 0;
+    // `receiveTimeout` asks the socket for data with a deadline, and Zig
+    // implements it on Winsock and on POSIX sockets alike. A single byte is
+    // enough to answer: anything waiting, a close included, means the connection
+    // cannot carry another request. Nothing waiting times out.
+    var buffer: [1]u8 = undefined;
+    const io = kept.client.io;
+    const incoming = kept.stream_reader.stream.socket.receiveTimeout(
+        io,
+        &buffer,
+        .{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } },
+    ) catch return true;
+    if (incoming.data.len > 0) return true;
+    return false;
 }
 
 /// A Content-Type naming JSON, with any parameters such as `charset`.

@@ -129,7 +129,7 @@ const Loaded = struct {
         var file = try io_mod.openExistingRegularFile(dir, file_name, .read_only);
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
-        if (stat.kind != .file or stat.nlink > 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidCatalogCache;
+        if (stat.kind != .file or stat.nlink > 1 or io_mod.exposesGroupOrOther(stat.permissions) or stat.size > max_bytes) return error.InvalidCatalogCache;
         const bytes = try alloc.alloc(u8, @intCast(stat.size));
         errdefer alloc.free(bytes);
         var offset: usize = 0;
@@ -305,11 +305,12 @@ fn statOptional(dir: std.Io.Dir, path: []const u8) !?std.Io.File.Stat {
 
 fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
     return a.inode == b.inode and a.nlink == b.nlink and a.kind == b.kind and a.size == b.size and
-        a.permissions.toMode() == b.permissions.toMode() and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
+        io_mod.permissionFingerprint(a.permissions) == io_mod.permissionFingerprint(b.permissions) and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
 }
 
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @backingInt(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    const kind: u128 = @intCast(@backingInt(stat.kind));
+    const values = [_]u128{ @intCast(stat.inode), @intCast(stat.nlink), @intCast(stat.size), kind, io_mod.permissionFingerprint(stat.permissions), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);
@@ -594,9 +595,9 @@ test "catalog fingerprint detects event appends and child directory permissions"
     try std.testing.expect(!std.mem.eql(u8, &first, &appended));
     var child = try tmp.dir.openDir(std.testing.io, "session/subagent", .{ .iterate = true });
     defer child.close(std.testing.io);
-    try child.setPermissions(std.testing.io, .fromMode(0o700));
+    try io_mod.setPermissions(child, io_mod.permissionsForMode(0o700));
     const private = (try fingerprint(tmp.dir, "session")).?;
-    try child.setPermissions(std.testing.io, .fromMode(0o755));
+    try io_mod.setPermissions(child, io_mod.permissionsForMode(0o755));
     const changed = (try fingerprint(tmp.dir, "session")).?;
     try std.testing.expect(!std.mem.eql(u8, &private, &changed));
 }

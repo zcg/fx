@@ -466,6 +466,7 @@ test "Darwin spawn resolves argv through parent PATH and replaces the child envi
 }
 
 test "Darwin explicit inherited descriptor avoids low user descriptors" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const io = try darwin_io();
     for ([_]std.posix.fd_t{
         0,
@@ -637,6 +638,7 @@ test "Darwin spawn preserves inherit ignore file and close stdio modes" {
 }
 
 test "Darwin spawn reports launch errors and preserves wait and kill" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const io = try darwin_io();
     const missing_before = try child_pid_snapshot();
     try std.testing.expectError(error.FileNotFound, std.process.spawn(io, .{

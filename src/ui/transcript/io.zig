@@ -6,6 +6,7 @@
 // owners.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
 const record_tape = @import("../../core/workspace/record_tape.zig");
 const types = @import("../../core/shared/types.zig");
@@ -39,6 +40,18 @@ pub fn disableShadowVt(shell: anytype) void {
 }
 
 pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
+    // A Windows console is written with the console call, which `writeFd` picks.
+    // Zig's own Windows IO goes through `NtWriteFile`, and a console refuses
+    // that with `INVALID_HANDLE`, which surfaces as `NotOpenForWriting` on the
+    // first frame. `writeFd` asks the console first and falls back to the file
+    // path only for a handle that is not one, so this goes through it on every
+    // platform and the loop below never runs on Windows.
+    if (comptime builtin.target.os.tag == .windows) {
+        io_mod.writeFd(shell.stdout_file.handle, bytes) catch |err| {
+            return recordPartialFrame(metrics, &.{}, err);
+        };
+        return recordCompleteFrame(metrics, bytes);
+    }
     var accepted_bytes: usize = 0;
     while (accepted_bytes < bytes.len) {
         const written = shell.stdout_file.writeStreaming(

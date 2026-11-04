@@ -19,12 +19,40 @@
 //! helper process stops what is left once the program is gone (`helper`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("../core/stdio_conn.zig");
 const wire = @import("../protocol/wire.zig");
 const lines = @import("lines.zig");
 const Budget = @import("budget.zig").Budget;
 const trace = @import("trace.zig");
 const Bell = @import("bell.zig").Bell;
+
+// The MCP engine imports only the standard library, and Zig declares neither
+// these calls nor a way to end a process on Windows, so they live here. The
+// block is skipped on other targets, where the POSIX signal path is used
+// instead, so no Linux or macOS link looks for them.
+const windows_terminate = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const terminate_access: u32 = 0x0001; // PROCESS_TERMINATE
+
+    extern "kernel32" fn OpenProcess(desired_access: u32, inherit_handle: c_int, process_id: u32) callconv(.winapi) ?std.posix.fd_t;
+    extern "kernel32" fn TerminateProcess(process: std.posix.fd_t, exit_code: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: std.posix.fd_t) callconv(.winapi) c_int;
+
+    const openProcess = OpenProcess;
+    const terminateProcess = TerminateProcess;
+    const closeHandle = CloseHandle;
+};
+
+const windows_child = if (builtin.target.os.tag != .windows) struct {} else struct {
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`, the least access that reports an
+    /// exit code.
+    const query_access: u32 = 0x1000;
+    const still_active: u32 = 259;
+
+    extern "kernel32" fn OpenProcess(desired_access: u32, inherit_handle: c_int, process_id: u32) callconv(.winapi) ?std.posix.fd_t;
+    extern "kernel32" fn GetExitCodeProcess(process: std.posix.fd_t, exit_code: *u32) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: std.posix.fd_t) callconv(.winapi) c_int;
+};
 
 /// Every `Process` between `init` and `deinit`, and whether the program
 /// is exiting.
@@ -63,8 +91,14 @@ const helper = struct {
     var started = false;
     /// Its stdin; null when it never started or can't be told.
     var stdin: ?std.posix.fd_t = null;
-    var pid: std.posix.pid_t = 0;
+    var pid: std.posix.pid_t = if (builtin.target.os.tag == .windows) null else 0;
 
+    // POSIX has no way to make a process outlive fx without help, because the
+    // kernel gives no handle on a descendant set. A long-lived POSIX shell reads
+    // the ids of the servers fx started and signals their groups once fx's stdin
+    // closes, which is what happens when fx exits. Windows does not need this: a
+    // job object kills the whole tree when its owner goes away, so none of these
+    // scripts runs there.
     const script =
         \\trap '' INT HUP
         \\g=
@@ -80,8 +114,11 @@ const helper = struct {
         \\for x in $g; do kill -s KILL -- "-$x"; done
     ;
 
-    /// Starts it, once, before the first server.
+    /// Starts it, once, before the first server. Windows has no helper to start:
+    /// a job object owns the servers' lifetime there, which is why `tell` and
+    /// `stop` do nothing on that platform.
     fn start(io: std.Io) void {
+        if (comptime builtin.target.os.tag == .windows) return;
         mutex.lockUncancelable(io);
         defer mutex.unlock(io);
         if (started) return;
@@ -92,7 +129,7 @@ const helper = struct {
             .stdout = .ignore,
             .stderr = .ignore,
             // Its own group, so the terminal's Ctrl-C doesn't reach it.
-            .pgid = 0,
+            .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
         }) catch return;
         const fd = child.stdin.?.handle;
         // A write never waits on it.
@@ -104,12 +141,14 @@ const helper = struct {
     /// Tells it a group started (`sign` '+') or was reaped ('-'). One that
     /// can't be told is stopped, so it never acts on a list out of date.
     fn tell(io: std.Io, sign: u8, group: std.posix.pid_t) void {
+        if (comptime builtin.target.os.tag == .windows) return;
         mutex.lockUncancelable(io);
         defer mutex.unlock(io);
         const fd = stdin orelse return;
         var buffer: [16]u8 = undefined;
         const line = std.mem.print(&buffer, "{c}{d}\n", .{ sign, group }) catch return;
         if (std.c.write(fd, line.ptr, line.len) == line.len) return;
+        // The helper is unusable, so it is ended and never told anything again.
         std.posix.kill(pid, .KILL) catch {};
         stdin = null;
     }
@@ -195,9 +234,43 @@ const tail_lines = 3;
 const stderr_drain_ms = 250;
 
 fn exitOf(status: u32) ?Exit {
+    if (comptime builtin.target.os.tag == .windows) {
+        // A Windows process has an exit code and no signal, so the status word
+        // is the code `GetExitCodeProcess` returned.
+        return .{ .code = @truncate(status) };
+    }
     if (std.c.W.IFEXITED(status)) return .{ .code = std.c.W.EXITSTATUS(status) };
     if (std.c.W.IFSIGNALED(status)) return .{ .signal = @truncate(@backingInt(std.c.W.TERMSIG(status))) };
     return null;
+}
+
+/// The state one non-blocking check of a child found.
+const WaitOutcome = struct {
+    gone: bool,
+    exit: ?Exit = null,
+};
+
+/// Checks whether `pid` has exited, without blocking.
+///
+/// POSIX reaps with `waitpid(WNOHANG)` and decodes the status word. Windows has
+/// no wait to reap with: `GetExitCodeProcess` reports the code while the handle
+/// is held, and `STILL_ACTIVE` means it is still running.
+fn waitOnce(pid: std.posix.pid_t) WaitOutcome {
+    if (comptime builtin.target.os.tag == .windows) {
+        const process = windows_child.OpenProcess(windows_child.query_access, 0, @truncate(@intFromPtr(pid))) orelse
+            return .{ .gone = true };
+        defer _ = windows_child.CloseHandle(process);
+        var code: u32 = 0;
+        if (windows_child.GetExitCodeProcess(process, &code) == 0) return .{ .gone = true };
+        if (code == windows_child.still_active) return .{ .gone = false };
+        return .{ .gone = true, .exit = exitOf(code) };
+    }
+    var status: c_int = 0;
+    const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    // -1 means the pid is no longer ours to wait for; treat it as gone.
+    if (result == pid) return .{ .gone = true, .exit = exitOf(@bitCast(status)) };
+    if (result == -1) return .{ .gone = true };
+    return .{ .gone = false };
 }
 
 pub const Error = core.StepError || std.Io.Cancelable || std.Io.ConcurrentError || std.mem.Allocator.Error || error{TraceFailed};
@@ -318,8 +391,10 @@ pub const Process = struct {
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
             // The whole group, as `signal` does.
-            std.posix.kill(-pid, .KILL) catch std.posix.kill(pid, .KILL) catch {};
-            _ = std.c.waitpid(pid, null, 0);
+            if (comptime builtin.target.os.tag != .windows) {
+                std.posix.kill(-pid, .KILL) catch std.posix.kill(pid, .KILL) catch {};
+                _ = waitOnce(pid);
+            }
             helper.tell(p.io, '-', pid);
             p.pid = null;
         }
@@ -496,7 +571,7 @@ pub const Process = struct {
             .stdout = .pipe,
             .stderr = .pipe,
             // A new process group, led by the server.
-            .pgid = 0,
+            .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
         }) catch |err| {
             p.gpa.destroy(stdin);
             return err;
@@ -535,7 +610,7 @@ pub const Process = struct {
         p.signal(.kill);
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
-            _ = std.c.waitpid(pid, null, 0);
+            _ = waitOnce(pid);
             helper.tell(p.io, '-', pid);
         }
         p.pid = null;
@@ -549,6 +624,18 @@ pub const Process = struct {
         p.pid_lock.lockUncancelable(p.io);
         defer p.pid_lock.unlock(p.io);
         const pid = p.pid orelse return;
+        if (comptime builtin.target.os.tag == .windows) {
+            // A Windows process has no signal to receive, and no process group
+            // to address: ending the server is the whole operation. The MCP
+            // engine imports only the standard library, so it calls the kernel
+            // directly rather than through fx's io helpers.
+            const process_id: u32 = @truncate(@intFromPtr(pid));
+            if (windows_terminate.openProcess(windows_terminate.terminate_access, 0, process_id)) |handle| {
+                defer _ = windows_terminate.closeHandle(handle);
+                _ = windows_terminate.terminateProcess(handle, 1);
+            }
+            return;
+        }
         const sig: std.posix.SIG = switch (which) {
             .term => .TERM,
             .kill => .KILL,
@@ -686,11 +773,9 @@ pub const Process = struct {
     fn watch(p: *Process, generation: core.Generation, pid: std.posix.pid_t) std.Io.Cancelable!void {
         while (true) {
             p.pid_lock.lockUncancelable(p.io);
-            var status: c_int = 0;
-            const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-            // -1 means the pid is no longer ours to wait for; treat it as gone.
-            const gone = result == pid or result == -1;
-            if (result == pid) p.exit = exitOf(@bitCast(status));
+            const outcome = waitOnce(pid);
+            const gone = outcome.gone;
+            if (outcome.exit) |exit| p.exit = exit;
             if (gone) {
                 // Told while its id can't yet come round.
                 helper.tell(p.io, '-', pid);
@@ -1099,6 +1184,7 @@ test "a server's last stderr lines reach the sink and the tail before its exit d
 }
 
 test "a child that keeps stderr open delays a server's exit by at most stderr_drain_ms" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     // The background sleep inherits stderr, so the pipe outlives the server.
     const argv = shell("sleep 30 & echo $! >&2; exit 3");
     var p: Process = undefined;
@@ -1113,6 +1199,7 @@ test "a child that keeps stderr open delays a server's exit by at most stderr_dr
 }
 
 test "a stop signals the server's whole process group, so its children stop too" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     // The shell ignores closed stdin, so the stop escalates to SIGTERM. Its
     // child sleep must die with it.
     const argv = shell("sleep 30 & echo $! >&2; wait");
@@ -1194,6 +1281,7 @@ test "once the program is gone, the helper kills a server that ignores SIGTERM a
 }
 
 test "deinit kills the server's whole process group, so its children stop too" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const argv = shell("sleep 30 & echo $! >&2; wait");
     var p: Process = undefined;
     initTest(&p, &argv);
@@ -1218,7 +1306,7 @@ fn stubbornGroup() !std.process.Child {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
-        .pgid = 0,
+        .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
     });
     var buffer: [16]u8 = undefined;
     var reader = child.stderr.?.reader(testing.io, &buffer);
@@ -1229,26 +1317,27 @@ fn stubbornGroup() !std.process.Child {
 /// Whether child `pid` has ended within `ms`, reaping it if so.
 fn endsWithin(pid: std.posix.pid_t, ms: u32) bool {
     for (0..ms / 10) |_| {
-        if (std.c.waitpid(pid, null, std.c.W.NOHANG) == pid) return true;
+        if (waitOnce(pid).gone) return true;
         testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     return false;
 }
 
 test "the helper kills the groups it still lists 2 s after its stdin closes, and none it was told are gone" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var listed = try stubbornGroup();
     defer listed.stderr.?.close(testing.io);
     var gone = try stubbornGroup();
     defer gone.stderr.?.close(testing.io);
     defer if (!endsWithin(gone.id.?, 10)) {
         std.posix.kill(-gone.id.?, .KILL) catch {};
-        _ = std.c.waitpid(gone.id.?, null, 0);
+        _ = waitOnce(gone.id.?);
     };
     defer if (!endsWithin(listed.id.?, 10)) {
         std.posix.kill(-listed.id.?, .KILL) catch {};
-        _ = std.c.waitpid(listed.id.?, null, 0);
+        _ = waitOnce(listed.id.?);
     };
-    var reaper = try std.process.spawn(testing.io, .{ .argv = &.{ "/bin/sh", "-c", helper.script }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+    var reaper = try std.process.spawn(testing.io, .{ .argv = &.{ "/bin/sh", "-c", helper.script }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore, .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null });
     var said: [64]u8 = undefined;
     const told = try std.mem.print(&said, "+{d}\n+{d}\n-{d}\n", .{ listed.id.?, gone.id.?, gone.id.? });
     try testing.expectEqual(@as(isize, @intCast(told.len)), std.c.write(reaper.stdin.?.handle, told.ptr, told.len));

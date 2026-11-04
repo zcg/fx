@@ -17,6 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const readiness = @import("../shared/readiness.zig");
 const shell_resolver = @import("shell_resolver.zig");
 const command_runner = @import("../execution/command_runner.zig");
 
@@ -848,22 +849,22 @@ fn readPayload(
     const started_ms = io_mod.milliTimestamp();
     const deadline = started_ms + capture_timeout_ms;
     var chunk: [64 * 1024]u8 = undefined;
-    var fds = [_]std.posix.pollfd{
-        .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = stderr_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    var watches = [_]readiness.Watch{
+        .{ .fd = fd },
+        .{ .fd = stderr_fd },
     };
     var stderr_bytes: usize = 0;
     while (true) {
         const now = io_mod.milliTimestamp();
         if (now >= deadline) return .timed_out;
-        const wait_ms: i32 = @intCast(@min(deadline - now, read_poll_ms));
-        const ready = std.posix.poll(&fds, wait_ms) catch |err| {
+        const wait_ms: u32 = @intCast(@min(deadline - now, read_poll_ms));
+        const ready = readiness.pollDescriptors(&watches, .{ .milliseconds = wait_ms }) catch |err| {
             debug_trace.logf("core", "shell snapshot capture poll failed err={s}", .{@errorName(err)});
             return .incomplete;
         };
         if (ready == 0) continue;
-        if (fds[1].revents != 0) {
-            const drained = std.posix.read(stderr_fd, &chunk) catch 0;
+        if (watches[1].events.any()) {
+            const drained = io_mod.readFd(stderr_fd, &chunk) catch 0;
             if (stderr_bytes == 0 and drained > 0) {
                 debug_trace.logf("core", "shell snapshot capture first stderr bytes={d} elapsed_ms={d}", .{
                     drained,
@@ -872,10 +873,10 @@ fn readPayload(
             }
             stderr_bytes += drained;
             // Stop watching stderr once it closes.
-            if (drained == 0) fds[1].fd = -1;
+            if (drained == 0) watches[1].parked = true;
         }
-        if (fds[0].revents == 0) continue;
-        const read_len = std.posix.read(fd, &chunk) catch |err| {
+        if (!watches[0].events.any()) continue;
+        const read_len = io_mod.readFd(fd, &chunk) catch |err| {
             debug_trace.logf("core", "shell snapshot capture stdout read failed err={s} payload_bytes={d}", .{
                 @errorName(err),
                 payload.items.len,

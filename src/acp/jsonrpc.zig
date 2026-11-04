@@ -227,12 +227,12 @@ pub const Writer = struct {
     };
 
     pub fn init() Writer {
-        return .{ .stdout = std.Io.File.stdout() };
+        return .{ .stdout = io_mod.stdoutFile() };
     }
 
     pub fn initCallback(context: ?*anyopaque, write_fn: WriteFn) Writer {
         return .{
-            .stdout = std.Io.File.stdout(),
+            .stdout = io_mod.stdoutFile(),
             .callback = .{
                 .context = context,
                 .write_fn = write_fn,
@@ -336,12 +336,12 @@ pub const Reader = struct {
     // backend and let the host's fd_read import suspend through JSPI.
     fn readStdin(_: ?*anyopaque, destination: []u8) usize {
         if (comptime host_target.is_wasm) {
-            return std.Io.File.stdin().readStreaming(
+            return io_mod.stdinFile().readStreaming(
                 io_mod.getIo(),
                 &.{destination},
             ) catch return 0;
         }
-        return std.posix.read(std.posix.STDIN_FILENO, destination) catch return 0;
+        return io_mod.readFd(io_mod.stdinHandle(), destination) catch return 0;
     }
 
     fn readFromSource(self: *Reader) usize {

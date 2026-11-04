@@ -100,9 +100,9 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         var state_buf: [43]u8 = undefined;
         const state = std.base64.url_safe_no_pad.Encoder.encode(&state_buf, &entropy);
         const start_url = try alloc.print("{s}/api/slack/install?state={s}&challenge={s}&port={d}", .{ origin, state, challenge, listener.socket.address.getPort() });
-        try std.Io.File.stderr().writeStreamingAll(io.getIo(), "Authorize the workspace installation in your browser. Keep fx running.\n");
+        try io.writeFd(io.stderrHandle(), "Authorize the workspace installation in your browser. Keep fx running.\n");
         if (io.getenv("FX_NO_OPEN_BROWSER") != null or !try opener.open(alloc, start_url)) {
-            try std.Io.File.stderr().writeStreamingAll(io.getIo(), try alloc.print("Open on this computer: {s}\n", .{start_url}));
+            try io.writeFd(io.stderrHandle(), try alloc.print("Open on this computer: {s}\n", .{start_url}));
         }
         var context = oauth.FormCallbackContext{
             .expected_state = state,
@@ -260,7 +260,7 @@ fn load(alloc: Allocator, dir: *io.VerifiedDir) !?Installation {
     };
     defer file.close(io.getIo());
     const stat = try file.stat(io.getIo());
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600) return error.UnsafeSlackCredentialFile;
+    if (stat.kind != .file or stat.nlink != 1 or io.modeMismatch(stat.permissions, 0o600)) return error.UnsafeSlackCredentialFile;
     const bytes = try io.readFileToEnd(alloc, &file, 65536);
     const record = (try json_decode.parseFromSlice(Installation, alloc, bytes, .{ .allocate = .alloc_always })).value;
     if (record.version != 1 or !valid_id(record.app_id, "A") or !valid_id(record.team_id, "T") or !valid_id(record.bot_user_id, "UW") or !valid_id(record.bot_id, "B") or !valid_id(record.installed_by, "UW") or !std.mem.eql(u8, record.scope, bot_scope) or record.access_token.len == 0 or

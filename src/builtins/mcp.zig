@@ -639,7 +639,7 @@ test "saving MCP config replaces the file durably" {
     {
         var seed = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{ .mode = .read_write });
         defer seed.close(io_mod.getIo());
-        try seed.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o644));
+        try io_mod.setPermissions(seed, io_mod.permissionsForMode(0o644));
     }
 
     // Hold the pre-save file open. A rename-over leaves this descriptor on the
@@ -661,7 +661,7 @@ test "saving MCP config replaces the file durably" {
     try std.testing.expect(std.mem.find(u8, written, "stale") == null);
 
     const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 
     var it = fx_dir.iterate();
     var entries: usize = 0;

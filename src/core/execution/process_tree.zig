@@ -215,10 +215,7 @@ pub const Tracker = struct {
     }
 
     pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
-        const root_snapshot: ?ProcessSnapshot = captureSnapshot(self.alloc, root_pid) catch |err| switch (err) {
-            error.ProcessNotFound => null,
-            else => return err,
-        };
+        const root_snapshot: ?ProcessSnapshot = captureSnapshotOptional(self.alloc, root_pid) catch |err| return err;
         var traverse_root = false;
         if (root_snapshot) |snapshot| {
             if (self.root) |root| {
@@ -936,6 +933,7 @@ test "macOS lineage identity matches only the same unique process" {
 }
 
 test "checked signal delivery distinguishes vanished stale and failed targets" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
             return switch (pid) {
@@ -989,6 +987,7 @@ test "checked signal delivery distinguishes vanished stale and failed targets" {
 }
 
 test "checked signal delivery keeps vanished stale and excluded targets complete" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
             if (pid == 21) return error.ProcessNotFound;
@@ -1049,6 +1048,7 @@ test "natural completion detaches only processes that left the command session" 
 }
 
 test "natural completion stops attached processes and keeps detached daemons" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         var sent: [16]std.posix.pid_t = undefined;
         var sent_count: usize = 0;
@@ -1122,6 +1122,7 @@ test "natural completion stops attached processes and keeps detached daemons" {
 }
 
 test "a kill stops every tracked process before killing any" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         var pids: [16]std.posix.pid_t = undefined;
         var signals: [16]std.posix.SIG = undefined;
@@ -1188,6 +1189,7 @@ test "a kill stops every tracked process before killing any" {
 }
 
 test "natural completion keeps an unreadable process attached and reports it" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         var sent_count: usize = 0;
 
@@ -1230,6 +1232,7 @@ test "natural completion keeps an unreadable process attached and reports it" {
 }
 
 test "session inspection separates the caller's session from a new one" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const io = std.testing.io;
@@ -1259,6 +1262,21 @@ test "session inspection separates the caller's session from a new one" {
         CompletionStanding.detached,
         completionStanding(own_session, inspectSession(pid)),
     );
+}
+
+/// Captures a process snapshot, or null when the process is already gone.
+///
+/// Only Linux and macOS can enumerate processes, so `captureSnapshot` returns a
+/// narrower error set elsewhere and `ProcessNotFound` is not one of its members.
+/// Naming that case in a `catch` switch therefore fails to compile on Windows,
+/// where every case would already be covered. Splitting the two platforms lets
+/// each name the cases its own error set carries.
+fn captureSnapshotOptional(alloc: Allocator, pid: std.posix.pid_t) !?ProcessSnapshot {
+    if (comptime builtin.target.os.tag == .linux or builtin.target.os.tag == .macos) {
+        const snapshot = try captureSnapshot(alloc, pid);
+        return snapshot;
+    }
+    return try captureSnapshot(alloc, pid);
 }
 
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {

@@ -385,7 +385,7 @@ test "the profile's first write creates ~/.fx readable only by its owner" {
     defer alloc.free(path);
     try write(alloc, .profile, path, "{\"mcpServers\":{}}");
     const dir = try tmp.dir.statFile(io, ".fx", .{});
-    try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir.permissions.toMode() & 0o777);
     const file = try tmp.dir.statFile(io, ".fx/mcp.json", .{});
-    try testing.expectEqual(@as(std.posix.mode_t, 0o600), file.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(std.posix.mode_t, 0o600), file.permissions.toMode() & 0o777);
 }

@@ -19,20 +19,33 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) process_provider.ProviderError!process_identity.ProcessInstanceToken {
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
-        return error.InvalidPid;
+    // A process instance token is a start time and an argument digest read from
+    // the kernel's process listing. Windows exposes no such listing, and its
+    // `pid_t` is an opaque handle rather than a number to parse, so the check
+    // cannot run there and says so before parsing anything.
     return switch (builtin.target.os.tag) {
-        .linux => captureLinuxToken(alloc, pid) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.ProcessNotFound => error.ProcessNotFound,
-            else => error.ProcessIdentityUnavailable,
+        .linux => {
+            const pid = parsePid(pid_text) catch return error.InvalidPid;
+            return captureLinuxToken(alloc, pid) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ProcessNotFound => error.ProcessNotFound,
+                else => error.ProcessIdentityUnavailable,
+            };
         },
-        .macos => captureMacOSToken(pid) catch |err| switch (err) {
-            error.ProcessNotFound => error.ProcessNotFound,
-            else => error.ProcessIdentityUnavailable,
+        .macos => {
+            const pid = parsePid(pid_text) catch return error.InvalidPid;
+            return captureMacOSToken(pid) catch |err| switch (err) {
+                error.ProcessNotFound => error.ProcessNotFound,
+                else => error.ProcessIdentityUnavailable,
+            };
         },
         else => error.ProcessIdentityUnsupported,
     };
+}
+
+/// Parses a process id from the text fx records beside a token.
+fn parsePid(pid_text: []const u8) !std.posix.pid_t {
+    return std.fmt.parseInt(std.posix.pid_t, pid_text, 10);
 }
 
 fn matchToken(
@@ -222,6 +235,11 @@ fn signalProcess(
     pid_text: []const u8,
     expected: process_identity.ProcessInstanceToken,
 ) process_provider.ProviderError!void {
+    // Signalling another process by id needs a process tree to confirm identity
+    // before acting, and Windows exposes no such listing. The host reports
+    // `process_control` only where it can back that promise, so this path is not
+    // reached there.
+    if (comptime builtin.target.os.tag == .windows) return error.Unsupported;
     switch (matchToken(context, alloc, pid_text, expected)) {
         .matched => {},
         .missing, .mismatched => return error.ProcessIdentityMismatch,

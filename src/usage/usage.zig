@@ -5,6 +5,7 @@
 //! Grok plan its allowance and credits. All usage logic lives here.
 
 const std = @import("std");
+const io_mod = @import("../core/shared/io.zig");
 const builtin = @import("builtin");
 pub const report = @import("report.zig");
 pub const policy = @import("policy.zig");
@@ -542,7 +543,7 @@ pub const Dashboard = struct {
     fn openOrCreateFxDir(self: *Dashboard) ?Io.Dir {
         var home = self.openHome() orelse return null;
         defer home.close(self.io());
-        home.createDir(self.io(), self.host.fx_dir_name, .fromMode(0o700)) catch |err| switch (err) {
+        home.createDir(self.io(), self.host.fx_dir_name, io_mod.permissionsForMode(0o700)) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return null,
         };
@@ -1007,7 +1008,7 @@ const member: Credential = .{ .scope = .member, .bearer = "vca_token", .team = "
 const api_key: Credential = .{ .scope = .api_key, .bearer = "vck_key", .team = null, .subject = "vck_key" };
 
 fn testHome(tmp: *std.testing.TmpDir) ![:0]u8 {
-    try tmp.dir.createDir(testing.io, ".fx", .fromMode(0o700));
+    try tmp.dir.createDir(testing.io, ".fx", io_mod.permissionsForMode(0o700));
     return tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
 }
 
@@ -1181,7 +1182,7 @@ test "a first fetch creates a private ~/.fx for its cache" {
     try testing.expect(snap.status == .ready);
     const stat = try tmp.dir.statFile(testing.io, ".fx", .{});
     try testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
-    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    if (comptime io_mod.modeIsEnforced) try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "a Codex sign-in reads its plan's limits from ChatGPT" {

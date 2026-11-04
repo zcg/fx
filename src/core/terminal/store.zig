@@ -397,8 +397,10 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
-                return error.InvalidTerminalRecord;
+            // The recorded id is text, so it is validated as the digits of a
+            // process id rather than parsed into a `pid_t`, which Windows does
+            // not express as a number.
+            _ = io_mod.parseProcessId(pid) catch return error.InvalidTerminalRecord;
             _ = process_identity.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,
             ) catch return error.InvalidTerminalRecord;
@@ -1342,10 +1344,12 @@ pub fn formatOwnerIdentity(
     token: process_identity.ProcessInstanceToken,
 ) error{ NoSpaceLeft, InvalidOwnerIdentity }![]const u8 {
     if (instance_hex.len != owner_instance_hex_len) return error.InvalidOwnerIdentity;
+    // The identity is text, so the process is recorded by the number the kernel
+    // reports rather than by its handle value, which is a pointer on Windows.
     return std.mem.print(buffer, "{s}{s}/{d}/{s}", .{
         owner_identity_prefix,
         instance_hex,
-        pid,
+        io_mod.pidAsNumber(pid),
         token.view(),
     });
 }
@@ -5943,7 +5947,7 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
     var terminal_root = io_mod.VerifiedDir{ .dir = try root.dir.openDir(std.testing.io, profile_paths.terminal_dir_name, .{ .iterate = true, .follow_symlinks = false }) };
     defer terminal_root.close();
     const made_stat = try terminal_root.dir.statFile(std.testing.io, "v2-new-owner", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o700), made_stat.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), made_stat.permissions.toMode() & 0o777);
     var found = try fixture.profile.open_capability("v2-new-owner", false, false);
     found.deinit();
     var side = try fixture.profile.open_capability("v2-side-owner", false, false);

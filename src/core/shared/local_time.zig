@@ -148,6 +148,11 @@ extern "c" fn localtime_r(timer: *const std.c.time_t, result: *Tm) ?*Tm;
 fn localZoneAt(epoch_s: i64) Zone {
     if (builtin.is_test) return test_zone;
     if (!builtin.link_libc or builtin.target.os.tag == .wasi) return .utc;
+    // `std.c.time_t` is a real integer on the POSIX targets, but not on every
+    // target this file is compiled for, so the cast is made only where the type
+    // can hold a time. `std.math.cast` refuses a non-integer type at comptime,
+    // which is why the check comes first.
+    if (comptime @typeInfo(std.c.time_t) != .int) return .utc;
     const timer = std.math.cast(std.c.time_t, epoch_s) orelse return .utc;
     var tm: Tm = undefined;
     if (localtime_r(&timer, &tm) == null) return .utc;

@@ -224,7 +224,7 @@ fn createUnlinkedFile(alloc: Allocator, temp_dir: []const u8, stem: []const u8) 
     var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
         .read = true,
         .exclusive = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     }) catch |err| switch (err) {
         error.PathAlreadyExists => return error.ReplayNameCollision,
         else => return error.EphemeralReplayUnavailable,
@@ -1454,7 +1454,7 @@ test "command replay capture spills without losing callback order" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -1494,10 +1494,7 @@ test "command replay capture spills without losing callback order" {
         replay_path,
         .{ .follow_symlinks = false },
     );
-    try std.testing.expectEqual(
-        @as(u32, 0o600),
-        replay_stat.permissions.toMode() & 0o777,
-    );
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), replay_stat.permissions.toMode() & 0o777);
     var reader = try Reader.open(alloc, &capability, descriptor);
     defer reader.deinit();
 
@@ -1628,7 +1625,7 @@ test "saved and ephemeral replay backings share collision handling" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -1962,7 +1959,7 @@ test "saved command replay pages and searches beyond eight mebibytes with bounde
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -2020,7 +2017,7 @@ test "command replay reader rejects descriptor and frame corruption" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -2138,7 +2135,7 @@ test "command replay cleanup removes tentative and retained spools exactly once"
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,

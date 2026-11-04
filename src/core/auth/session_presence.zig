@@ -25,7 +25,7 @@ pub fn requireWritableProfileFile(file_name: []const u8, lock_name: []const u8) 
     }) catch |err| {
         if (err != error.FileNotFound) return error.CredentialStorageUnavailable;
         const stat = home_dir.stat(io_mod.getIo()) catch return error.CredentialStorageUnavailable;
-        if (stat.permissions.toMode() & 0o200 == 0) return error.CredentialStorageUnavailable;
+        if (io_mod.inaccessibleToWrite(stat.permissions)) return error.CredentialStorageUnavailable;
         return false;
     };
     defer profile_dir.close(io_mod.getIo());
@@ -48,12 +48,12 @@ pub fn storageError(file_name: []const u8, err: anyerror) error{ OutOfMemory, Ca
 /// Borrows the verified store directory; checks metadata without changing it.
 pub fn requireWritableInDir(dir: std.Io.Dir, file_name: []const u8) error{CredentialStorageUnavailable}!bool {
     const dir_stat = dir.stat(io_mod.getIo()) catch return error.CredentialStorageUnavailable;
-    if (dir_stat.permissions.toMode() & 0o200 == 0) return error.CredentialStorageUnavailable;
+    if (io_mod.inaccessibleToWrite(dir_stat.permissions)) return error.CredentialStorageUnavailable;
     const stat = dir.statFile(io_mod.getIo(), file_name, .{ .follow_symlinks = false }) catch |err| {
         if (err == error.FileNotFound) return false;
         return error.CredentialStorageUnavailable;
     };
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600) {
+    if (stat.kind != .file or stat.nlink != 1 or io_mod.modeMismatch(stat.permissions, 0o600)) {
         return error.CredentialStorageUnavailable;
     }
     return true;
@@ -90,7 +90,7 @@ fn profileFileFromHome(
     const stat = file.stat(io_mod.getIo()) catch return .unavailable;
     if (stat.kind != .file or
         stat.nlink != 1 or
-        stat.permissions.toMode() & 0o077 != 0 or
+        io_mod.exposesGroupOrOther(stat.permissions) or
         stat.size == 0 or
         stat.size > max_bytes)
     {
@@ -112,13 +112,13 @@ test "credential write admission accepts missing files and rejects read-only tar
     try std.testing.expect(!try requireWritableInDir(tmp.dir, "auth.json"));
     var file = try tmp.dir.createFile(std.testing.io, "auth.json", .{
         .read = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     });
     defer file.close(std.testing.io);
     try std.testing.expect(try requireWritableInDir(tmp.dir, "auth.json"));
-    defer file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o600)) catch {};
+    defer io_mod.setPermissions(file, io_mod.permissionsForMode(0o600)) catch {};
     for ([_]std.posix.mode_t{ 0o400, 0o200, 0o700 }) |mode| {
-        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(mode));
+        try io_mod.setPermissions(file, io_mod.permissionsForMode(mode));
         try std.testing.expectError(error.CredentialStorageUnavailable, requireWritableInDir(tmp.dir, "auth.json"));
     }
 }

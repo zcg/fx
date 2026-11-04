@@ -2340,7 +2340,7 @@ test "merged settings rejects writable user policy files" {
     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{});
     defer root_dir.close(io_mod.getIo());
     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o666)) catch {
+    io_mod.setPermissions(file, io_mod.permissionsForMode(0o666)) catch {
         file.close(io_mod.getIo());
         return error.SkipZigTest;
     };
@@ -4465,7 +4465,7 @@ test "detailed settings remove loose write access, load, and note it once" {
     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{});
     defer root_dir.close(io_mod.getIo());
     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o666)) catch {
+    io_mod.setPermissions(file, io_mod.permissionsForMode(0o666)) catch {
         file.close(io_mod.getIo());
         return error.SkipZigTest;
     };
@@ -4487,7 +4487,7 @@ test "detailed settings remove loose write access, load, and note it once" {
         try std.testing.expect(result.prompt_history_store_allowed);
     }
     const tightened = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), tightened.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), tightened.permissions.toMode() & 0o777);
 
     // Nothing is loose any more, so the next start says nothing.
     var again = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);

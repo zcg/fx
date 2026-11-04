@@ -13,16 +13,60 @@
 //! and the driver. Without hooks that code does not exist in the binary.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Io = std.Io;
 
-pub const hooks = build_options.hooks;
+/// Whether the test-only fault injection is compiled in.
+///
+/// It models a POSIX filesystem: descriptors are numbers, `dup` shares an inode,
+/// and a kill is a signal. Windows has none of those, so the module is left out
+/// there whatever the build asks for; the durability suites that drive it report
+/// themselves as skipped.
+pub const hooks = build_options.hooks and @import("builtin").target.os.tag != .windows;
 pub const Fault = if (hooks) @import("storage_fault.zig").Fault else void;
 
 pub const folder_mode: std.posix.mode_t = 0o700;
 pub const file_mode: std.posix.mode_t = 0o600;
 /// A blob never changes once written, and a tool may open it by path (D49).
 pub const blob_mode: std.posix.mode_t = 0o400;
+
+/// The session manager reads and writes the profile's own folders with these
+/// two calls and nothing else, because it may import only the standard library.
+/// POSIX answers both directly. Windows has no mode: its `Permissions` is a
+/// `DWORD` of attributes whose only security-relevant bit is READONLY, access
+/// comes from the ACL the entry inherits, and the type has neither method. The
+/// helpers therefore make the same request Windows can honor, and report no
+/// mode, which is why `modeIsEnforced` is false there.
+pub const modeIsEnforced = @hasDecl(std.Io.File.Permissions, "fromMode");
+
+/// The Windows READONLY file attribute, `0x1`. Zig 0.17.0's Windows
+/// `Permissions.setReadOnly` names a constant its own `std.os.windows` does not
+/// declare, so the session manager builds the attribute itself.
+const windows_readonly_attribute: u32 = 0x1;
+
+/// Requests a `mode` for a new folder or file, as far as this platform can.
+/// `0o400` asks for a read-only blob, which is the one mode bit Windows also has.
+pub fn permissionsForMode(mode: std.posix.mode_t) std.Io.File.Permissions {
+    if (comptime modeIsEnforced) return std.Io.File.Permissions.fromMode(mode);
+    if (mode & 0o200 == 0) return @fromBackingInt(windows_readonly_attribute);
+    return if (mode & 0o040 != 0) .default_dir else .default_file;
+}
+
+/// Reads the mode back for a caller that verifies what it created. Windows has
+/// no mode to report, so this answers zero rather than inventing one; callers
+/// gate the comparison on `modeIsEnforced`.
+pub fn modeOf(permissions: std.Io.File.Permissions) std.posix.mode_t {
+    if (comptime modeIsEnforced) return permissions.toMode() & 0o777;
+    return 0;
+}
+
+/// Whether the entry refuses writes. POSIX reads the mode's write bits, and
+/// Windows reads the READONLY attribute.
+pub fn deniesWrites(permissions: std.Io.File.Permissions) bool {
+    if (comptime modeIsEnforced) return permissions.toMode() & 0o222 == 0;
+    return @backingInt(permissions) & windows_readonly_attribute != 0;
+}
 
 pub const Error = error{
     /// No file or folder by that name.
@@ -101,7 +145,7 @@ pub const Storage = struct {
         // Missing parents are the manager's own folders, so private too, for
         // example `~/.fx/sessions` on a machine that never ran v1 (D19).
         // Existing ones are left as they are.
-        _ = cwd.createDirPathStatus(s.io, parent_path, .fromMode(folder_mode)) catch |err| return translate(err);
+        _ = cwd.createDirPathStatus(s.io, parent_path, permissionsForMode(folder_mode)) catch |err| return translate(err);
         var parent = cwd.openDir(s.io, parent_path, .{}) catch |err| return translate(err);
         defer parent.close(s.io);
         return s.ensureDir(.{ .handle = parent }, name);
@@ -151,7 +195,7 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
-        parent.handle.createDir(s.io, name, .fromMode(folder_mode)) catch |err|
+        parent.handle.createDir(s.io, name, permissionsForMode(folder_mode)) catch |err|
             return translate(err);
         if (hooks) if (s.fault) |f| try f.noteCreate(s, parent, name);
     }
@@ -176,7 +220,7 @@ pub const Storage = struct {
             .read = true,
             .truncate = false,
             .exclusive = true,
-            .permissions = .fromMode(mode),
+            .permissions = permissionsForMode(mode),
             .resolve_beneath = true,
         }) catch |err| return translate(err);
         if (hooks) if (s.fault) |f| {
@@ -272,9 +316,15 @@ pub const Storage = struct {
     }
 
     /// Makes created, renamed and removed names inside `dir` durable.
+    ///
+    /// A POSIX filesystem makes a rename durable by syncing the directory. Windows
+    /// cannot sync a directory handle at all, so there is nothing to wait for
+    /// there and the call reports success: the file's own data was already synced
+    /// by the caller, and refusing here would fail every write on that platform.
     pub fn syncDir(s: Storage, dir: Dir) Error!void {
         try s.alive();
         try s.mutate();
+        if (comptime builtin.target.os.tag == .windows) return;
         const as_file: Io.File = .{ .handle = dir.handle.handle, .flags = .{ .nonblocking = false } };
         as_file.sync(s.io) catch |err| return translate(err);
         if (hooks) if (s.fault) |f| try f.noteDirSync(s, dir);
@@ -351,7 +401,7 @@ pub const Storage = struct {
                 .directory => .directory,
                 else => .other,
             },
-            .mode = st.permissions.toMode() & 0o777,
+            .mode = modeOf(st.permissions),
             .mtime_ms = st.mtime.toMilliseconds(),
         };
     }

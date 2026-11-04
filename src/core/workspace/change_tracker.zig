@@ -169,6 +169,7 @@ fn expectSignalHandlerEqual(expected: std.posix.Sigaction, actual: std.posix.Sig
 }
 
 test "file size limit guard restores SIGXFSZ after normal use" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     var original: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
@@ -190,6 +191,7 @@ test "file size limit guard restores SIGXFSZ after normal use" {
 }
 
 test "file size limit setup restores SIGXFSZ on failure" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     var original: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);

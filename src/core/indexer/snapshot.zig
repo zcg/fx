@@ -64,7 +64,7 @@ fn readAdmitted(arena: Allocator, path: []const u8) ![]const u8 {
     var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false, .allow_directory = false });
     defer file.close(io);
     const stat = try file.stat(io);
-    if (stat.kind != .file or stat.nlink != 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidSnapshot;
+    if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions) or stat.size > max_bytes) return error.InvalidSnapshot;
     const bytes = try arena.alloc(u8, @intCast(stat.size));
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -116,7 +116,7 @@ pub fn save(alloc: Allocator, path: []const u8, trees: []const Tree) !void {
     defer dir.close(io);
     var verified: io_mod.VerifiedDir = .{ .dir = dir };
     try io_mod.durableReplaceVerified(alloc, &verified, std.Io.Dir.path.basename(path), out.written());
-    try dir.setPermissions(io, .fromMode(0o700));
+    try io_mod.setPermissions(dir, io_mod.permissionsForMode(0o700));
 }
 
 fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) !void {
@@ -344,13 +344,13 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
     // Older formats fail the magic check. A v2 file stamped every source
     // without following symlinks.
     for ([_][]const u8{ "fx-file-index-v1\n{}", "fx-file-index-v2\n" }) |old| {
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = old, .flags = .{ .permissions = .fromMode(0o600) } });
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = old, .flags = .{ .permissions = io_mod.permissionsForMode(0o600) } });
         try std.testing.expect((try load(alloc, path, &roots)) == null);
     }
 
     // A file others can read is not trusted.
     try save(alloc, path, &trees);
-    try std.Io.Dir.cwd().setFilePermissions(std.testing.io, path, .fromMode(0o644), .{});
+    try std.Io.Dir.cwd().setFilePermissions(std.testing.io, path, io_mod.permissionsForMode(0o644), .{});
     try std.testing.expect((try load(alloc, path, &roots)) == null);
 
     try save(alloc, path, &.{ testTree("/w", &.{}), testTree("/extra", &.{}) });

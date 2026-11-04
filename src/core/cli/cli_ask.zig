@@ -3637,7 +3637,7 @@ fn readAskTerminalLine(
 
 fn readOwnedStdinLine(alloc: Allocator) anyerror![]u8 {
     var read_buffer: [64 * 1024]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buffer);
+    var reader = io_mod.stdinFile().reader(io_mod.getIo(), &read_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.EndOfStream;
     return alloc.dupe(u8, line);
 }
@@ -3914,7 +3914,7 @@ fn readPromptFromStdinSourceWithLimit(
 ) ![]u8 {
     const input = switch (stdin) {
         .real => blk: {
-            if (try std.Io.File.stdin().isTty(io_mod.getIo())) return error.MissingPrompt;
+            if (try io_mod.stdinFile().isTty(io_mod.getIo())) return error.MissingPrompt;
             break :blk try readPromptFromStdin(alloc, resource_byte_limit);
         },
         .tty => return error.MissingPrompt,
@@ -3938,7 +3938,7 @@ fn readPromptFromStdinSourceWithLimit(
 fn readPromptFromStdin(alloc: Allocator, resource_byte_limit: usize) ![]u8 {
     const zio = io_mod.getIo();
     var read_buf: [8192]u8 = undefined;
-    var r = std.Io.File.stdin().reader(zio, &read_buf);
+    var r = io_mod.stdinFile().reader(zio, &read_buf);
     return readPromptFromReader(alloc, &r.interface, resource_byte_limit);
 }
 
@@ -4142,7 +4142,7 @@ fn promptRealPermissionApproval(
     notify_attention: NotifyAttentionFn,
 ) !PermissionApprovalPromptResult {
     const zio = io_mod.getIo();
-    const stdin_tty = std.Io.File.stdin().isTty(zio) catch false;
+    const stdin_tty = io_mod.stdinFile().isTty(zio) catch false;
     if (!stdin_tty) return .unavailable;
 
     try write_stderr(stderr_ctx, "fx wants to run:\n  ");
@@ -4151,7 +4151,7 @@ fn promptRealPermissionApproval(
     notify_attention(attention_ctx);
 
     var read_buf: [256]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(zio, &read_buf);
+    var reader = io_mod.stdinFile().reader(zio, &read_buf);
     const line = reader.interface.takeDelimiter('\n') catch return .deny;
     const answer = std.mem.trim(u8, line orelse "", " \t\r\n");
     if (answer.len == 1 and (answer[0] == 'y' or answer[0] == 'Y')) return .approve;
@@ -4159,23 +4159,23 @@ fn promptRealPermissionApproval(
 }
 
 fn realStderrIsTty(_: ?*anyopaque) bool {
-    return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
+    return io_mod.stderrFile().isTty(io_mod.getIo()) catch false;
 }
 
 fn realStdinIsTty(_: ?*anyopaque) bool {
-    return std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
+    return io_mod.stdinFile().isTty(io_mod.getIo()) catch false;
 }
 
 fn realStdoutIsTty(_: ?*anyopaque) bool {
-    return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
+    return io_mod.stdoutFile().isTty(io_mod.getIo()) catch false;
 }
 
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stdoutHandle(), text);
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stderrHandle(), text);
 }
 
 const TestCapture = struct {
@@ -5912,6 +5912,7 @@ test "fx ask automatic review observes worker cancellation" {
 }
 
 test "headless ask SIGINT sets process-lifetime cancellation storage" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     var scope = try headless_interrupt.Scope.install(true);
@@ -6086,6 +6087,7 @@ fn sendRequestedSigints(state: *CrossThreadSigintState) void {
 }
 
 test "headless ask rejects concurrent and nested interrupt scopes without overwrite" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     var first = try headless_interrupt.Scope.install(true);
@@ -6119,6 +6121,7 @@ test "headless ask rejects concurrent and nested interrupt scopes without overwr
 }
 
 test "headless ask restores the exact previous SIGINT handler" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{
@@ -6142,6 +6145,7 @@ test "headless ask restores the exact previous SIGINT handler" {
 }
 
 test "headless ask redelivers consumed SIGINT after restoring the previous handler" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{
@@ -6166,6 +6170,7 @@ test "headless ask redelivers consumed SIGINT after restoring the previous handl
 }
 
 test "headless ask returns nonzero when the restored SIGINT handler returns" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{
@@ -6203,6 +6208,7 @@ test "headless ask returns nonzero when the restored SIGINT handler returns" {
 }
 
 test "headless ask startup cancellation prevents later hooks" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{
@@ -6263,6 +6269,7 @@ test "headless ask startup cancellation prevents later hooks" {
 }
 
 test "headless ask resets signal-visible cancellation state for each scope" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     var scope = try headless_interrupt.Scope.install(true);
@@ -6279,6 +6286,7 @@ test "headless ask resets signal-visible cancellation state for each scope" {
 }
 
 test "headless ask preserves signal ordering during install and teardown" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{
@@ -6307,6 +6315,7 @@ test "headless ask preserves signal ordering during install and teardown" {
 }
 
 test "headless ask cross-thread SIGINT teardown and reuse target only the active scope" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{
@@ -6347,6 +6356,7 @@ test "headless ask cross-thread SIGINT teardown and reuse target only the active
 }
 
 test "disabled headless ask scope leaves the interactive SIGINT handler untouched" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_headless_interrupt) return error.SkipZigTest;
 
     const previous_action: std.posix.Sigaction = .{

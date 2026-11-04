@@ -747,7 +747,7 @@ fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
 }
 
 fn writeStdout(text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stdoutHandle(), text);
 }
 
 test "ChatGPT E2E OAuth endpoint overrides accept only loopback HTTP" {

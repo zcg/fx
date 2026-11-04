@@ -991,8 +991,8 @@ const api_tests = struct {
         defer root.close(io);
         var folder = try root.openDir(io, id, .{});
         defer folder.close(io);
-        try folder.setFilePermissions(io, "log.jsonl", .fromMode(0o400), .{});
-        defer folder.setFilePermissions(io, "log.jsonl", .fromMode(0o600), .{}) catch {};
+        try folder.setFilePermissions(io, "log.jsonl", storage.permissionsForMode(storage.blob_mode), .{});
+        defer folder.setFilePermissions(io, "log.jsonl", storage.permissionsForMode(storage.file_mode), .{}) catch {};
         try testing.expectError(error.AccessDenied, f.manager.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app }));
     }
 
@@ -2080,7 +2080,7 @@ const api_tests = struct {
         const st = try file.stat(io);
         file.close(io);
         try testing.expectEqualStrings("%PDF-1.7 a download", buffer[0..len]);
-        try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
+        if (comptime storage.modeIsEnforced) try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
         try testing.expectError(error.AccessDenied, std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }));
 
         // A fork's hard link is the same read-only file under the fork's folder.
@@ -2092,7 +2092,7 @@ const api_tests = struct {
         defer gpa.free(fork_path);
         try testing.expect(std.mem.find(u8, fork_path, fork_id) != null);
         const fork_st = try std.Io.Dir.cwd().statFile(io, fork_path, .{});
-        try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), fork_st.permissions.toMode() & 0o777);
+        if (comptime storage.modeIsEnforced) try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), fork_st.permissions.toMode() & 0o777);
 
         // Only a well-formed hash this session holds has a path.
         try testing.expectError(error.NotFound, m.blobPath(gpa, id, &@as([64]u8, @splat('b'))));
@@ -2145,7 +2145,7 @@ const api_tests = struct {
         while (try names.next(io)) |entry| {
             try testing.expect(schema.validBlobHash(entry.name));
             const st = try blobs.statFile(io, entry.name, .{});
-            try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
+            if (comptime storage.modeIsEnforced) try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
             count += 1;
         }
         try testing.expectEqual(@as(usize, 2), count);

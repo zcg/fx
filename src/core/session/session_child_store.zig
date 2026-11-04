@@ -4,8 +4,8 @@ const io_mod = @import("../shared/io.zig");
 const artifact_digest = @import("artifact_digest.zig");
 
 const Allocator = std.mem.Allocator;
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = io_mod.permissionsForMode(0o700);
+const private_file_permissions = io_mod.permissionsForMode(0o600);
 
 pub const subagent_relationship_index_file = "relationship-index.bin";
 
@@ -481,7 +481,7 @@ const CapabilityImpl = struct {
         errdefer dir.close(io_mod.getIo());
 
         if (self.mode == .writable) {
-            dir.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+            io_mod.setPermissions(dir, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDirectory(dir);
@@ -673,7 +673,7 @@ pub const MemoryBlobsForTesting = struct {
             defer self.alloc.free(file_path);
             var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), file_path, .{
                 .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o400),
+                .permissions = io_mod.permissionsForMode(0o400),
             }) catch return error.BlobStoreFailed;
             defer file.close(io_mod.getIo());
             file.writeStreamingAll(io_mod.getIo(), bytes) catch return error.BlobStoreFailed;
@@ -897,7 +897,7 @@ pub const SessionChildCapability = struct {
         };
         errdefer route.close(io_mod.getIo());
         if (mode == .writable) {
-            route.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+            io_mod.setPermissions(route, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         return initOpenedLegacyRoute(alloc, route, route_path, kind, mode);
@@ -1125,7 +1125,7 @@ pub const SessionChildCapability = struct {
         };
         var file_open = true;
         errdefer if (file_open) file.close(io_mod.getIo());
-        file.setPermissions(io_mod.getIo(), private_file_permissions) catch
+        io_mod.setPermissions(file, private_file_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
         try verifyPrivateRegularFile(file);
         io_mod.syncVerifiedDir(route_dir.dir) catch {
@@ -1293,7 +1293,8 @@ pub const SessionChildCapability = struct {
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.DurablePathUnsafe => return error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => return err,
+            // The permission variant only exists where a POSIX mode is enforced,
+            // so it cannot take an arm of its own on a platform without one.
             error.DurableReplacePostRenameFailed => {
                 try self.impl.setIndeterminate(kind, name);
                 return error.SessionChildCommitIndeterminate;
@@ -1463,7 +1464,7 @@ fn validateName(name: []const u8) !void {
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (io_mod.modeMismatch(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1478,7 +1479,7 @@ fn verifyPrivateOpenedStat(
 ) !void {
     io_mod.verifyOpenedRegularFile(stat, mode) catch
         return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (io_mod.modeMismatch(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1487,7 +1488,7 @@ fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
     if (stat.kind != .file or stat.nlink != 1) {
         return error.SessionPathUnsafe;
     }
-    if (stat.permissions.toMode() & 0o777 != 0o600) {
+    if (io_mod.modeMismatch(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1508,7 +1509,7 @@ fn openPrivateFile(
     };
     errdefer file.close(io_mod.getIo());
     if (capability_mode == .writable and mode != .read_only) {
-        file.setPermissions(io_mod.getIo(), private_file_permissions) catch
+        io_mod.setPermissions(file, private_file_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateOpenedStat(try file.stat(io_mod.getIo()), mode);
@@ -1564,7 +1565,7 @@ fn openTestSession(
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
     errdefer alloc.free(display_path);
@@ -1676,7 +1677,7 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try session.dir.createDir(
         io_mod.getIo(),
         "tool-results/wrong-kind",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     try std.testing.expectError(
         error.SessionPathUnsafe,
@@ -1704,11 +1705,11 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     var wrong_kind = try session.dir.createFile(io_mod.getIo(), "artifacts", .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsForMode(0o600),
     });
     wrong_kind.close(io_mod.getIo());
     try std.testing.expectError(
@@ -1789,7 +1790,7 @@ test "retained route handle contains pathname swaps" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     try session.dir.rename(
         "tool-results",
@@ -1902,9 +1903,9 @@ test "terminal capabilities are private route restricted and reject symlinks" {
         "terminal/state/record.json",
         .{ .follow_symlinks = false },
     );
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), terminal_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), state_stat.permissions.toMode() & 0o777);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), record_stat.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), terminal_stat.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), state_stat.permissions.toMode() & 0o777);
+    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), record_stat.permissions.toMode() & 0o777);
 
     try session.dir.rename(
         "terminal",
@@ -1915,7 +1916,7 @@ test "terminal capabilities are private route restricted and reject symlinks" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "outside-terminal",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     try session.dir.symLink(
         io_mod.getIo(),
@@ -1971,7 +1972,7 @@ test "a v2 capability keeps terminal kinds in the terminal folder, made only by 
     for ([_][]const u8{ "fx/terminal", "fx/terminal/kYIGy8ik0H3K" }) |sub_path| {
         const stat = try tmp.dir.statFile(io_mod.getIo(), sub_path, .{ .follow_symlinks = false });
         try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
-        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
+        if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
     }
 
     // A read-only clone reads it back; side-folder kinds stay absent.

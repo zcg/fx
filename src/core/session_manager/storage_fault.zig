@@ -12,13 +12,17 @@
 //! This is the guarantee a plain `fsync` gives on an OS crash, or a power cut
 //! on Linux (D3). `restart` revives the process after a `kill`; `reboot`
 //! brings the machine back after a `powerLoss`.
+//!
+//! It models a POSIX filesystem: a descriptor is a number, `dup` shares an
+//! inode, and a kill is a signal. None of those hold on Windows, where a
+//! descriptor is a handle and no signal ends a process, so the whole module is
+//! left out there and the durability suites that need it are skipped.
 
 const std = @import("std");
 const Io = std.Io;
 const storage = @import("storage.zig");
 
-pub const Fault = struct {
-    gpa: std.mem.Allocator,
+pub const Fault = struct {    gpa: std.mem.Allocator,
     io: Io,
     prng: std.Random.DefaultPrng,
     /// The simulated process is dead: every storage call fails untouched.
@@ -149,7 +153,14 @@ pub const Fault = struct {
     pub fn mutate(f: *Fault) bool {
         const step = f.steps.fetchAdd(1, .monotonic) + 1;
         if (f.kill_at_step) |n| if (step == n) {
-            std.posix.kill(std.c.getpid(), .KILL) catch {};
+            // Ending this process is the fault the step models. Windows has no
+            // `SIGKILL` to raise, so it exits directly; POSIX raises the signal so
+            // the test also covers a kill delivered from outside.
+            if (comptime @import("builtin").target.os.tag == .windows) {
+                std.process.exit(137);
+            } else {
+                std.posix.kill(std.c.getpid(), .KILL) catch {};
+            }
         };
         if (f.power_at_step) |n| if (step == n) {
             _ = f.powerLoss();
@@ -338,8 +349,8 @@ fn join(gpa: std.mem.Allocator, parent: []const u8, name: []const u8) storage.Er
 /// A read-only blob (D49) is made writable for the flip and then restored.
 pub fn flipBit(io: Io, dir: storage.Dir, name: []const u8, offset: u64, bit: u3) !void {
     const before = try dir.handle.statFile(io, name, .{ .follow_symlinks = false });
-    const read_only = before.permissions.toMode() & 0o200 == 0;
-    if (read_only) try dir.handle.setFilePermissions(io, name, .fromMode(storage.file_mode), .{ .follow_symlinks = false });
+    const read_only = storage.deniesWrites(before.permissions);
+    if (read_only) try dir.handle.setFilePermissions(io, name, storage.permissionsForMode(storage.file_mode), .{ .follow_symlinks = false });
     defer if (read_only) dir.handle.setFilePermissions(io, name, before.permissions, .{ .follow_symlinks = false }) catch {};
     var file = try dir.handle.openFile(io, name, .{ .mode = .read_write, .follow_symlinks = false });
     defer file.close(io);

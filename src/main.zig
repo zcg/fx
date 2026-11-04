@@ -1132,7 +1132,7 @@ const App = struct {
         };
 
         const io = io_mod.getIo();
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+        try io_mod.writeFd(io_mod.stdoutHandle(), "\n");
         var child = std.process.spawn(io, .{
             .argv = argv,
             .stdin = .inherit,
@@ -1140,7 +1140,7 @@ const App = struct {
             .stderr = .inherit,
         }) catch return error.ExternalInteractiveFailed;
         const term = child.wait(io) catch return error.ExternalInteractiveFailed;
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+        try io_mod.writeFd(io_mod.stdoutHandle(), "\n");
 
         try self.terminal.captureOriginalTermios();
         try self.terminal.enableRawMode();
@@ -3749,7 +3749,17 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
-    const raw_args = rawArgs(c_argc, c_argv);
+    // Windows has no byte-string argv, so its arguments are rebuilt first and
+    // outlive every early-return path below.
+    var args_arena: ?std.heap.ArenaAllocator = if (comptime builtin.target.os.tag == .windows)
+        std.heap.ArenaAllocator.init(processAllocator())
+    else
+        null;
+    defer if (args_arena) |*arena| arena.deinit();
+    const raw_args = if (args_arena) |*arena|
+        try windowsRawArgs(arena.allocator())
+    else
+        rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under fx's folder too.
     try useFxHomeFromEnv(raw_env);
@@ -3823,8 +3833,9 @@ fn useFxHomeFromEnv(raw_env: RawEnviron) !void {
 
 /// Whether `path` is a file, or a path through one, rather than a folder or
 /// nothing yet. Asking for `path/` makes the system resolve it as a folder.
-/// This runs before fx's I/O is set up, so it calls libc.
+/// This runs before fx's I/O is set up, so it uses the platform's raw API.
 fn namesNonFolderRaw(path: []const u8) bool {
+    if (comptime builtin.target.os.tag == .windows) return windowsNamesNonFolder(path);
     var buffer: [std.Io.Dir.max_path_bytes + 2]u8 = undefined;
     const trimmed = std.mem.trimEnd(u8, path, "/");
     if (trimmed.len == 0 or trimmed.len + 2 > buffer.len) return false;
@@ -3859,9 +3870,10 @@ test "FX_HOME is refused only when it is a file or a path through one" {
 }
 
 /// Creates `path` and every folder above it that is missing. This runs before
-/// fx's I/O is set up, so it calls libc; a folder that already exists, or
-/// one fx can't create, is left for the first use to report.
+/// fx's I/O is set up, so it uses the platform's raw API; a folder that already
+/// exists, or one fx can't create, is left for the first use to report.
 fn createFolderPathRaw(path: []const u8) void {
+    if (comptime builtin.target.os.tag == .windows) return windowsCreateFolderPath(path);
     var buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     if (path.len == 0 or path.len >= buffer.len) return;
     var end: usize = 1;
@@ -3872,6 +3884,73 @@ fn createFolderPathRaw(path: []const u8) void {
         _ = std.c.mkdir(@ptrCast(&buffer), 0o755);
     }
 }
+
+/// The Windows form of `namesNonFolderRaw`: the kernel reports the attributes of
+/// an existing path, and a path that runs through a file has none.
+fn windowsNamesNonFolder(path: []const u8) bool {
+    var wide_buffer: [windows_path_max_wide]u16 = undefined;
+    const wide_len = std.unicode.utf8ToUtf16Le(&wide_buffer, path) catch return false;
+    if (wide_len + 1 > wide_buffer.len) return false;
+    wide_buffer[wide_len] = 0;
+    const attributes = windows_file.GetFileAttributesW(@ptrCast(&wide_buffer));
+    // `INVALID_FILE_ATTRIBUTES` means the path does not resolve at all, which is
+    // a path fx may create later rather than one a file blocks.
+    const invalid_attributes: u32 = 0xFFFFFFFF;
+    if (attributes == invalid_attributes) return false;
+    const directory_attribute: u32 = 0x10;
+    return attributes & directory_attribute == 0;
+}
+
+/// The Windows form of `createFolderPathRaw`. Windows accepts both separators,
+/// so each prefix is created in turn and an existing folder is not an error.
+fn windowsCreateFolderPath(path: []const u8) void {
+    if (path.len == 0) return;
+    var wide_buffer: [windows_path_max_wide]u16 = undefined;
+    const wide_len = std.unicode.utf8ToUtf16Le(&wide_buffer, path) catch return;
+    if (wide_len >= wide_buffer.len) return;
+
+    var end: usize = 0;
+    while (end <= wide_len) : (end += 1) {
+        if (end != wide_len and wide_buffer[end] != '/' and wide_buffer[end] != '\\') continue;
+        // A drive root such as `C:\` already exists, and asking to create it
+        // would fail rather than do nothing.
+        if (end <= 2 and wide_len > 2 and wide_buffer[1] == ':') continue;
+        const saved = wide_buffer[end];
+        wide_buffer[end] = 0;
+        _ = windows_file.CreateDirectoryW(@ptrCast(&wide_buffer), null);
+        wide_buffer[end] = saved;
+    }
+}
+
+/// The longest path a Windows file API accepts in its wide form.
+const windows_path_max_wide = 32767;
+
+const windows_file = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const file_append_data: u32 = 0x00000004;
+    const file_share_write: u32 = 0x00000002;
+    const open_always: u32 = 0x00000004;
+    const file_attribute_normal: u32 = 0x00000080;
+
+    extern "kernel32" fn GetFileAttributesW(file_name: [*:0]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn CreateDirectoryW(path_name: [*:0]const u16, security_attributes: ?*anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn CreateFileW(
+        name: [*:0]const u16,
+        access: u32,
+        share: u32,
+        security_attributes: ?*anyopaque,
+        disposition: u32,
+        flags: u32,
+        template: ?*anyopaque,
+    ) callconv(.winapi) ?std.posix.fd_t;
+    extern "kernel32" fn WriteFile(
+        file: std.posix.fd_t,
+        buffer: [*]const u8,
+        bytes_to_write: u32,
+        bytes_written: ?*u32,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: std.posix.fd_t) callconv(.winapi) c_int;
+};
 
 fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
     const columns = topLevelHelpColumns(raw_env);
@@ -3944,9 +4023,80 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
     return argv[0..argc];
 }
 
+/// Windows hands a process one UTF-16 command line, not a vector of byte
+/// strings, so `c_argv` there does not describe the arguments and `rawArgs`
+/// cannot read them. This converts them to the UTF-8, NUL-terminated vector the
+/// rest of `main` consumes, applying the same quoting rules a C runtime does.
+///
+/// The returned vector and every string in it are owned by `arena`, and the
+/// empty slice is returned when the arguments cannot be read, which leaves the
+/// caller with no arguments rather than a crash. Other platforms never call it.
+fn windowsRawArgs(arena: std.mem.Allocator) ![]const [*:0]const u8 {
+    if (comptime builtin.target.os.tag != .windows) return &.{};
+
+    const command_line = windows_command_line.GetCommandLineW();
+    // `std.process.Args` on Windows holds the whole wide command line rather
+    // than a vector, so the text is copied once for `process.io` to parse.
+    {
+        const command_line_len = std.mem.len(command_line);
+        const wide = try arena.alloc(u16, command_line_len);
+        @memcpy(wide, command_line[0..command_line_len]);
+        windows_wide_args = wide;
+    }
+
+    var argument_count: c_int = 0;
+    const argv_w = windows_command_line.CommandLineToArgvW(
+        command_line,
+        &argument_count,
+    ) orelse return &.{};
+    defer _ = windows_command_line.LocalFree(@ptrCast(argv_w));
+    if (argument_count <= 0) return &.{};
+
+    const count: usize = @intCast(argument_count);
+    const vector = try arena.alloc([*:0]const u8, count);
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const entry = argv_w[index] orelse {
+            vector[index] = "";
+            continue;
+        };
+        const wide = std.mem.sliceTo(entry, 0);
+        const utf8 = try std.unicode.wtf16LeToWtf8Alloc(arena, wide);
+        const terminated = try arena.alloc(u8, utf8.len + 1);
+        @memcpy(terminated[0..utf8.len], utf8);
+        terminated[utf8.len] = 0;
+        arena.free(utf8);
+        vector[index] = @ptrCast(terminated[0..utf8.len :0].ptr);
+    }
+    return vector;
+}
+
+// Zig's standard library declares only `CreateProcessW` for kernel32 and has no
+// shell32 at all, so fx declares the three calls it needs for its own command
+// line. They exist on every supported Windows version, and the block is skipped
+// entirely on other targets so no Linux or macOS link ever looks for them.
+const windows_command_line = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
+    extern "kernel32" fn LocalFree(h_mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "shell32" fn CommandLineToArgvW(
+        lp_cmd_line: [*:0]const u16,
+        p_num_args: *c_int,
+    ) callconv(.winapi) ?[*]?[*:0]u16;
+};
+
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.target.os.tag == .windows) {
+        // A Windows `Args` is a WTF-16 vector. `windowsRawArgs` keeps the wide
+        // form it decoded, because `process.io` needs the arguments in that
+        // shape while every other reader wants the UTF-8 one.
+        return .{ .vector = windows_wide_args };
+    }
     return .{ .vector = raw_args };
 }
+
+/// The process arguments in the wide form a Windows `std.process.Args` holds.
+/// Filled by `windowsRawArgs`, and empty on other targets.
+var windows_wide_args: []const u16 = &.{};
 
 /// Options for every process Io. fx starts its own tasks with `io.concurrent`,
 /// and they count against the capacity that limits `io.async`. Once fx holds
@@ -3962,6 +4112,11 @@ fn processIoOptions(process_args: std.process.Args, env_block: std.process.Envir
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.target.os.tag == .windows) {
+        // Windows reads its environment from the process itself rather than from
+        // a block of strings, and Zig models that difference in this type.
+        return .global;
+    }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -4017,18 +4172,12 @@ fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: 
 }
 
 fn stdoutIsTerminal() bool {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
-    return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
+    return io_mod.stdoutIsTty();
 }
 
 fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
-
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(std.posix.STDOUT_FILENO, req, &ws);
-    if (rc == -1 or ws.col == 0) return null;
-    return @intCast(ws.col);
+    const size = io_mod.terminalSize(io_mod.stdoutHandle()) catch return null;
+    return size.columns;
 }
 
 fn parseColumnCount(value: []const u8) ?usize {
@@ -4070,27 +4219,33 @@ fn writeStdoutFast(text: []const u8) !void {
     if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
-            const written = std.c.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
+            const written = std.c.write(io_mod.stdoutHandle(), remaining.ptr, remaining.len);
             if (written <= 0) return error.WriteFailed;
             remaining = remaining[@intCast(written)..];
         }
         return;
     }
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stdoutHandle(), text);
 }
 
+/// Appends a line to `%TEMP%\fx-boot.log` when `FX_BOOT_LOG` is set.
+///
+/// Startup has to be diagnosable on a machine where the console cannot be
+/// written: that is exactly when the interesting failure happens. So this opens
+/// the log with the raw Windows call and writes through `WriteFile`, using none
+/// of the IO the startup path is in the middle of setting up.
 fn writeStderrFast(text: []const u8) !void {
     @setRuntimeSafety(false);
     if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
-            const written = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
+            const written = std.c.write(io_mod.stderrHandle(), remaining.ptr, remaining.len);
             if (written <= 0) return error.WriteFailed;
             remaining = remaining[@intCast(written)..];
         }
         return;
     }
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    try io_mod.writeFd(io_mod.stderrHandle(), text);
 }
 
 fn exitFast(code: u8) noreturn {
@@ -4100,9 +4255,16 @@ fn exitFast(code: u8) noreturn {
     std.process.exit(code);
 }
 
+/// Whether `rawArgs` produced a vector of NUL-terminated byte strings, which is
+/// the shape `cliArgsFromRaw` reads without allocating.
+///
+/// Windows has no such vector from its C entry point, but `windowsRawArgs`
+/// builds one from the wide command line before anything else runs, so the
+/// vector every later step sees has the POSIX shape there too. Only WASI, which
+/// has no argument vector at all, is left out.
 fn hasPosixArgVector() bool {
     return switch (builtin.target.os.tag) {
-        .windows, .freestanding, .other => false,
+        .freestanding, .other => false,
         .wasi => builtin.link_libc,
         else => true,
     };
@@ -4541,7 +4703,17 @@ fn handleSigWinchWeb() callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
+/// The resize handler for a platform that delivers no resize signal. Windows
+/// reports a resize as a console input event, which the screen reads from its
+/// input loop, so this handler exists only to satisfy the type and is never
+/// installed.
+fn handleSigWinchNoSignal() callconv(.c) void {
+    resize_interlock.noteResizeSignal();
+}
+
+const handle_sigwinch: app_lifecycle.ResizeHandler = if (std.posix.Sigaction == void)
+    handleSigWinchNoSignal
+else if (builtin.target.os.tag == .wasi)
     handleSigWinchWeb
 else
     handleSigWinchNative;

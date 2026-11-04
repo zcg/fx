@@ -455,11 +455,11 @@ fn argsContainJson(args: []const [:0]const u8) bool {
 
 const ProcessOutput = struct {
     fn writeStdout(_: *@This(), text: []const u8) !void {
-        try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+        try io_mod.writeFd(io_mod.stdoutHandle(), text);
     }
 
     fn writeStderr(_: *@This(), text: []const u8) !void {
-        try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+        try io_mod.writeFd(io_mod.stderrHandle(), text);
     }
 };
 

@@ -4,6 +4,7 @@
 //! ignored so the integration cannot block or terminate an fx session.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
@@ -181,6 +182,10 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
+    // A receive deadline is a POSIX socket option that `std.posix` does not
+    // expose on Windows. The wait this bounds is short and the caller also holds
+    // a deadline, so on Windows the socket is left as it is.
+    if (comptime builtin.target.os.tag == .windows) return;
     std.posix.setsockopt(
         stream.socket.handle,
         std.posix.SOL.SOCKET,

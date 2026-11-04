@@ -7,7 +7,6 @@ const update_target = @import("update_target.zig");
 const Allocator = std.mem.Allocator;
 
 pub const platform = helpers.platform;
-
 const progress_label = "upgrading...";
 const found_hold_ns = 150 * std.time.ns_per_ms;
 
@@ -31,6 +30,8 @@ const RunError = error{
     ReplaceFailed,
     OutOfMemory,
     Cancelled,
+    /// fx publishes no release archive for this target.
+    UnsupportedPlatform,
 };
 
 pub fn run(
@@ -140,6 +141,7 @@ fn failureMessage(err: RunError) []const u8 {
         error.ReplaceFailed => "failed to replace binary (permission denied?)",
         error.OutOfMemory => "out of memory",
         error.Cancelled => "upgrade cancelled",
+        error.UnsupportedPlatform => "no release archive is published for this platform",
     };
 }
 
@@ -154,6 +156,7 @@ fn workerErrorToRunError(err: UpgradeError) RunError {
         .replace_failed => error.ReplaceFailed,
         .out_of_memory => error.OutOfMemory,
         .cancelled => error.Cancelled,
+        .unsupported_platform => error.UnsupportedPlatform,
     };
 }
 
@@ -192,7 +195,11 @@ fn upgradeWorkerInner(
     progress.markUpdateFound();
     if (show_progress) io_mod.sleep(found_hold_ns);
 
-    const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse "/tmp";
+    const tmp_base = io_mod.tempDir(alloc) catch {
+        result.err = .extraction_failed;
+        return;
+    };
+    defer alloc.free(tmp_base);
     var rand_buf: [8]u8 = undefined;
     io_mod.getIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
@@ -205,10 +212,15 @@ fn upgradeWorkerInner(
         return;
     };
 
+    const asset_platform = helpers.platform orelse {
+        result.err = .unsupported_platform;
+        return;
+    };
+
     const archive_path = try alloc.print("{s}/fx.tar.gz", .{tmp_dir});
     defer alloc.free(archive_path);
 
-    const archive_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const archive_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), asset_platform });
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -224,7 +236,7 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), asset_platform });
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url, .{}) catch |err| {
@@ -326,7 +338,7 @@ fn progressDownloadUpdate(ctx: *anyopaque, downloaded: u64, total: ?u64) void {
 }
 
 fn progressWait(done: *std.atomic.Value(bool), progress: *ProgressState, worker_result: *const WorkerResult, current: []const u8) void {
-    const stderr = std.Io.File.stderr();
+    const stderr = io_mod.stderrFile();
     const zio = io_mod.getIo();
     var buf: [128]u8 = undefined;
     var rendered_row = false;
@@ -404,6 +416,10 @@ const UpgradeError = enum {
     replace_failed,
     out_of_memory,
     cancelled,
+    /// fx publishes no release archive for this target, so there is nothing to
+    /// upgrade to. This is the honest answer on a platform whose build exists
+    /// but whose assets do not.
+    unsupported_platform,
 };
 
 fn versionLabel(v: []const u8) []const u8 {

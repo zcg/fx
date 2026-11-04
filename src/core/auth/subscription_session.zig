@@ -140,7 +140,7 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
             defer file.close(io_mod.getIo());
 
             const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(spec.auth_file_name, err);
-            if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
+            if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) {
                 debug_trace.logf("auth", spec.trace_label ++ " session load failed step=permissions err=InsecureAuthFile", .{});
                 return error.InsecureAuthFile;
             }
@@ -264,12 +264,12 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
 
     const initial_stat = try dir.stat(io_mod.getIo());
     if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) return error.PrivateStatePermissionsUnsupported;
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
+    if (io_mod.inaccessibleToWrite(initial_stat.permissions)) return error.PrivateStatePermissionsUnsupported;
+    io_mod.setPermissions(dir, io_mod.permissionsForMode(0o700)) catch {
         return error.PrivateStatePermissionsUnsupported;
     };
     const stat = try dir.stat(io_mod.getIo());
-    if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
+    if (stat.kind != .directory or io_mod.modeMismatch(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
     return .{ .dir = dir };

@@ -12,9 +12,12 @@ const Allocator = std.mem.Allocator;
 
 const RootSpec = skill_contract.RootSpec;
 
-/// Roots scanned at the workspace root and each ancestor directory below
-/// home, in precedence order. `.fx/skills` and `skills/` belong to the product;
-/// the rest are compatibility roots for other agent installs.
+/// Roots scanned at the workspace root, in precedence order.
+///
+/// These are every convention a skill collection is installed under, so a user
+/// who keeps one copy and links it into several tools sees the same skills here.
+/// A name appearing in more than one root is fine: the list groups them by
+/// source, and the same skill reached twice is still one thing to use.
 const workspace_roots = [_]RootSpec{
     .{ .source = .workspace_fx, .path = ".fx/skills" },
     .{ .source = .workspace_shared, .path = "skills" },
@@ -25,7 +28,10 @@ const workspace_roots = [_]RootSpec{
     .{ .source = .workspace_claw, .path = ".claw/skills" },
 };
 
-/// Home-relative compatibility roots scanned after the managed install root.
+/// Home-relative roots scanned after the managed install root.
+///
+/// The managed root, `~/.fx/skills`, is added separately through
+/// `managed_root_source`, so it does not appear here.
 const global_roots = [_]RootSpec{
     .{ .source = .global_opencode, .path = ".config/opencode/skills" },
     .{ .source = .global_codex, .path = ".codex/skills" },

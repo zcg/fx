@@ -13,7 +13,14 @@ const checksum_max_bytes: usize = 4096;
 const Channel = update_target.Channel;
 const Target = update_target.Target;
 
+/// Bounds how long a CDN response may stall before the request fails.
+///
+/// A receive timeout is a POSIX socket option that `std.posix` does not expose
+/// on Windows. The upgrade path already passes a deadline to every request it
+/// makes, so on Windows the socket is left as it is and that deadline does the
+/// work.
 fn setRecvTimeout(conn: *std.http.Client.Connection) void {
+    if (comptime builtin.target.os.tag == .windows) return;
     const sock = conn.stream_writer.stream.socket.handle;
     const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
@@ -47,13 +54,16 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1");
 }
 
-pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
-
-fn platformFromTarget() ?[]const u8 {
+/// The release asset suffix for this build, such as `macos-aarch64`.
+///
+/// An unsupported target reports null rather than failing to compile, so the
+/// binary still builds everywhere and `auto_upgrade` refuses at runtime with a
+/// message the user can act on.
+pub fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.target.os.tag) {
         .macos => "macos",
         .linux => "linux",
+        .windows => "windows",
         else => null,
     };
     const arch: ?[]const u8 = switch (builtin.target.cpu.arch) {
@@ -68,6 +78,9 @@ fn platformFromTarget() ?[]const u8 {
     }
     return null;
 }
+
+/// This build's release asset suffix, or null where fx publishes no asset.
+pub const platform: ?[]const u8 = platformFromTarget();
 
 pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, control: TransferControl) !Target {
     return switch (channel) {
@@ -421,7 +434,7 @@ fn copyBinary(src_path: []const u8, dest_path: []const u8) !void {
         dest.writeStreamingAll(zio, transfer_buf[0..n]) catch return error.ReplaceFailed;
     }
 
-    dest.setPermissions(zio, stat.permissions) catch {};
+    io_mod.setPermissions(dest, stat.permissions) catch {};
 }
 
 fn writeTempFile(dir: std.Io.Dir, name: []const u8, content: []const u8) !void {
@@ -437,8 +450,9 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
 }
 
 test "platform string is valid" {
-    try std.testing.expect(platform.len > 0);
-    try std.testing.expect(std.mem.find(u8, platform, "-") != null);
+    const value = platform orelse return error.SkipZigTest;
+    try std.testing.expect(value.len > 0);
+    try std.testing.expect(std.mem.find(u8, value, "-") != null);
 }
 
 test "E2E upgrade base accepts only explicit IPv4 loopback origins" {

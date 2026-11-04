@@ -202,7 +202,7 @@ test "client system prompt of exactly the size limit survives a restore" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // Session directories must be private for the child store to open them.
-    try tmp.dir.createDir(std.testing.io, "session", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(std.testing.io, "session", io_mod.permissionsForMode(0o700));
     var session_dir = try tmp.dir.openDir(std.testing.io, "session", .{ .iterate = true, .follow_symlinks = false });
     defer session_dir.close(std.testing.io);
     const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");

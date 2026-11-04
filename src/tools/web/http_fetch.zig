@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const select_watch = @import("../../core/shared/select_watch.zig");
@@ -469,6 +470,9 @@ fn isRetryableConnectError(err: anyerror) bool {
 
 fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
     const effective = normalizedOptions(options);
+    if (comptime builtin.target.os.tag == .windows) {
+        return connectWindows(alloc, target, effective);
+    }
     const dialer: Dialer = .{
         .ctx = @ptrCast(&default_connector_ctx),
         .connect_fn = connectDefaultDialer,
@@ -483,6 +487,64 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
         .http => try fetchPlain(alloc, fd, target, effective),
         .https => try fetchTls(alloc, fd, target, effective),
     };
+}
+
+/// Windows connects through `std.Io.net`, which is how that platform is meant
+/// to reach the network.
+///
+/// A Windows socket is a Winsock `SOCKET` handle, not a small file descriptor:
+/// it has no `fcntl` to make it nonblocking, no `poll` in the shape Zig's
+/// `std.posix` expects, and no `errno` to read. Driving the POSIX path with it
+/// would mean rebuilding each of those, which is the wrong way round. Zig's
+/// `Io.net` already speaks to the kernel correctly on every platform, so this
+/// branch hands the request and response code a `Stream` and lets the standard
+/// library do the platform work. The request and response logic is shared with
+/// the POSIX path: `writeRequest` and `readResponse` take an `Io.Writer` and an
+/// `Io.Reader` and never see a descriptor.
+fn connectWindows(alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    const zio = io_mod.getIo();
+    const address = windowsAdmittedAddress(target.admitted_addresses) orelse return error.NoAddressReturned;
+    checkControl(options) catch |err| {
+        traceFailure(.connect, err);
+        return err;
+    };
+    var stream = address.connect(zio, .{ .mode = .stream }) catch |err| {
+        traceFailure(.connect, err);
+        return err;
+    };
+    defer stream.close(zio);
+
+    var send_buffer: [4096]u8 = undefined;
+    var receive_buffer: [16384]u8 = undefined;
+
+    {
+        var net_writer = stream.writer(zio, &send_buffer);
+        writeRequest(&net_writer.interface, target, options) catch |err| {
+            const root = unwrapWriteFailure(err, net_writer.err);
+            traceFailure(.request_write, root);
+            return root;
+        };
+        net_writer.interface.flush() catch |err| {
+            const root = unwrapWriteFailure(err, net_writer.err);
+            traceFailure(.request_write, root);
+            return root;
+        };
+
+        var net_reader = stream.reader(zio, &receive_buffer);
+        var failure_stage: FailureStage = .response_head;
+        return readResponse(alloc, &net_reader.interface, options.max_body_bytes, options, &failure_stage) catch |err| {
+            const root = unwrapReadFailure(err, null, net_reader.err);
+            traceFailure(failure_stage, root);
+            return root;
+        };
+    }
+}
+
+/// The address to connect to, chosen from the addresses the URL policy admitted.
+/// Each one was already checked to be public, so the first is taken.
+fn windowsAdmittedAddress(admitted: []const IpAddress) ?IpAddress {
+    if (admitted.len == 0) return null;
+    return admitted[0];
 }
 
 fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {

@@ -61,7 +61,7 @@ var old_sighup_action: ?std.posix.Sigaction = null;
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
     // Signal context cannot recover from a failed async-signal-safe write.
     _ = std.c.write(
-        std.posix.STDOUT_FILENO,
+        io_mod.stdoutHandle(),
         restore.ptr,
         restore.len,
     );
@@ -950,12 +950,10 @@ fn resolveStartupFastMode(
 pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     try cfg.terminal.ensureInteractive();
     try cfg.terminal.captureOriginalTermios();
-
     cfg.shell.sync_updates_enabled = shell_runtime.detectSyncUpdatesEnabled(cfg.alloc);
     cfg.shell.history_reset_uses_ris = shell_runtime.detectHistoryResetUsesRis(cfg.alloc);
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
-
     var state = try loadInteractiveStartupState(
         cfg.alloc,
         cfg.secret_store,
@@ -975,7 +973,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.metrics,
         cfg.terminal_title,
     );
-
     try cfg.terminal.enableRawMode();
     cfg.terminal.installResizeSignal(cfg.resize_handler);
     installAbnormalExitHandlers(io_mod.getenv("TMUX"));
@@ -994,7 +991,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     // The shadow VT is load-bearing: frame commit diffs the target
     // surface against it and records the accepted terminal state.
     try cfg.shell.enableShadowVt(cfg.alloc);
-
     const truecolor = ui_render.truecolorSupportedForValues(
         io_mod.getenv("COLORTERM"),
         io_mod.getenv("TERM_PROGRAM"),
@@ -1627,7 +1623,7 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
 }
 
 pub fn writeLifecycleTerminalBytes(shell: *TranscriptRuntime, metrics: *Metrics, bytes: []const u8) !void {
-    try shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
+    try io_mod.writeFd(shell.stdout_file.handle, bytes);
     if (shell.shadow_vt) |grid| {
         grid.feed(bytes) catch |err| debug_trace.logf(
             "render",

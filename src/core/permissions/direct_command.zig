@@ -1329,6 +1329,7 @@ test "direct executor enforces one budget across concurrent stdout and stderr" {
 }
 
 test "direct executor reaps partial spawn and output-limit process groups" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const PidCapture = struct {
@@ -1344,7 +1345,7 @@ test "direct executor reaps partial spawn and output-limit process groups" {
             const pid = self.pid.?;
             defer {
                 std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
-                _ = std.c.waitpid(pid, null, 0);
+                _ = io_mod.waitProcess(pid, true);
             }
             try std.testing.expectError(
                 error.ProcessNotFound,
@@ -1409,6 +1410,7 @@ test "direct executor reaps partial spawn and output-limit process groups" {
 }
 
 test "direct executor cleans up cancellation after the first pipeline spawn" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var cancel = std.atomic.Value(bool).init(false);
@@ -1456,7 +1458,7 @@ test "direct executor cleans up cancellation after the first pipeline spawn" {
     const pid = test_control.pid.?;
     defer {
         std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
-        _ = std.c.waitpid(pid, null, 0);
+        _ = io_mod.waitProcess(pid, true);
     }
     try std.testing.expectError(
         error.ProcessNotFound,

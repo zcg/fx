@@ -21,7 +21,7 @@ const NapiSurface = enum {
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = preferMsvcOnWindows(b, b.standardTargetOptions(.{}));
     const optimize = b.standardOptimizeOption(.{});
     const pgso_artifact = b.option(
         PgsoArtifact,
@@ -98,8 +98,28 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
 
+    // The unit suites model POSIX behavior: descriptors are numbers, `dup` shares
+    // an inode, a kill is a signal, `fsync` works on a directory, and a process
+    // group can be addressed. None of that exists on Windows, so the suites are
+    // not built there rather than being made to pass on semantics they do not
+    // have. Windows coverage is added as its own tests, written against the
+    // Windows behavior.
+    const posix_suites = target.result.os.tag != .windows;
+
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
+
+    const test_paths = b.addOptions();
+    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
+    test_paths.addOptionPathUntracked("source_root", b.path("src"));
+    const test_paths_module = test_paths.createModule();
+    exe.root_module.addImport("test_paths", test_paths_module);
+
+    const test_step = b.step("test", "Run tests");
+    const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
+    if (!posix_suites) {
+        return;
+    }
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
@@ -108,12 +128,6 @@ pub fn build(b: *std.Build) void {
     run_exe_tests.step.dependOn(b.getInstallStep());
     // Tests launch the installed fx binary, and the session boundary test
     // walks the source tree.
-    const test_paths = b.addOptions();
-    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
-    test_paths.addOptionPathUntracked("source_root", b.path("src"));
-    const test_paths_module = test_paths.createModule();
-    exe.root_module.addImport("test_paths", test_paths_module);
-
     // The session manager's own tests, as fx compiles it (no hooks).
     const session_manager_tests = b.addTest(.{ .root_module = session_manager });
 
@@ -142,11 +156,9 @@ pub fn build(b: *std.Build) void {
         session_manager_hook_tests.root_module.addObject(tsan_mremap);
     }
     const run_session_manager_hook_tests = b.addRunArtifact(session_manager_hook_tests);
-    const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
     session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
 
-    const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
     test_step.dependOn(&run_session_manager_hook_tests.step);
@@ -482,6 +494,23 @@ fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
     };
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch std.process.fatal("could not allocate Node include path", .{});
+}
+
+/// Windows has no POSIX libc, so `-lc` there can only mean a C runtime. Zig
+/// defaults a native Windows target to the gnu ABI, whose mingw-w64 crt2.o and
+/// winpthreads sources do not build under Zig 0.17, which fails the whole build
+/// before any fx code is compiled. The msvc ABI links the UCRT that every
+/// Windows machine already has, so re-point a gnu Windows target at it. An
+/// explicitly requested ABI is honored, which keeps cross-compilation and the
+/// Linux and macOS builds byte-identical.
+fn preferMsvcOnWindows(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
+    if (target.result.os.tag != .windows) return target;
+    if (target.result.abi != .gnu) return target;
+    // A caller who spells out the gnu ABI asked for it, so leave that alone.
+    if (target.query.abi == .gnu) return target;
+    var msvc_query = target.query;
+    msvc_query.abi = .msvc;
+    return b.resolveTargetQuery(msvc_query);
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {

@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const readiness = @import("../shared/readiness.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -122,7 +123,13 @@ const foreground_session_replace_failure_prefix = "\x00FX_FOREGROUND_EXEC_FAILED
 const foreground_session_replace_failure_marker_bytes =
     foreground_session_replace_failure_prefix.len +
     foreground_session_failure_nonce_hex_bytes + 1;
-const foreground_session_force_signal = std.posix.SIG.USR1;
+/// The signal that forces a foreground session to end. POSIX raises it, so the
+/// value is named there. Windows has no such signal and its `std.posix.SIG` is a
+/// CRT enum without `USR1`, so the field keeps a plain zero that is never sent.
+const foreground_session_force_signal: std.posix.SIG = if (@hasField(std.posix.SIG, "USR1"))
+    std.posix.SIG.USR1
+else
+    @fromBackingInt(0);
 const ForegroundSessionTerminationRequest = enum(std.c.sig_atomic_t) {
     none,
     graceful,
@@ -151,7 +158,7 @@ fn readForegroundSessionInputExact(buffer: []u8) !void {
     const zio = io_mod.getIo();
     var offset: usize = 0;
     while (offset < buffer.len) {
-        const read_len = std.Io.File.stdin().readStreaming(
+        const read_len = io_mod.stdinFile().readStreaming(
             zio,
             &.{buffer[offset..]},
         ) catch |err| switch (err) {
@@ -179,8 +186,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (command_session == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
-    try std.Io.File.stderr().writeStreamingAll(
-        zio,
+    try io_mod.writeFd(
+        io_mod.stderrHandle(),
         &.{foreground_session_ready_byte},
     );
 
@@ -382,12 +389,7 @@ fn foregroundRequestAtDeadline(
 }
 
 fn foregroundSessionOwnerAlive() bool {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    return (std.posix.poll(&poll_fds, 0) catch return false) == 0;
+    return !readiness.hasInput(io_mod.stdinHandle());
 }
 
 const ChildWaiter = struct {
@@ -590,7 +592,7 @@ fn refreshForegroundTargetTree(
 ) !void {
     try descendants.refresh(target_pid);
     if (comptime builtin.target.os.tag == .linux) {
-        try descendants.refreshAdditionalRoot(std.c.getpid());
+        try descendants.refreshAdditionalRoot(@intCast(io_mod.currentProcessId()));
     }
     if (comptime builtin.target.os.tag == .macos) {
         if (foregroundSessionTerminationRequest() != .none) {
@@ -617,7 +619,7 @@ fn advanceForegroundTargetTermination(
             termination_started_ms.* = now_ms;
             const count = descendants.signalOutsideProcessGroup(
                 std.posix.SIG.TERM,
-                std.c.getpid(),
+                @intCast(io_mod.currentProcessId()),
             );
             debug_trace.logf(
                 "core",
@@ -689,7 +691,7 @@ fn writeForegroundSessionReplaceFailure(
         foreground_session_replace_failure_prefix ++ "{s}:{s}\n",
         .{ nonce, @errorName(err) },
     ) catch foreground_session_replace_failure_prefix ++ "unknown\n";
-    std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), message) catch {};
+    io_mod.writeFd(io_mod.stderrHandle(), message) catch {};
 }
 
 fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
@@ -1765,7 +1767,7 @@ fn waitForForegroundSessionReady(
         const revents = poll_fds[0].revents;
         if ((revents & std.posix.POLL.IN) != 0) {
             var marker: [1]u8 = undefined;
-            const marker_len = try std.posix.read(ready_read.handle, &marker);
+            const marker_len = try io_mod.readFd(ready_read.handle, &marker);
             if (marker_len == 0) return error.ForegroundSessionSetupFailed;
             if (marker[0] != foreground_session_ready_byte) {
                 return error.InvalidForegroundSessionReady;
@@ -2035,7 +2037,7 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
 }
 
 fn currentProcessId() u64 {
-    return @intCast(std.c.getpid());
+    return io_mod.currentProcessId();
 }
 
 fn elapsedMs(started_ms: i64, finished_ms: i64) u64 {
@@ -2209,9 +2211,9 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
             .{ quoted_home, quoted_home, quoted_debug_log },
         );
         try wrapper.writeStreamingAll(io_mod.getIo(), source);
-        try wrapper.setPermissions(
-            io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o700),
+        try io_mod.setPermissions(
+            wrapper,
+            io_mod.permissionsForMode(0o700),
         );
     }
 
@@ -2284,7 +2286,7 @@ fn writeSnapshotTestShellFor(
     var wrapper = try tmp.dir.createFile(io_mod.getIo(), wrapper_path, .{ .truncate = true });
     defer wrapper.close(io_mod.getIo());
     try wrapper.writeStreamingAll(io_mod.getIo(), source);
-    try wrapper.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+    try io_mod.setPermissions(wrapper, io_mod.permissionsForMode(0o700));
     return .{
         .home = home,
         .workspace = workspace,
@@ -3861,6 +3863,18 @@ fn emitOutputChunk(
 }
 
 fn signalProcess(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
+    if (comptime builtin.target.os.tag == .windows) {
+        // Windows has no signal numbers to deliver. Every caller that reaches
+        // here is ending a child it started, so the kernel's terminate is the
+        // operation with the same effect. A negative pid addresses a POSIX
+        // process group, which Windows expresses as a job object instead.
+        if (!io_mod.pidIsValid(pid)) return;
+        io_mod.killProcess(pid) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => return error.SignalFailed,
+        };
+        return;
+    }
     std.posix.kill(pid, signal) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
@@ -3872,6 +3886,19 @@ fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
 }
 
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
+    if (comptime builtin.target.os.tag == .windows) {
+        // Windows has no process groups to signal, so only the process itself is
+        // ended. Its children are covered by the job object fx assigns when it
+        // starts a command.
+        if (io_mod.pidIsValid(pid)) {
+            io_mod.killProcess(pid) catch |err| debug_trace.logf(
+                "core",
+                "remaining captured process cleanup failed err={s}",
+                .{@errorName(err)},
+            );
+        }
+        return;
+    }
     signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
         debug_trace.logf(
             "core",
@@ -4087,7 +4114,7 @@ fn writeForegroundSessionFrameForTest(
 fn expectForegroundSessionReadyForTest(child: *std.process.Child) !void {
     const ready_read = child.stderr orelse return error.TestUnexpectedResult;
     var ready: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(ready_read.handle, &ready));
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.readFd(ready_read.handle, &ready));
     try std.testing.expectEqual(foreground_session_ready_byte, ready[0]);
 }
 
@@ -4204,6 +4231,7 @@ test "foreground session bootstrap waits for release before executing target" {
 }
 
 test "foreground session owner loss kills the target and descendant before delayed effects" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_foreground_session) return;
 
     const alloc = std.testing.allocator;
@@ -4268,6 +4296,7 @@ test "foreground session owner loss kills the target and descendant before delay
 }
 
 test "finishing a detached session leaves cleanup to its supervisor" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !supports_foreground_session) return;
 
     const alloc = std.testing.allocator;
@@ -4649,7 +4678,7 @@ test "managed command artifact confirms an indeterminate rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -4729,7 +4758,7 @@ test "managed command artifact rejects an unconfirmed rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -5090,9 +5119,9 @@ test "cancellation preserves the termination grace in an invoked script" {
                 "printf 'GRACE-READY\\n'\n" ++
                 "while :; do sleep 1; done\n",
         );
-        try script.setPermissions(
-            io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o700),
+        try io_mod.setPermissions(
+            script,
+            io_mod.permissionsForMode(0o700),
         );
     }
 
@@ -5168,7 +5197,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsForMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -5378,7 +5407,7 @@ test "artifact write failure after cancellation remains a bare error" {
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = workspace },
-        .pgid = 0,
+        .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
     });
     defer cleanupChild(&child);
 
@@ -5442,6 +5471,7 @@ test "timeout source is distinct from cancellation" {
 }
 
 test "foreground force cleanup preserves the supervisor" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const mask = foregroundSupervisorSignalMask();
     try std.testing.expect(std.posix.sigismember(&mask, std.posix.SIG.TERM));
     try std.testing.expect(std.posix.sigismember(&mask, foreground_session_force_signal));
@@ -5539,6 +5569,7 @@ test "forced termination settlement expires only after its deadline" {
 }
 
 test "nonterminal child terms remain indeterminate" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     try std.testing.expectEqual(
         command_contract.CommandStatus.indeterminate,
         commandStatusFromTerm(.{ .unknown = 0 }),
@@ -5644,6 +5675,7 @@ test "timeout remains dominant when its output callback fails" {
 }
 
 test "timeout terminates foreground process group descendants" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
@@ -5772,6 +5804,7 @@ test "timeout terminates double-forked descendant after setsid" {
 }
 
 test "timeout terminates environment-sanitized double-fork descendants" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;

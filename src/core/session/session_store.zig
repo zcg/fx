@@ -187,7 +187,7 @@ pub const Store = struct {
     fn readRememberedSessionFile(alloc: Allocator, file: *std.Io.File) ![]u8 {
         const stat = try file.stat(io_mod.getIo());
         // An atomic replacement can unlink the valid version already opened here.
-        if (stat.kind != .file or stat.nlink > 1 or stat.permissions.toMode() & 0o777 != 0o600 or stat.size > 256) {
+        if (stat.kind != .file or stat.nlink > 1 or io_mod.modeMismatch(stat.permissions, 0o600) or stat.size > 256) {
             return error.InvalidRememberedSession;
         }
         const bytes = try io_mod.readFileToEnd(alloc, file, 256);
@@ -216,7 +216,7 @@ pub const Store = struct {
             else => return err,
         };
         defer profile.close(zio);
-        if ((try profile.stat(zio)).permissions.toMode() & 0o777 != 0o700) return error.SessionPathUnsafe;
+        if (io_mod.modeMismatch((try profile.stat(zio)).permissions, 0o700)) return error.SessionPathUnsafe;
         if (create) return try io_mod.openOrCreateVerifiedPrivateDirFromDir(profile, "continue");
         var directory = profile.openDir(zio, "continue", .{
             .iterate = true,
@@ -226,7 +226,7 @@ pub const Store = struct {
             else => return err,
         };
         errdefer directory.close(zio);
-        if ((try directory.stat(zio)).permissions.toMode() & 0o777 != 0o700) return error.SessionPathUnsafe;
+        if (io_mod.modeMismatch((try directory.stat(zio)).permissions, 0o700)) return error.SessionPathUnsafe;
         return .{ .dir = directory };
     }
 
@@ -812,14 +812,14 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
         try tmp.dir.createDir(
             std.testing.io,
             sessions_name,
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsForMode(0o700),
         );
         var sessions = try tmp.dir.openDir(std.testing.io, sessions_name, .{});
         defer sessions.close(std.testing.io);
         try sessions.createDir(
             std.testing.io,
             "session",
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsForMode(0o700),
         );
         var session_dir = try sessions.openDir(std.testing.io, "session", .{});
         defer session_dir.close(std.testing.io);
@@ -828,7 +828,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
             try tmp.dir.createDir(
                 std.testing.io,
                 "outside-images",
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsForMode(0o700),
             );
             var outside_images = try tmp.dir.openDir(std.testing.io, "outside-images", .{});
             defer outside_images.close(std.testing.io);
@@ -860,7 +860,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
             try session_dir.createDir(
                 std.testing.io,
                 "images",
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsForMode(0o700),
             );
             var images_dir = try session_dir.openDir(std.testing.io, "images", .{});
             defer images_dir.close(std.testing.io);

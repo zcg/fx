@@ -1490,7 +1490,7 @@ fn traceFilePermissions() std.Io.File.Permissions {
     const builtin = @import("builtin");
     return switch (builtin.target.os.tag) {
         .windows => .default_file,
-        else => std.Io.File.Permissions.fromMode(0o600),
+        else => io_mod.permissionsForMode(0o600),
     };
 }
 
@@ -1756,12 +1756,12 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
 }
 
 fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
-    const pid = std.c.getpid();
-    try writer.print("process: pid={d}", .{pid});
+    const pid_number = io_mod.currentProcessId();
+    try writer.print("process: pid={d}", .{pid_number});
     if (countOpenFileDescriptors()) |fd_count| try writer.print(" open_fds={d}", .{fd_count});
     try writer.writeByte('\n');
 
-    const ps = processMemorySnapshot(alloc, pid) catch null;
+    const ps = processMemorySnapshot(alloc, io_mod.pidFromNumber(@truncate(pid_number))) catch null;
     if (ps) |text| {
         defer alloc.free(text);
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -1796,7 +1796,13 @@ fn countOpenFileDescriptors() ?usize {
     return count;
 }
 
-fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.c.pid_t) ![]u8 {
+/// A one-line memory and lifetime summary for the running process.
+///
+/// POSIX asks `ps`, which every POSIX host has. Windows has no `ps`, so it reads
+/// the same facts from the kernel through `GetProcessMemoryInfo` and
+/// `GetProcessTimes`, which is what a Windows tool would do.
+fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.posix.pid_t) ![]u8 {
+    if (comptime @import("builtin").target.os.tag == .windows) return windowsMemorySnapshot(alloc);
     const pid_text = try alloc.print("{d}", .{pid});
     defer alloc.free(pid_text);
     const result = try std.process.run(alloc, io_mod.getIo(), .{
@@ -1809,6 +1815,105 @@ fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.c.pid_t) ![]u8 {
     }
     return result.stdout;
 }
+
+/// Reads this process's memory counters and elapsed time from the kernel, in the
+/// same shape `ps` reports them on POSIX.
+///
+/// `ps` on Windows prints PowerShell process objects, which is not the same data
+/// and not present on every install, so the kernel counters are used instead.
+fn windowsMemorySnapshot(alloc: std.mem.Allocator) ![]u8 {
+    var counters: windows_memory.PROCESS_MEMORY_COUNTERS = std.mem.zeroes(windows_memory.PROCESS_MEMORY_COUNTERS);
+    counters.cb = @sizeOf(windows_memory.PROCESS_MEMORY_COUNTERS);
+    if (windows_memory.GetProcessMemoryInfo(
+        windows_memory.current_process,
+        &counters,
+        counters.cb,
+    ) == 0) return error.ProcessSnapshotFailed;
+
+    var creation: windows_memory.FILETIME = undefined;
+    var exit_time: windows_memory.FILETIME = undefined;
+    var kernel_time: windows_memory.FILETIME = undefined;
+    var user_time: windows_memory.FILETIME = undefined;
+    var elapsed_text: [32]u8 = undefined;
+    const elapsed: ?[]const u8 = if (windows_memory.GetProcessTimes(
+        windows_memory.current_process,
+        &creation,
+        &exit_time,
+        &kernel_time,
+        &user_time,
+    ) != 0)
+        windowsElapsed(creation, &elapsed_text)
+    else
+        null;
+
+    const rss_kb = counters.WorkingSetSize / 1024;
+    const vsz_kb = counters.PagefileUsage / 1024;
+    return if (elapsed) |text|
+        alloc.print("pid={d} rss_kb={d} vsz_kb={d} etime={s}\n", .{
+            io_mod.currentProcessId(),
+            rss_kb,
+            vsz_kb,
+            text,
+        })
+    else
+        alloc.print("pid={d} rss_kb={d} vsz_kb={d}\n", .{
+            io_mod.currentProcessId(),
+            rss_kb,
+            vsz_kb,
+        });
+}
+
+/// Formats a process's wall-clock age as `HH:MM:SS`, the shape `ps` uses.
+fn windowsElapsed(creation: windows_memory.FILETIME, buffer: *[32]u8) ?[]const u8 {
+    const created_ticks = (@as(u64, creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+    if (created_ticks == 0) return null;
+    var now: windows_memory.FILETIME = undefined;
+    windows_memory.GetSystemTimeAsFileTime(&now);
+    const now_ticks = (@as(u64, now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    if (now_ticks < created_ticks) return null;
+    // FILETIME counts 100-nanosecond intervals.
+    const elapsed_seconds = (now_ticks - created_ticks) / 10_000_000;
+    const hours = elapsed_seconds / 3600;
+    const minutes = (elapsed_seconds % 3600) / 60;
+    const seconds = elapsed_seconds % 60;
+    return std.mem.print(buffer, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch null;
+}
+
+const windows_memory = if (@import("builtin").target.os.tag != .windows) struct {} else struct {
+    const FILETIME = extern struct {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    };
+    const PROCESS_MEMORY_COUNTERS = extern struct {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    };
+    /// The pseudo-handle `GetCurrentProcess` returns, `(HANDLE)-1`.
+    const current_process: std.posix.fd_t = @ptrFromInt(std.math.maxInt(usize));
+
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.posix.fd_t;
+    extern "kernel32" fn GetProcessTimes(
+        process: std.posix.fd_t,
+        creation_time: *FILETIME,
+        exit_time: *FILETIME,
+        kernel_time: *FILETIME,
+        user_time: *FILETIME,
+    ) callconv(.winapi) c_int;
+    extern "kernel32" fn GetSystemTimeAsFileTime(file_time: *FILETIME) callconv(.winapi) void;
+    extern "psapi" fn GetProcessMemoryInfo(
+        process: std.posix.fd_t,
+        counters: *PROCESS_MEMORY_COUNTERS,
+        counters_len: u32,
+    ) callconv(.winapi) c_int;
+};
 
 fn writeDebugEnvSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
     try writer.print("FX_TRACE: {s}\n", .{if (envTruthy("FX_TRACE")) "on" else "off"});
@@ -3956,6 +4061,7 @@ test "trace model catalog summary renders cache state and failure detail" {
 }
 
 test "trace report file uses private randomized markdown path" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const path = try writeTraceReportFile(alloc, "hello\n");
     defer alloc.free(path);
@@ -3969,7 +4075,7 @@ test "trace report file uses private randomized markdown path" {
     const stat = try file.stat(std.testing.io);
     try std.testing.expectEqual(@as(u64, 6), stat.size);
     if (@import("builtin").target.os.tag != .windows) {
-        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+        if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
     }
 }
 

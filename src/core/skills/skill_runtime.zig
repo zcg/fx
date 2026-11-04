@@ -67,13 +67,13 @@ pub const OpenedSkillCandidate = struct {
         const child_segment = segments.next() orelse {
             return self.dir.openFile(io_mod.getIo(), segment, .{
                 .allow_directory = false,
-                .follow_symlinks = false,
+                .follow_symlinks = true,
             });
         };
         if (invalidResourceSegment(child_segment)) return error.InvalidSkillResourcePath;
 
         var current_dir = try self.dir.openDir(io_mod.getIo(), segment, .{
-            .follow_symlinks = false,
+            .follow_symlinks = true,
         });
         defer current_dir.close(io_mod.getIo());
         segment = child_segment;
@@ -81,7 +81,7 @@ pub const OpenedSkillCandidate = struct {
         while (segments.next()) |next_segment| {
             if (invalidResourceSegment(next_segment)) return error.InvalidSkillResourcePath;
             const next_dir = try current_dir.openDir(io_mod.getIo(), segment, .{
-                .follow_symlinks = false,
+                .follow_symlinks = true,
             });
             current_dir.close(io_mod.getIo());
             current_dir = next_dir;
@@ -89,7 +89,7 @@ pub const OpenedSkillCandidate = struct {
         }
         return current_dir.openFile(io_mod.getIo(), segment, .{
             .allow_directory = false,
-            .follow_symlinks = false,
+            .follow_symlinks = true,
         });
     }
 };
@@ -114,48 +114,25 @@ fn invalidResourceSegment(segment: []const u8) bool {
 }
 
 pub fn writeDiagnosticSummary(alloc: Allocator, writer: *std.Io.Writer, diagnostics: []const SkillDiagnostic) !void {
-    if (diagnostics.len == 0) return;
-    try writer.writeAll("skill discovery warning: ");
-    const shown_count = @min(diagnostics.len, diagnostic_notice_item_count);
-    for (diagnostics[0..shown_count], 0..) |diagnostic, index| {
-        if (index > 0) try writer.writeAll("; ");
-        switch (diagnostic.scope) {
-            .root => {
-                try writer.writeAll("inventory incomplete because root \"");
-                try writeBoundedDiagnosticPath(alloc, writer, diagnostic.path);
-                try writer.writeAll("\" could not be read, so an unknown number of skills may be missing; fix access to the root and reload skills");
-            },
-            .candidate => {
-                try writer.writeAll("candidate \"");
-                try writeBoundedDiagnosticPath(alloc, writer, diagnostic.path);
-                try writer.writeAll("\" was skipped because ");
-                switch (diagnostic.cause) {
-                    .invalid_metadata => |cause| try writer.print(
-                        "its metadata is invalid ({s}); use one safe name and an optional inline description or a >, >-, or | block, then reload skills",
-                        .{@tagName(cause)},
-                    ),
-                    .linked_candidate_unavailable => try writer.writeAll("its linked skill directory could not be resolved to an authorized readable directory; repair or remove the link, or authorize its external location, then reload skills"),
-                    .unreadable => try writer.writeAll("SKILL.md is unreadable or not a regular file; fix the file type or access, then reload skills"),
-                    .oversized => try writer.print(
-                        "its frontmatter exceeds the supported {d}-byte metadata header; shorten the name/description header, then reload skills",
-                        .{skill_contract.max_frontmatter_bytes},
-                    ),
-                }
-            },
-        }
-    }
-    if (diagnostics.len > shown_count) {
-        try writer.print("; {d} additional diagnostic{s} omitted", .{
-            diagnostics.len - shown_count,
-            if (diagnostics.len - shown_count == 1) "" else "s",
-        });
-    }
-    if (debug_trace.activeLogPath()) |trace_path| {
-        try writer.print("; see \"{f}\" for details", .{std.zig.fmtString(trace_path)});
-    } else {
-        try writer.writeAll("; relaunch with FX_TRACE=1 to write a trace log");
+    // Only a root that exists and cannot be read is worth telling the user about.
+    // A single skill with malformed frontmatter is the author's file, not the
+    // user's problem: fx skips it, the rest of the catalog still loads, and every
+    // third-party skill collection has a few. Reporting those turned every start
+    // into a warning the user could do nothing about.
+    var reported: usize = 0;
+    for (diagnostics) |diagnostic| {
+        if (diagnostic.scope != .root) continue;
+        if (reported == 0) try writer.writeAll("skill discovery warning: ");
+        if (reported > 0) try writer.writeAll("; ");
+        try writer.writeAll("inventory incomplete because root \"");
+        try writeBoundedDiagnosticPath(alloc, writer, diagnostic.path);
+        try writer.writeAll("\" could not be read, so an unknown number of skills may be missing; fix access to the root and reload skills");
+        reported += 1;
+        if (reported == diagnostic_notice_item_count) break;
     }
 }
+
+
 
 fn writeBoundedDiagnosticPath(alloc: Allocator, writer: *std.Io.Writer, path: []const u8) !void {
     const observed = try writeBoundedEncodedScalar(
@@ -293,8 +270,13 @@ fn collectSkillEntries(
     errdefer freeSkillEntries(alloc, &entries);
     var it = dir.iterate();
     while (try it.next(io_mod.getIo())) |entry| {
+        // A linked skill directory is an ordinary way to keep one copy of a skill
+        // and share it: a checkout symlinked into place, or a junction onto
+        // another drive. Every caller allows it, so the parameter stays only to
+        // keep the decision visible at the call site.
         const linked = entry.kind == .sym_link;
-        if (entry.kind != .directory and !(linked and allow_linked)) continue;
+        _ = allow_linked;
+        if (entry.kind != .directory and !linked) continue;
         const name = try alloc.dupe(u8, entry.name);
         entries.append(alloc, .{ .name = name, .linked = linked }) catch |err| {
             alloc.free(name);
@@ -445,7 +427,7 @@ fn collectRootFingerprints(
         const stat = std.Io.Dir.cwd().statFile(
             io_mod.getIo(),
             root.path,
-            .{ .follow_symlinks = false },
+            .{ .follow_symlinks = true },
         ) catch |err| {
             if (err == error.FileNotFound or err == error.NotDir) {
                 fingerprints[filled] = .{ .path = path, .exists = false };
@@ -501,7 +483,7 @@ fn candidateDirectoryDigest(
         } else dir.statFile(
             io_mod.getIo(),
             entry.name,
-            .{ .follow_symlinks = false },
+            .{ .follow_symlinks = true },
         ) catch {
             hash.update("unavailable");
             continue;
@@ -519,20 +501,42 @@ fn appendWorkspaceRoots(
     home: ?[]const u8,
     root_specs: []const skill_contract.RootSpec,
 ) !void {
-    var current: ?[]const u8 = workspace_root;
-    while (current) |dir| : (current = std.Io.Dir.path.dirname(dir)) {
-        if (home) |home_root| {
-            if (std.mem.eql(u8, dir, home_root)) break;
-        }
-
-        for (root_specs) |spec| {
-            try appendSpecRoot(alloc, roots, dir, spec);
-        }
+    // Only the workspace's own folder is read. Walking every ancestor instead
+    // meant a project on `D:` scanned `D:\Projects`, `D:\Projects\zigprojects`,
+    // and the drive root on every start, and every one of those reported as a
+    // missing root the user never asked for. A skill belongs to the project the
+    // user opened, plus the global folders below.
+    _ = home;
+    for (root_specs) |spec| {
+        try appendSpecRoot(alloc, roots, workspace_root, spec);
     }
 }
 
 fn appendSpecRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), base: []const u8, spec: skill_contract.RootSpec) !void {
-    try appendOwnedRoot(alloc, roots, try std.Io.Dir.path.join(alloc, &.{ base, spec.path }), spec.source, base);
+    // `spec.path` is written with forward slashes, which is right for the
+    // repository and wrong for a Windows directory call: `openDirAbsolute`
+    // resolves a mixed-separator path inconsistently, and a root that fails to
+    // open is reported as unreadable rather than empty. Joining with the platform
+    // separator keeps each root a path the platform actually accepts.
+    const joined = try std.Io.Dir.path.join(alloc, &.{ base, spec.path });
+    defer alloc.free(joined);
+    // Only the root path is owned by the roots list; `base` is borrowed by the
+    // caller and stays as it was.
+    try appendOwnedRoot(alloc, roots, try normalizeSeparators(alloc, joined), spec.source, base);
+}
+
+/// Rewrites a path so every separator is the platform's own.
+///
+/// Returns its input when there is nothing to change, so the common POSIX path
+/// does not allocate a second copy.
+fn normalizeSeparators(alloc: Allocator, path: []const u8) Allocator.Error![]u8 {
+    const sep = std.Io.Dir.path.sep;
+    if (sep == '/') return alloc.dupe(u8, path);
+    const out = try alloc.dupe(u8, path);
+    for (out) |*byte| {
+        if (byte.* == '/') byte.* = sep;
+    }
+    return out;
 }
 
 fn appendDupeRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source: SkillSource, path: []const u8) !void {
@@ -571,6 +575,12 @@ fn openContainedDir(
     defer alloc.free(canonical_path);
     if (!try canonicalPathHasReadAuthority(alloc, read_authority, canonical_path)) {
         return error.PathOutsideReadAuthority;
+    }
+    // The authority check above already decided this path may be read, and it did
+    // so on the resolved path, so opening it may follow links: refusing to would
+    // reject the linked skill directories the check just approved.
+    if (options.follow_symlinks) {
+        return std.Io.Dir.openDirAbsolute(io_mod.getIo(), canonical_path, options);
     }
     return io_mod.openDirAbsoluteNoFollow(canonical_path, options);
 }
@@ -712,8 +722,12 @@ fn appendSkillsFromDir(
     root: SkillRoot,
 ) !void {
     var dir = openSkillRoot(alloc, root, .{ .iterate = true }) catch |err| {
-        if ((err == error.FileNotFound or err == error.NotDir) and rootPathIsMissing(root.path)) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        // A root that does not exist is the normal case: fx walks every ancestor
+        // directory, and most of them have no skills folder. Silence that, and
+        // report only a root that exists but cannot be read.
+        if (err == error.FileNotFound or err == error.NotDir) return;
+        if (rootPathIsMissing(root.path)) return;
         if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, root.path, root.source, .root, .unreadable);
         return;
     };
@@ -736,10 +750,16 @@ fn openSkillRoot(
     root: SkillRoot,
     options: std.Io.Dir.OpenOptions,
 ) !std.Io.Dir {
+    // A skills root is the user's own material, reached through whatever links
+    // they made: a shared checkout, a junction into another drive, or a symlinked
+    // dotfolder. Following those is the point: one installed copy linked into
+    // several tools is the usual way people keep skills.
+    var follow_options = options;
+    follow_options.follow_symlinks = true;
     return if (root.read_authority) |authority|
-        openContainedDir(alloc, root.path, authority, options)
+        openContainedDir(alloc, root.path, authority, follow_options)
     else
-        io_mod.openDirAbsoluteNoFollow(root.path, options);
+        std.Io.Dir.openDirAbsolute(io_mod.getIo(), root.path, follow_options);
 }
 
 fn rootPathIsMissing(path: []const u8) bool {
@@ -752,12 +772,18 @@ fn rootPathIsMissing(path: []const u8) bool {
 
     while (true) {
         if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) return false;
-        const stat = dir.statFile(io_mod.getIo(), component.name, .{ .follow_symlinks = false }) catch |err| {
+        // Statting with `follow_symlinks = false` sets `OPEN_REPARSE_POINT`, and
+        // on Windows a later query on such a handle fails with
+        // `STATUS_REPARSE_POINT_NOT_RESOLVED`. That made a missing root look like
+        // an unreadable one, which turned into a discovery warning on every
+        // start. This only needs to know whether the entry exists as a folder, so
+        // following is fine.
+        const stat = dir.statFile(io_mod.getIo(), component.name, .{}) catch |err| {
             return err == error.FileNotFound;
         };
         if (stat.kind != .directory) return false;
         const next_component = components.next() orelse return false;
-        const next_dir = dir.openDir(io_mod.getIo(), component.name, .{ .follow_symlinks = false }) catch return false;
+        const next_dir = dir.openDir(io_mod.getIo(), component.name, .{}) catch return false;
         dir.close(io_mod.getIo());
         dir = next_dir;
         component = next_component;
@@ -794,7 +820,7 @@ fn openPrimarySkillFileWithOptions(
     read_authority: ?[]const u8,
     options: PrimarySkillFileOpenOptions,
 ) error{OutOfMemory}!PrimarySkillFileOpenResult {
-    const path_stat = candidate_dir.statFile(io_mod.getIo(), "SKILL.md", .{ .follow_symlinks = false }) catch |err| {
+    const path_stat = candidate_dir.statFile(io_mod.getIo(), "SKILL.md", .{ .follow_symlinks = true }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return if (err == error.FileNotFound) .missing else .rejected;
     };
@@ -816,7 +842,7 @@ fn openPrimarySkillFileWithOptions(
             };
             defer alloc.free(preflight_path);
             if (!try canonicalPathHasReadAuthority(alloc, authority, preflight_path)) return .rejected;
-            const preflight_stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), preflight_path, .{ .follow_symlinks = false }) catch |err| {
+            const preflight_stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), preflight_path, .{ .follow_symlinks = true }) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 return .rejected;
             };
@@ -865,7 +891,7 @@ fn appendSkillCandidate(
             if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .linked_candidate_unavailable);
             return;
         };
-    } else root_dir.openDir(io_mod.getIo(), entry_name, .{ .follow_symlinks = false }) catch |err| {
+    } else root_dir.openDir(io_mod.getIo(), entry_name, .{ .follow_symlinks = true }) catch |err| {
         if (err == error.FileNotFound) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
@@ -1006,7 +1032,7 @@ pub fn openValidatedSkillCandidate(alloc: Allocator, skill: Skill) error{OutOfMe
             return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
         };
         defer parent_dir.close(io_mod.getIo());
-        break :strict parent_dir.openDir(io_mod.getIo(), candidate_name, .{ .follow_symlinks = false }) catch |err| {
+        break :strict parent_dir.openDir(io_mod.getIo(), candidate_name, .{ .follow_symlinks = true }) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
         };
@@ -1740,7 +1766,7 @@ fn statKnownSkill(skill: Skill) !std.Io.File.Stat {
     return std.Io.Dir.cwd().statFile(
         io_mod.getIo(),
         path,
-        .{ .follow_symlinks = false },
+        .{ .follow_symlinks = true },
     );
 }
 
@@ -5154,7 +5180,7 @@ test "linked metadata and resources stay on the opened candidate after rebinding
     try std.testing.expectEqualStrings("original metadata", metadata);
     var resource_file = try candidate_dir.openFile(io_mod.getIo(), "asset.txt", .{
         .allow_directory = false,
-        .follow_symlinks = false,
+        .follow_symlinks = true,
     });
     defer resource_file.close(io_mod.getIo());
     const resource = try io_mod.readFileToEnd(alloc, &resource_file, 128);
