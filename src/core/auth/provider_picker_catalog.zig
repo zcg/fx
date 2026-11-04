@@ -211,3 +211,12 @@ test "key source slugs round trip and map to their credentials" {
     try std.testing.expectEqual(types.CredentialSource.stored_key, keySourceCredential(.saved).?);
     try std.testing.expect(keySourceCredential(.new) == null);
 }
+
+test "provider options include the profile's configured names" {
+    var buf: [max_provider_options][]const u8 = undefined;
+    const count = providerOptions(&buf, &.{ "magpie", "openrouter" });
+    // The three built-in slugs, then the configured names in order.
+    try std.testing.expectEqual(provider_catalog.entries.len + 2, count);
+    try std.testing.expectEqualStrings("magpie", buf[provider_catalog.entries.len]);
+    try std.testing.expectEqualStrings("openrouter", buf[provider_catalog.entries.len + 1]);
+}

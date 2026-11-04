@@ -648,7 +648,7 @@ test "exact label matching ignores case and surrounding spaces" {
 
 test "model provider identity stays aligned with the catalog slugs" {
     var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-    const count = provider_picker_catalog.providerOptions(&slugs);
+    const count = provider_picker_catalog.providerOptions(&slugs, &.{});
     for (slugs[0..count]) |slug| {
         const id: model_provider.ProviderId = provider_catalog.parse(slug).?;
         try std.testing.expectEqualStrings(slug, provider_catalog.find(id).slug);
