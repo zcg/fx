@@ -442,6 +442,15 @@ pub const Runtime = struct {
         trigger: LoadTrigger,
     ) void {
         self.from_profile_settings = provider.provider_id == .configured;
+        // On Windows the fetch runs on the caller. Zig 0.17's threaded Io cannot
+        // serve a thread it did not spawn: a background fetch hung there
+        // forever, and the model menu stayed at zero models for a configured
+        // provider. The request is one HTTP GET, so the caller holds the frame
+        // for it and the menu opens complete.
+        if (comptime @import("builtin").target.os.tag == .windows) {
+            self.loadCooperative(provider, access);
+            return;
+        }
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {

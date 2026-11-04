@@ -1102,7 +1102,7 @@ pub const ProviderPreparation = struct {
     catalog: ?model_catalog.ProviderResult = null,
     failure: ?anyerror = null,
 
-    fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
+    fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput, mode: enum { background, synchronous }) !*ProviderPreparation {
         const self = try alloc.create(ProviderPreparation);
         self.* = .{
             .alloc = alloc,
@@ -1120,6 +1120,9 @@ pub const ProviderPreparation = struct {
         if (input.primary_model) |value| self.input.primary_model = try alloc.dupe(u8, value);
         if (input.preferred_model) |value| self.input.preferred_model = try alloc.dupe(u8, value);
         if (input.candidate) |candidate| self.input.candidate = try candidate.clone(alloc);
+        // A synchronous preparation has no thread: the caller runs `run`
+        // itself and `takeProviderPreparation` sees it done on the next poll.
+        if (mode == .synchronous) return self;
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
@@ -2302,7 +2305,19 @@ pub const Runtime = struct {
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
         if (self.provider_preparation != null) return error.ProviderPreparationInProgress;
         self.cancelPromptCredentialRefresh();
-        self.provider_preparation = try ProviderPreparation.start(alloc, self, input);
+        // On Windows the preparation runs on the caller. Its work is a
+        // credential read and one catalog GET, and Zig 0.17's threaded Io
+        // cannot serve a thread it did not spawn - a background preparation
+        // hung there forever, and a provider switch never completed. The
+        // caller holds the frame for the request instead; the completion is
+        // collected by the same tick that polls a background one.
+        if (comptime @import("builtin").target.os.tag == .windows) {
+            const task = try ProviderPreparation.start(alloc, self, input, .synchronous);
+            self.provider_preparation = task;
+            task.run();
+            return;
+        }
+        self.provider_preparation = try ProviderPreparation.start(alloc, self, input, .background);
     }
 
     pub fn providerPreparationPending(self: *const Self) bool {
@@ -2348,6 +2363,19 @@ pub const Runtime = struct {
         alloc: Allocator,
         action: InventoryRefreshAction,
     ) InventoryRefreshStart {
+        // On Windows the probe runs on the caller: every check is a file stat
+        // against the profile, which completes in microseconds, and Zig 0.17's
+        // threaded Io cannot run directory opens on a thread the pool did not
+        // spawn - the inventory thread hung there forever, and the provider
+        // picker showed "checking credentials..." without end. The POSIX path
+        // keeps its background worker, where the same checks may touch
+        // filesystems that do block.
+        if (comptime @import("builtin").target.os.tag == .windows) {
+            self.applySourceInventory(SourceInventory.detect(alloc, self, probeCredentialSource) catch {
+                return .failed;
+            });
+            return .started;
+        }
         return self.beginSourceInventoryRefreshWithDeps(alloc, action, .{
             .ctx = self,
             .probe = probeCredentialSource,

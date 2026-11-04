@@ -65,12 +65,11 @@ pub fn Runtime(comptime App: type) type {
             // a caller-retained buffer.
             column.count = 0;
             if (comptime !supported(App)) return 0;
-            if (app.auth.sourceInventoryRefreshActive()) {
-                column.labels[0] = "checking credentials...";
-                column.annotations[0] = "";
-                column.count = 1;
-                return column.count;
-            }
+            // A credential inventory still running does not block the list: the
+            // names are known without it, and only the "current" annotation
+            // needs it. The row budget is the same either way, so finishing the
+            // refresh swaps annotations in place instead of resizing anything.
+            const inventory_ready = !app.auth.sourceInventoryRefreshActive();
             if (comptime @hasDecl(@TypeOf(app.auth), "teamListLoading")) {
                 if (app.auth.teamListLoading()) {
                     column.labels[0] = auth_runtime.team_list_loading_label;
@@ -88,7 +87,7 @@ pub fn Runtime(comptime App: type) type {
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id.eql(active_provider) and
+                        column.annotations[i] = if (inventory_ready and id.eql(active_provider) and
                             model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
                 },
