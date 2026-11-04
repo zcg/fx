@@ -456,6 +456,8 @@ const RunDeps = struct {
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
+    /// Startup state for a command that lists models, which needs no model chosen.
+    load_catalog_startup_state: LoadStartupStateFn = app_lifecycle.loadCatalogStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
     load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
@@ -1847,7 +1849,7 @@ fn runNonInteractiveWithDeps(
                     null,
                 )
             else
-                try deps.load_startup_state(
+                try deps.load_catalog_startup_state(
                     alloc,
                     cfg.gateway_provider.oauth_transport,
                     cfg.secret_store,

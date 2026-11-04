@@ -1418,9 +1418,21 @@ pub const PickerView = struct {
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
     api_key_inline: bool = false,
+    /// The names of the profile's configured providers, in the order the picker
+    /// offers them after the built-in ones. Borrowed from the profile runtime.
+    configured_providers: []const []const u8 = &.{},
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
+    }
+
+    /// The choice for a configured provider at `index`, or null when the index
+    /// is past the configured names. A name the profile no longer defines cannot
+    /// be parsed, so it yields no choice rather than a broken one.
+    fn configuredProviderAt(self: PickerView, index: usize) ?Choice {
+        if (index >= self.configured_providers.len) return null;
+        const provider = model_provider.parse(self.configured_providers[index]) orelse return null;
+        return .{ .provider = provider };
     }
 
     pub fn choiceCount(self: PickerView) usize {
@@ -1432,7 +1444,10 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
+            .provider => if (comptime host_target.is_wasm)
+                2 + self.configured_providers.len
+            else
+                3 + self.configured_providers.len,
             .sign_in, .api_key => 0,
             .change_team => teamFilter(self.teams, self.team_query).count(),
             .switch_credential => gatewaySourceCount(self.available_sources) + 1,
@@ -1459,8 +1474,11 @@ pub const PickerView = struct {
             .provider => switch (index) {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
-                2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
-                else => null,
+                2 => if (comptime host_target.is_wasm)
+                    self.configuredProviderAt(0)
+                else
+                    .{ .provider = .grok },
+                else => self.configuredProviderAt(index - (if (comptime host_target.is_wasm) 2 else 3)),
             },
             .sign_in, .api_key => null,
             .change_team => if (teamFilter(self.teams, self.team_query).at(index)) |team_index| .{ .team = team_index } else null,
@@ -1864,6 +1882,10 @@ pub const Runtime = struct {
     api_key_inline: bool = false,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
+    /// The profile's configured provider names, offered after the built-in ones
+    /// in the `/provider` picker. Owned by the runtime and refreshed whenever the
+    /// profile's definitions change.
+    configured_provider_names: std.ArrayList([]const u8) = .empty,
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
     /// Revocations of signed-out sessions still talking to their issuer.
@@ -1915,7 +1937,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 35) {
+            if (@typeInfo(Self).@"struct".field_names.len != 36) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1948,6 +1970,7 @@ pub const Runtime = struct {
         storage.api_key_inline = false;
         storage.api_key_returns_to_root = false;
         storage.api_key_save = .{};
+        storage.configured_provider_names = .empty;
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.remote_revocation_tasks = .empty;
@@ -2415,6 +2438,7 @@ pub const Runtime = struct {
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = self.apiKeyMaskCount(),
             .api_key_inline = self.api_key_inline,
+            .configured_providers = self.configured_provider_names.items,
         };
     }
 
@@ -2486,6 +2510,30 @@ pub const Runtime = struct {
         self.picker_stage = .provider;
         self.provider_picker_active = active_provider;
         self.picker_selection = .{ .provider = active_provider };
+    }
+
+    /// Replaces the names the `/provider` picker offers after the built-in ones.
+    /// The profile owns the definitions, so the names are copied and the caller
+    /// may release or replace its registry afterwards.
+    pub fn setConfiguredProviders(self: *Self, alloc: Allocator, definitions: []const []const u8) Allocator.Error!void {
+        for (self.configured_provider_names.items) |name| alloc.free(name);
+        self.configured_provider_names.clearRetainingCapacity();
+        try self.configured_provider_names.ensureTotalCapacity(alloc, definitions.len);
+        errdefer {
+            for (self.configured_provider_names.items) |name| alloc.free(name);
+            self.configured_provider_names.clearRetainingCapacity();
+        }
+        for (definitions) |name| {
+            const owned = try alloc.dupe(u8, name);
+            self.configured_provider_names.appendAssumeCapacity(owned);
+        }
+    }
+
+    /// Releases the copied configured provider names. Safe on a zeroed runtime.
+    pub fn deinitConfiguredProviders(self: *Self, alloc: Allocator) void {
+        for (self.configured_provider_names.items) |name| alloc.free(name);
+        self.configured_provider_names.deinit(alloc);
+        self.configured_provider_names = .empty;
     }
 
     pub fn teamPickerActive(self: *const Self) bool {

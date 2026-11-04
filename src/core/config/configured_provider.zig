@@ -21,6 +21,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidProviderId,
     ReservedProviderId,
     InvalidProtocol,
+    InvalidModelListing,
     InvalidBaseUrl,
     InsecureBaseUrl,
     InvalidAuth,
@@ -30,7 +31,54 @@ pub const ParseError = Allocator.Error || error{
     InvalidModelMetadata,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+/// The wire protocol a configured provider speaks. Each value names a request
+/// and reply shape, not a vendor: several vendors share one.
+pub const Protocol = enum {
+    @"openai-chat-completions",
+    @"openai-responses",
+    @"anthropic-messages",
+
+    pub fn fromName(name: []const u8) ?Protocol {
+        for (std.enums.values(Protocol)) |protocol| {
+            if (std.mem.eql(u8, name, @tagName(protocol))) return protocol;
+        }
+        return null;
+    }
+
+    /// The path appended to a provider's base URL for a chat request.
+    pub fn chatPath(self: Protocol) []const u8 {
+        return switch (self) {
+            .@"openai-chat-completions" => "/chat/completions",
+            .@"openai-responses" => "/responses",
+            .@"anthropic-messages" => "/messages",
+        };
+    }
+};
+
+/// How a provider reports the models a key may use. `listed` asks the provider's
+/// own listing endpoint, whose shape differs per vendor; `none` keeps only the
+/// declared metadata.
+pub const ModelListing = enum {
+    /// GET the models path and read the reply's own shape.
+    listed,
+    /// The provider has no listing endpoint; use `model_metadata` alone.
+    none,
+
+    pub fn fromName(name: []const u8) ?ModelListing {
+        for (std.enums.values(ModelListing)) |listing| {
+            if (std.mem.eql(u8, name, @tagName(listing))) return listing;
+        }
+        return null;
+    }
+
+    /// The path appended to a provider's base URL to list models.
+    pub fn path(self: ModelListing) []const u8 {
+        return switch (self) {
+            .listed => "/models",
+            .none => "",
+        };
+    }
+};
 pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
@@ -58,10 +106,19 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// Whether the provider can list its own models. A listed provider's catalog
+    /// is fetched and cached; the declared metadata then supplies the fields the
+    /// listing does not carry.
+    model_listing: ModelListing = .listed,
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+        return std.mem.concat(alloc, u8, &.{ self.base_url, self.protocol.chatPath() });
+    }
+
+    /// Caller owns the returned URL.
+    pub fn models_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, self.model_listing.path() });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -165,9 +222,10 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "model_listing" });
     const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
+    if (protocol != .string) return error.InvalidProtocol;
+    const parsed_protocol = Protocol.fromName(protocol.string) orelse return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
@@ -198,14 +256,19 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
+    const listing: ModelListing = if (value.object.get("model_listing")) |raw| blk: {
+        if (raw != .string) return error.InvalidModelListing;
+        break :blk ModelListing.fromName(raw.string) orelse return error.InvalidModelListing;
+    } else .listed;
     return .{
         .id = owned_id,
-        .protocol = .@"openai-chat-completions",
+        .protocol = parsed_protocol,
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
+        .model_listing = listing,
     };
 }
 

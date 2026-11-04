@@ -5,6 +5,7 @@ const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const catalog = @import("../core/gateway/model_catalog.zig");
+const model_listing = @import("model_listing.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
@@ -246,6 +247,26 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
     const definition = definition_at(raw);
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
+
+    // A provider that lists its models is asked first: the list is the vendor's
+    // own and changes as it ships models, while the declared metadata only says
+    // which of them fx should present and what the listing cannot express. A
+    // listing that fails or does not parse leaves the declared set, so a
+    // provider whose key is missing still shows the models the user configured.
+    var listing: ?model_listing.Listing = null;
+    defer if (listing) |*value| value.deinit();
+    if (definition.model_listing == .listed) {
+        listing = fetchListing(alloc, definition, input) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf("gateway", "configured_model_listing_unavailable reason={s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    if (listing) |value| {
+        try model_listing.mergeInto(alloc, definition, value, &entries);
+        return .{ .catalog = entries };
+    }
+
     for (definition.model_metadata) |metadata| {
         var entry = metadata_entry(metadata);
         entry.id = try alloc.dupe(u8, entry.id);
@@ -255,6 +276,38 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
+}
+
+/// Asks the provider which models it serves. The credential comes from the
+/// provider's own environment slot, the same one its chat requests use.
+fn fetchListing(alloc: Allocator, definition: *const definitions.Definition, input: catalog.FetchInput) !model_listing.Listing {
+    const url = try definition.models_url(alloc);
+    defer alloc.free(url);
+    const token = listingToken(alloc, definition) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer if (token) |value| secret.zeroAndFree(alloc, value);
+    var cancel = std.atomic.Value(bool).init(false);
+    const cancel_flag = input.cancel_flag orelse &cancel;
+    const result = try client_mod.fetchGatewayJsonCancellable(alloc, token, null, url, cancel_flag);
+    return switch (result) {
+        .success => |body| blk: {
+            defer alloc.free(body);
+            break :blk model_listing.parse(alloc, body);
+        },
+        .http_status => error.ListingRefused,
+    };
+}
+
+/// The token the provider's own listing accepts, or null when it needs none.
+fn listingToken(alloc: Allocator, definition: *const definitions.Definition) Allocator.Error!?[]u8 {
+    switch (definition.auth) {
+        .none => return null,
+        .bearer => |env| {
+            const value = io.getenv(env) orelse return null;
+            return try alloc.dupe(u8, value);
+        },
+    }
 }
 
 test "configured capability lookup matches catalog projection and preserves unknowns" {

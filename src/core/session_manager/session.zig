@@ -546,7 +546,9 @@ pub const Session = struct {
     fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
-        const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
+        const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| {
+            return storage.ioFault(io_err);
+        };
         defer s.closeDir(tmp);
         // An import that staged blobs already has its folder.
         const dir = if (session.staged) |staged| staged else try session.makeStaging(tmp);
@@ -566,14 +568,61 @@ pub const Session = struct {
 
         const rename_first = env.isPlanted(.rename_before_fsync);
         if (rename_first) try session.publishRename(tmp);
-        s.sync(log.file) catch |io_err| return storage.ioFault(io_err);
+        s.sync(log.file) catch |io_err| {
+            return storage.ioFault(io_err);
+        };
         session.observe(.publish_synced);
         const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
         errdefer s.closeFile(lock);
-        if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
-        s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
-        if (!rename_first) try session.publishRename(tmp);
-        s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
+        const locked = s.tryLock(lock) catch |io_err| {
+            return storage.ioFault(io_err);
+        };
+        if (!locked) {
+            return error.Io;
+        }
+        s.syncDir(dir) catch |io_err| {
+            return storage.ioFault(io_err);
+        };
+        if (!rename_first) {
+            // Windows cannot rename a directory that still has open files inside
+            // it: the rename comes back as AccessDenied. The staged log and lock
+            // are exactly that, so on Windows they are closed, the folder is
+            // renamed, and both are reopened under the published path. POSIX
+            // renames through the open descriptors and keeps them.
+            if (comptime @import("builtin").target.os.tag == .windows) {
+                s.closeFile(lock);
+                log.close();
+                try session.publishRename(tmp);
+                const reopened_dir = s.openDir(env.root, session.identity.id) catch |io_err| {
+                    return storage.ioFault(io_err);
+                };
+                errdefer s.closeDir(reopened_dir);
+                const reopened_log = Log.open(session.env.gpa, s, reopened_dir, "log.jsonl", .read_write, .{}) catch |io_err| {
+                    return storage.ioFault(io_err);
+                };
+                var reopened_log_value = reopened_log.log;
+                errdefer reopened_log_value.close();
+                const reopened_lock = s.openFile(reopened_dir, "lock", .read_write) catch |io_err| {
+                    return storage.ioFault(io_err);
+                };
+                errdefer s.closeFile(reopened_lock);
+                const relocked = s.tryLock(reopened_lock) catch |io_err| {
+                    return storage.ioFault(io_err);
+                };
+                if (!relocked) {
+                    return error.Io;
+                }
+                s.syncDir(env.root) catch |io_err| {
+                    return storage.ioFault(io_err);
+                };
+                session.observe(.published);
+                return .{ .dir = reopened_dir, .log = reopened_log_value, .lock = reopened_lock };
+            }
+            try session.publishRename(tmp);
+        }
+        s.syncDir(env.root) catch |io_err| {
+            return storage.ioFault(io_err);
+        };
         session.observe(.published);
         return .{ .dir = dir, .log = log, .lock = lock };
     }
@@ -723,7 +772,9 @@ pub const Session = struct {
     }
 
     fn publishRename(session: *Session, tmp: storage.Dir) AppendError!void {
-        session.env.s.rename(tmp, session.identity.id, session.env.root, session.identity.id) catch |io_err| return storage.ioFault(io_err);
+        session.env.s.rename(tmp, session.identity.id, session.env.root, session.identity.id) catch |io_err| {
+            return storage.ioFault(io_err);
+        };
         session.observe(.renamed);
     }
 

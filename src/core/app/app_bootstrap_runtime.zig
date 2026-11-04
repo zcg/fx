@@ -513,6 +513,18 @@ pub fn Runtime(comptime App: type) type {
                 app.provider_selection.definitions = startup.configured_providers;
                 startup.configured_providers = .{};
                 app.provider_selection.adoptOwned(startup.provider, &selected_model);
+                // The `/provider` picker lists the built-in providers plus the
+                // ones this profile defines, so a configured connection is
+                // reachable from the same menu as the built-ins.
+                if (comptime @hasField(App, "auth")) {
+                    var names: std.ArrayList([]const u8) = .empty;
+                    defer names.deinit(app.alloc);
+                    try names.ensureTotalCapacity(app.alloc, app.provider_selection.definitions.definitions.len);
+                    for (app.provider_selection.definitions.definitions) |definition| {
+                        names.appendAssumeCapacity(definition.id);
+                    }
+                    try app.auth.setConfiguredProviders(app.alloc, names.items);
+                }
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
             }

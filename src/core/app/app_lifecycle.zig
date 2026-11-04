@@ -510,7 +510,33 @@ pub fn loadStartupStateForRunWithOverrides(
     settings_overrides: []const config_runtime.SettingOverride,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, provider_override, model_override, .blocking, settings_overrides);
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, provider_override, model_override, .blocking, settings_overrides, false);
+}
+
+/// Startup state for a command that lists the available models rather than
+/// sending a request, so a configured provider needs no model chosen yet.
+pub fn loadCatalogStartupState(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+) !StartupState {
+    return loadCatalogStartupStateForRun(alloc, transport, secret_store, default_model, default_agent_step_limit, .local, null, null);
+}
+
+pub fn loadCatalogStartupStateForRun(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, provider_override, model_override, .blocking, &.{}, true);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
@@ -592,7 +618,7 @@ pub fn loadInteractiveStartupState(
     model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred, &.{});
+    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred, &.{}, false);
 }
 
 pub fn loadStartupStatus(
@@ -729,7 +755,7 @@ fn loadStartupStateFromOwnedWorkspace(
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
 ) !StartupState {
-    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking, &.{});
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking, &.{}, false);
 }
 
 fn loadStartupStateWithKeychainRead(
@@ -746,6 +772,11 @@ fn loadStartupStateWithKeychainRead(
     model_override: ?[]const u8,
     keychain_read: KeychainRead,
     settings_overrides: []const config_runtime.SettingOverride,
+    /// A catalog listing needs no model: it exists to show the user which models
+    /// they could choose. When set, a configured provider without a saved or run
+    /// model keeps an empty selection instead of failing, and the caller reads
+    /// the catalog only.
+    allow_unselected_model: bool,
 ) !StartupState {
     var state = StartupState{
         .agent_step_limit = default_agent_step_limit,
@@ -803,7 +834,14 @@ fn loadStartupStateWithKeychainRead(
     else
         null;
     const run_model = model_override orelse config_runtime.modelEnvOverride();
-    const configured_selection = try config_runtime.selectProviderModel(default_model, settings, bound_override, run_model);
+    const configured_selection = config_runtime.selectProviderModel(default_model, settings, bound_override, run_model) catch |err| blk: {
+        if (!allow_unselected_model or err != error.ConfiguredModelNotSelected) return err;
+        // Listing a catalog does not need a chosen model. The provider still has
+        // to be known, so the name is kept and the model stays empty; nothing
+        // that sends a request reads this state.
+        const provider = bound_override orelse settings.provider orelse .gateway;
+        break :blk model_provider.ProviderSelection{ .provider = provider, .model = "" };
+    };
     state.provider = configured_selection.provider;
     state.configured_providers = settings.providers orelse .{};
     settings.providers = null;
@@ -2962,7 +3000,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     var keychain_store = host.unavailable_secret_store;
     keychain_store.is_disabled_fn = keychainEnabledForTest;
     for ([_]KeychainRead{ .blocking, .deferred }) |keychain_read| {
-        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read, &.{});
+        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read, &.{}, false);
         defer state.deinit(alloc);
         try std.testing.expect(state.credential == null);
         if (keychain_read == .deferred and builtin.target.os.tag == .macos) {
