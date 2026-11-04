@@ -2670,6 +2670,20 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Starts adding a provider from a preset, with the preset's own name, base
+    /// URL, protocol, and key variable already filled in. The walk lands on the
+    /// key, because everything else is known.
+    pub fn beginAddProviderWithPreset(self: *Self, alloc: Allocator, preset: provider_presets.Preset) bool {
+        if (!self.beginAddProvider()) return false;
+        var draft = &self.add_provider_draft.?;
+        draft.name.appendSlice(alloc, preset.name) catch return false;
+        draft.base_url.appendSlice(alloc, preset.base_url) catch return false;
+        draft.protocol = preset.protocol;
+        draft.env = preset.env;
+        draft.field = .api_key;
+        return true;
+    }
+
     /// Cancels the add-provider flow and clears what was typed, including the
     /// key. Safe when no draft is in progress.
     pub fn cancelAddProvider(self: *Self, alloc: Allocator) void {

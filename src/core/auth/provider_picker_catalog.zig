@@ -9,6 +9,7 @@ const std = @import("std");
 const host_target = @import("../hosts/target.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_presets = @import("provider_presets.zig");
 const types = @import("../shared/types.zig");
 
 /// How a provider is authenticated. Subscription providers expose no methods;
@@ -20,9 +21,10 @@ pub const Method = enum {
     api_key,
 };
 
-/// The picker offers the built-in providers and the profile's configured ones;
-/// a profile defines at most 32 connections.
-pub const max_provider_options = provider_catalog.entries.len + 32;
+/// The picker offers the built-in providers, the profile's configured ones, and
+/// the presets the profile has not added yet: three built-ins, up to 32
+/// configured connections, and every preset.
+pub const max_provider_options = provider_catalog.entries.len + 32 + provider_presets.presets.len;
 const max_method_options = 2;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
@@ -135,7 +137,23 @@ pub fn providerOptions(out: [][]const u8, configured: []const []const u8) usize 
         out[count] = name;
         count += 1;
     }
+    // The presets come last, and only when the profile has not defined them
+    // yet: a preset the user already added is listed once, by its own name.
+    // Offering them here is what makes adding one a single pick instead of a
+    // walk through four fields the preset already knows.
+    for (&provider_presets.presets) |*preset| {
+        if (count >= out.len) return count;
+        if (containsName(configured, preset.name)) continue;
+        if (provider_catalog.parse(preset.name) != null) continue;
+        out[count] = preset.name;
+        count += 1;
+    }
     return count;
+}
+
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+    return false;
 }
 
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {

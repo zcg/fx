@@ -13,6 +13,7 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const provider_presets = @import("../auth/provider_presets.zig");
 const credentials = @import("../auth/credentials.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const provider_picker_catalog = @import("../auth/provider_picker_catalog.zig");
@@ -255,15 +256,14 @@ pub fn Runtime(comptime App: type) type {
 
         /// Enter: open the next column, or hand the completed choice to the
         /// auth runtime.
-        /// Resolves a picker row to a provider: a built-in slug, or a name the
-        /// profile defines. The picker offers both, so both must resolve.
-        fn resolveProvider(app: *App, label: []const u8) !model_provider.ProviderId {
+        /// Resolves a picker row to a provider: a built-in slug or a name the
+        /// profile defines. A preset the profile has not added yet returns null,
+        /// because choosing it starts the add-provider flow instead of a switch.
+        fn resolveProvider(app: *App, label: []const u8) ?model_provider.ProviderId {
             if (provider_catalog.parse(label)) |built_in| return built_in;
-            // A configured name binds against the profile's registry, which is
-            // what gives it the definition its requests read.
-            const configured = model_provider.parse(label) orelse return error.UnknownConfiguredProvider;
+            const configured = model_provider.parse(label) orelse return null;
             if (configured != .configured) return configured;
-            return try configured.bind(app.provider_selection.definitions);
+            return configured.bind(app.provider_selection.definitions) catch null;
         }
 
         pub fn submit(app: *App) !bool {
@@ -285,13 +285,16 @@ pub fn Runtime(comptime App: type) type {
 
             switch (query.stage) {
                 .provider => {
-                    // A configured connection is a provider the profile defines,
-                    // not one of the built-in three, so it is resolved through
-                    // the same binding the rest of the app uses. Parsing it as a
-                    // built-in name returns null, which used to make Enter fall
-                    // through to the command router and report "Unknown command"
-                    // for a provider the picker had just offered.
-                    const provider = try resolveProvider(app, selected);
+                    // A preset the profile has not added yet opens the
+                    // add-provider flow with the preset's own base URL,
+                    // protocol, and key variable filled in, so the user only
+                    // pastes a key. A provider that already exists switches.
+                    const provider = resolveProvider(app, selected) orelse {
+                        const preset = provider_presets.find(selected) orelse return false;
+                        _ = app.auth.beginAddProviderWithPreset(app.alloc, preset);
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    };
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         try commit(app, .{ .provider = provider });
                         return true;

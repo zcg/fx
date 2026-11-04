@@ -123,6 +123,14 @@ pub fn presetAt(index: usize) ?Preset {
     return null;
 }
 
+/// The preset with this name, when one exists.
+pub fn find(name: []const u8) ?Preset {
+    for (presets) |preset| {
+        if (std.mem.eql(u8, preset.name, name)) return preset;
+    }
+    return null;
+}
+
 test "every preset names a protocol fx can speak" {
     const known = [_][]const u8{ "openai-chat-completions", "anthropic-messages", "openai-responses" };
     for (presets) |preset| {
