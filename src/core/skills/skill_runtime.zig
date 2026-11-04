@@ -132,8 +132,6 @@ pub fn writeDiagnosticSummary(alloc: Allocator, writer: *std.Io.Writer, diagnost
     }
 }
 
-
-
 fn writeBoundedDiagnosticPath(alloc: Allocator, writer: *std.Io.Writer, path: []const u8) !void {
     const observed = try writeBoundedEncodedScalar(
         alloc,

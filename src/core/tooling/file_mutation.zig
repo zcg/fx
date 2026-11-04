@@ -3361,7 +3361,9 @@ test "apply preserves the existing destination mode" {
     {
         var file = try tmp.dir.openFile(std.testing.io, "mode.txt", .{});
         defer file.close(std.testing.io);
-        try io_mod.setPermissions(file, io_mod.permissionsForMode(0o640),
+        try io_mod.setPermissions(
+            file,
+            io_mod.permissionsForMode(0o640),
         );
     }
     var call_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

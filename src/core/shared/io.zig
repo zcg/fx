@@ -2087,7 +2087,6 @@ pub fn windowsRestoreConsole(
     _ = output_fd;
 }
 
-
 /// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
 pub fn tcsetattr(
     fd: std.posix.fd_t,

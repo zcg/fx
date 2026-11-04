@@ -22,7 +22,8 @@ const std = @import("std");
 const Io = std.Io;
 const storage = @import("storage.zig");
 
-pub const Fault = struct {    gpa: std.mem.Allocator,
+pub const Fault = struct {
+    gpa: std.mem.Allocator,
     io: Io,
     prng: std.Random.DefaultPrng,
     /// The simulated process is dead: every storage call fails untouched.

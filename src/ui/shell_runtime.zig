@@ -205,7 +205,7 @@ pub const TerminalState = struct {
         if (io_mod.getenv("TMUX") == null) return;
         const pane = io_mod.getenv("TMUX_PANE") orelse return;
 
-            io_mod.writeFd(io_mod.stdoutHandle(), "\x1b[0m\x1b[2J\x1b[3J\x1b[H") catch |err| {
+        io_mod.writeFd(io_mod.stdoutHandle(), "\x1b[0m\x1b[2J\x1b[3J\x1b[H") catch |err| {
             debug_trace.logf("resize", "tmux_clear_screen_failed pane={s} err={s}", .{ pane, @errorName(err) });
             return;
         };
@@ -217,23 +217,23 @@ pub const TerminalState = struct {
         _: TerminalState,
         protocol: cursor_probe.Protocol,
     ) !void {
-            try io_mod.writeFd(io_mod.stdoutHandle(), cursor_probe.queryBytes(protocol));
+        try io_mod.writeFd(io_mod.stdoutHandle(), cursor_probe.queryBytes(protocol));
     }
 
     pub fn enableThemeNotifications(_: TerminalState) !void {
-            try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_notification_enable_sequence);
+        try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_notification_enable_sequence);
     }
 
     pub fn requestThemeColorScheme(_: TerminalState) !void {
-            try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_color_scheme_query);
+        try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_color_scheme_query);
     }
 
     pub fn requestThemeResponseFence(_: TerminalState) !void {
-            try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_response_fence_query);
+        try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_response_fence_query);
     }
 
     pub fn requestThemeBackground(_: TerminalState) !void {
-            try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_background_query_with_fence);
+        try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.theme_background_query_with_fence);
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {
