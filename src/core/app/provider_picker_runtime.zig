@@ -255,6 +255,17 @@ pub fn Runtime(comptime App: type) type {
 
         /// Enter: open the next column, or hand the completed choice to the
         /// auth runtime.
+        /// Resolves a picker row to a provider: a built-in slug, or a name the
+        /// profile defines. The picker offers both, so both must resolve.
+        fn resolveProvider(app: *App, label: []const u8) !model_provider.ProviderId {
+            if (provider_catalog.parse(label)) |built_in| return built_in;
+            // A configured name binds against the profile's registry, which is
+            // what gives it the definition its requests read.
+            const configured = model_provider.parse(label) orelse return error.UnknownConfiguredProvider;
+            if (configured != .configured) return configured;
+            return try configured.bind(app.provider_selection.definitions);
+        }
+
         pub fn submit(app: *App) !bool {
             if (comptime !supported(App)) return false;
             if (!hasQuery(app)) return false;
@@ -274,7 +285,13 @@ pub fn Runtime(comptime App: type) type {
 
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
+                    // A configured connection is a provider the profile defines,
+                    // not one of the built-in three, so it is resolved through
+                    // the same binding the rest of the app uses. Parsing it as a
+                    // built-in name returns null, which used to make Enter fall
+                    // through to the command router and report "Unknown command"
+                    // for a provider the picker had just offered.
+                    const provider = try resolveProvider(app, selected);
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         try commit(app, .{ .provider = provider });
                         return true;

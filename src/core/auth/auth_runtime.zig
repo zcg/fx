@@ -1129,6 +1129,7 @@ pub const ProviderPreparation = struct {
 
     fn run(self: *ProviderPreparation) void {
         defer self.done.store(true, .release);
+        debug_trace.logf("provider", "preparation start target={t}", .{self.input.target()});
         if (self.cancel_requested.load(.seq_cst)) return;
         if (self.input.candidate) |candidate| {
             self.credential = candidate;
@@ -1142,10 +1143,14 @@ pub const ProviderPreparation = struct {
                 self.input.target(),
                 self.input.preferred_source,
             ) catch |err| {
+                debug_trace.logf("provider", "preparation credential failed err={s}", .{@errorName(err)});
                 self.failure = err;
                 return;
             };
-            if (self.credential == null) return;
+            if (self.credential == null) {
+                debug_trace.logf("provider", "preparation credential missing target={t}", .{self.input.target()});
+                return;
+            }
         }
         if (self.cancel_requested.load(.seq_cst)) return;
         const access: credentials.CatalogAccess = if (self.host_managed)
@@ -1163,9 +1168,14 @@ pub const ProviderPreparation = struct {
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
         }) catch |err| {
+            debug_trace.logf("provider", "preparation catalog failed err={s}", .{@errorName(err)});
             self.failure = err;
             return;
         };
+        debug_trace.logf("provider", "preparation catalog done target={t} kind={t}", .{
+            self.input.target(),
+            std.meta.activeTag(self.catalog.?),
+        });
     }
 
     pub fn requestCancel(self: *ProviderPreparation) void {
@@ -2305,18 +2315,6 @@ pub const Runtime = struct {
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
         if (self.provider_preparation != null) return error.ProviderPreparationInProgress;
         self.cancelPromptCredentialRefresh();
-        // On Windows the preparation runs on the caller. Its work is a
-        // credential read and one catalog GET, and Zig 0.17's threaded Io
-        // cannot serve a thread it did not spawn - a background preparation
-        // hung there forever, and a provider switch never completed. The
-        // caller holds the frame for the request instead; the completion is
-        // collected by the same tick that polls a background one.
-        if (comptime @import("builtin").target.os.tag == .windows) {
-            const task = try ProviderPreparation.start(alloc, self, input, .synchronous);
-            self.provider_preparation = task;
-            task.run();
-            return;
-        }
         self.provider_preparation = try ProviderPreparation.start(alloc, self, input, .background);
     }
 
@@ -2363,13 +2361,12 @@ pub const Runtime = struct {
         alloc: Allocator,
         action: InventoryRefreshAction,
     ) InventoryRefreshStart {
-        // On Windows the probe runs on the caller: every check is a file stat
-        // against the profile, which completes in microseconds, and Zig 0.17's
-        // threaded Io cannot run directory opens on a thread the pool did not
-        // spawn - the inventory thread hung there forever, and the provider
-        // picker showed "checking credentials..." without end. The POSIX path
-        // keeps its background worker, where the same checks may touch
-        // filesystems that do block.
+        // The probe runs on the caller: every check is a stat against the
+        // profile, so the inventory is ready before the picker draws its first
+        // frame. Running it in the background meant the provider list opened as
+        // "checking credentials..." and only filled in a frame or two later,
+        // which read as a hang. POSIX keeps the worker, where the same checks
+        // may touch filesystems that do block.
         if (comptime @import("builtin").target.os.tag == .windows) {
             self.applySourceInventory(SourceInventory.detect(alloc, self, probeCredentialSource) catch {
                 return .failed;

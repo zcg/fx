@@ -117,13 +117,14 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
-    if (!posix_suites) {
-        return;
-    }
 
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
+    // The unit suites model POSIX behavior, so they are not built on Windows.
+    // Everything below them - benchmarks and the platform probes - still is,
+    // which is why this gates the suites rather than returning early.
+    if (posix_suites) {
+        const exe_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
     // Tests launch the installed fx binary, and the session boundary test
@@ -163,6 +164,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_session_manager_tests.step);
     test_step.dependOn(&run_session_manager_hook_tests.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
+    }
 
     const fuzz_step = b.step(
         "fuzz",
@@ -216,6 +218,28 @@ pub fn build(b: *std.Build) void {
     const install_bench = b.addInstallArtifact(file_index_bench, .{});
     const bench_step = b.step("bench-file-index", "Build file_index search benchmark");
     bench_step.dependOn(&install_bench.step);
+
+    // Does a detached thread complete an HTTP GET through the process Io? The
+    // catalog warmup does exactly this, and the TUI's provider switch waits on
+    // it.
+    const http_probe = b.addExecutable(.{
+        .name = "http-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/windows/http_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    http_probe.root_module.addImport("io", b.createModule(.{
+        .root_source_file = b.path("src/core/shared/io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+    const run_http_probe = b.addRunArtifact(http_probe);
+    const http_probe_step = b.step("probe-http", "Check a background HTTP GET on Windows");
+    http_probe_step.dependOn(&run_http_probe.step);
 
     const run_bench = b.addRunArtifact(file_index_bench);
     run_bench.step.dependOn(&install_bench.step);
