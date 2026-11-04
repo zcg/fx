@@ -30,6 +30,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const chat_completions = @import("../../gateway/chat_completions.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -40,6 +41,8 @@ const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const provider_key_store = @import("../auth/provider_key_store.zig");
+const secret_mod = @import("../auth/secret.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -1168,6 +1171,60 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
     });
 }
 
+/// The first model a configured provider offers, or null when its catalog
+/// cannot be read. Used when a provider is selected before any model of its own
+/// was saved, so switching to a freshly added provider works instead of asking
+/// the user to run a second command.
+fn resolveFirstCatalogModel(
+    alloc: Allocator,
+    cfg: Config,
+    settings: config_runtime.Settings,
+    bound: model_provider.ProviderId,
+) !?[]u8 {
+    const definition = settings.providers orelse return null;
+    const entry = definition.get(bound.label()) orelse return null;
+    const provider = chat_completions.model_catalog_provider(entry);
+    // The key comes from the same place the provider's requests read it: the
+    // environment variable it names, or the value stored when it was added.
+    var owned_key: ?[]u8 = null;
+    defer if (owned_key) |key| secret_mod.zeroAndFree(alloc, key);
+    const access: credentials.CatalogAccess = blk: {
+        if (cfg.auth_mode == .host_managed) break :blk .host_managed;
+        const token: ?[]const u8 = switch (entry.auth) {
+            .none => null,
+            .bearer => |env| if (io_mod.getenv(env)) |value|
+                value
+            else token: {
+                owned_key = provider_key_store.load(alloc, bound.label()) catch null;
+                break :token owned_key;
+            },
+        };
+        const value = token orelse break :blk .{ .public_only = .no_credential };
+        break :blk .{ .authenticated = .{
+            .source = .stored_key,
+            .credential = value,
+            .team_context = null,
+        } };
+    };
+    const fetched = model_catalog.fetchWithPublicFallback(provider, alloc, .{
+        .access = access,
+        .endpoint = cfg.models_path,
+        .view = .picker,
+    });
+    switch (fetched) {
+        .failed => |failure| {
+            debug_trace.logf("catalog", "provider switch catalog failed provider={s} category={s}", .{ bound.label(), @tagName(failure.failure.category) });
+            return null;
+        },
+        .loaded => |loaded| {
+            var catalog = loaded.catalog;
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
+            if (catalog.items.len == 0) return null;
+            return try alloc.dupe(u8, catalog.items[0].id);
+        },
+    }
+}
+
 fn activateProviderSelectionFallible(
     alloc: Allocator,
     cfg: Config,
@@ -1197,7 +1254,18 @@ fn activateProviderSelectionFallible(
             },
             error.ConfiguredProviderChanged => return err,
         };
-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        // A configured provider that has never been used has no saved model.
+        // Switching to it is still a reasonable thing to ask for, so its own
+        // catalog is read and the first model it offers is saved: that is the
+        // same model the picker would offer first, and the user can change it
+        // afterwards. A provider whose catalog cannot be read keeps the error,
+        // because switching to a provider with no usable model would only fail
+        // on the next request.
+        const selected_model = settings.models.get(bound) orelse blk: {
+            const resolved = try resolveFirstCatalogModel(alloc, cfg, settings, bound);
+            break :blk resolved orelse return error.ConfiguredModelNotSelected;
+        };
+        defer if (settings.models.get(bound) == null) alloc.free(@constCast(selected_model));
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
             .provider = bound,
             .model_preference = .{ .provider = bound, .model = selected_model },
