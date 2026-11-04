@@ -5818,3 +5818,57 @@ test "auth runtime shutdown waits for a remote revocation in flight" {
 
     try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
 }
+
+test "add provider flow pre-fills from a preset and finishes on the key" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expect(runtime.beginAddProvider());
+    // A second begin is refused so gathered fields cannot be discarded.
+    try std.testing.expect(!runtime.beginAddProvider());
+    try std.testing.expect(runtime.addProviderFlowActive());
+
+    // The first step offers every preset plus the custom row.
+    try std.testing.expectEqual(provider_presets.option_count, provider_presets.presets.len + 1);
+    try std.testing.expect(runtime.moveAddProviderSelection(1));
+
+    // Choosing a preset fills the name, URL, protocol, and key slot at once.
+    const advanced = runtime.advanceAddProvider(alloc);
+    try std.testing.expect(advanced == null);
+    const view = runtime.addProviderDraftView().?;
+    try std.testing.expectEqual(AddProviderField.api_key, view.field);
+    try std.testing.expect(view.name.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, view.base_url, "https://"));
+    try std.testing.expect(view.protocol.len > 0);
+    try std.testing.expect(view.env.len > 0);
+
+    // Enter on the key field completes the flow so the caller can save it.
+    _ = try runtime.appendAddProviderByte(alloc, 'k');
+    try std.testing.expect(runtime.addProviderDraftView().?.key_mask_count == 1);
+    try std.testing.expectEqual(AddProviderField.api_key, runtime.advanceAddProvider(alloc).?);
+
+    runtime.cancelAddProvider(alloc);
+    try std.testing.expect(!runtime.addProviderFlowActive());
+}
+
+test "add provider custom row asks for a name first" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(runtime.beginAddProvider());
+    // Move to the custom row, which is last.
+    for (0..provider_presets.presets.len) |_| _ = runtime.moveAddProviderSelection(1);
+    _ = runtime.advanceAddProvider(alloc);
+    const view = runtime.addProviderDraftView().?;
+    try std.testing.expectEqual(AddProviderField.name, view.field);
+    try std.testing.expectEqual(@as(usize, 0), view.name.len);
+    // An empty name does not advance.
+    try std.testing.expect(runtime.advanceAddProvider(alloc) == null);
+    try std.testing.expectEqual(AddProviderField.name, runtime.addProviderDraftView().?.field);
+    // A typed name does.
+    for ("mine") |byte| _ = try runtime.appendAddProviderByte(alloc, byte);
+    _ = runtime.advanceAddProvider(alloc);
+    try std.testing.expectEqual(AddProviderField.base_url, runtime.addProviderDraftView().?.field);
+    runtime.cancelAddProvider(alloc);
+}
