@@ -313,6 +313,11 @@ fn composeTitleRow(
 
     var facts: std.ArrayList(u8) = .empty;
     defer facts.deinit(alloc);
+    // The vendor leads the facts: a gateway's catalog mixes several vendors, so
+    // it is the fact that tells two similarly named models apart.
+    if (item.owned_by) |vendor| {
+        try appendMetadataFact(alloc, &facts, vendor);
+    }
     try appendCompactFacts(alloc, &facts, item.capabilities);
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);

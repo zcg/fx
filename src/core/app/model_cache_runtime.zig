@@ -180,9 +180,14 @@ pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    /// The vendor the endpoint says serves the model, when it says so. A
+    /// gateway that fronts several vendors reports each model's own upstream,
+    /// which is what tells two similarly named models apart in the menu.
+    owned_by: ?[]u8 = null,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.owned_by) |owner| alloc.free(owner);
     }
 };
 
@@ -1018,9 +1023,12 @@ fn hydrateMenuSnapshot(
         const item = item: {
             const id = try alloc.dupe(u8, entry.id);
             errdefer alloc.free(id);
+            const owner = if (entry.owned_by) |vendor| try alloc.dupe(u8, vendor) else null;
+            errdefer if (owner) |vendor| alloc.free(vendor);
             break :item ModelMenuItem{
                 .id = id,
                 .provider = modelProvider(id),
+                .owned_by = owner,
                 .capabilities = model_capabilities.resolveCapabilities(
                     id,
                     model_catalog_metadata.fromCatalogEntry(entry),

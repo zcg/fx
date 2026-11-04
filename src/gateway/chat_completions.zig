@@ -36,7 +36,17 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
 /// the definition, which must outlive the provider.
 pub fn model_catalog_provider(definition: *const definitions.Definition) catalog.Provider {
     const context: *anyopaque = @ptrCast(@constCast(definition));
-    return .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) };
+    return .{
+        .context = context,
+        .fetch_fn = fetch_catalog,
+        .lookup_capabilities_fn = lookup_capabilities,
+        .provider_id = bound_identity(definition),
+        // A configured provider's list is the vendor's own, and vendors add
+        // models. A long interval keeps the list current without asking on
+        // every menu open: the catalog refreshes in the background once it is
+        // older than this.
+        .refresh_interval_ms = 6 * 60 * 60 * 1000,
+    };
 }
 
 fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
