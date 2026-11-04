@@ -374,7 +374,19 @@ fn resolve_provider_selection(settings: *Settings) !void {
     if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
-    if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
+    if (settings.provider) |provider| {
+        // A saved provider that no longer exists - a connection removed while
+        // it was selected, or a settings file edited by hand - must not make the
+        // whole profile unreadable. The selection falls back to the default
+        // provider so fx starts and the user can pick another, which is what
+        // they would do anyway.
+        settings.provider = provider.bind(settings.providers orelse .{}) catch |err| switch (err) {
+            error.UnknownConfiguredProvider, error.ConfiguredProviderChanged => blk: {
+                debug_trace.logf("config", "saved provider unavailable name={s} err={s}", .{ provider.label(), @errorName(err) });
+                break :blk .gateway;
+            },
+        };
+    }
 }
 
 /// Reads only profile-global connection definitions. Caller owns the registry.

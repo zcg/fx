@@ -1977,6 +1977,10 @@ fn putConfiguredProvider(
 /// Removes one named connection. The `providers` object itself is left in place
 /// even when it empties, so a settings file does not lose a section the user may
 /// add to again; the model saved for that connection is removed with it.
+///
+/// A `provider` that names the removed connection is cleared too. Leaving it
+/// behind points the profile at a connection that no longer exists, and the next
+/// start cannot resolve a provider at all.
 fn removeConfiguredProvider(root: *std.json.ObjectMap, name: []const u8) bool {
     var changed = false;
     if (root.getPtr("providers")) |value| {
@@ -1987,6 +1991,12 @@ fn removeConfiguredProvider(root: *std.json.ObjectMap, name: []const u8) bool {
     if (root.getPtr("models")) |value| {
         if (value.* == .object) {
             if (value.object.orderedRemove(name)) changed = true;
+        }
+    }
+    if (root.getPtr("provider")) |value| {
+        if (value.* == .string and std.mem.eql(u8, value.string, name)) {
+            _ = root.orderedRemove("provider");
+            changed = true;
         }
     }
     return changed;

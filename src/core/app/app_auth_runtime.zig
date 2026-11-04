@@ -934,6 +934,30 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Re-reads the profile's provider definitions and the names the picker
+        /// offers. A failed read leaves the previous registry in place, because
+        /// a settings file fx cannot parse is not a reason to lose the
+        /// connections that already work.
+        fn reloadConfiguredProviders(app: *App) void {
+            var registry = config_runtime.loadConfiguredProviders(app.alloc) catch |err| {
+                debug_trace.logf("provider", "provider definitions reload failed err={s}", .{@errorName(err)});
+                return;
+            };
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(app.alloc);
+            names.ensureTotalCapacity(app.alloc, registry.definitions.len) catch {
+                registry.deinit(app.alloc);
+                return;
+            };
+            for (registry.definitions) |definition| names.appendAssumeCapacity(definition.id);
+            app.auth.setConfiguredProviders(app.alloc, names.items) catch {
+                registry.deinit(app.alloc);
+                return;
+            };
+            app.provider_selection.definitions.deinit(app.alloc);
+            app.provider_selection.definitions = registry;
+        }
+
         fn submitApiKeyEntry(app: *App) !void {
             if (app.auth.pickerView().api_key_mask_count == 0) return;
             switch (app.auth.beginApiKeySave(app.alloc)) {
@@ -1539,6 +1563,12 @@ pub fn Runtime(comptime App: type) type {
 
             app.model_cache.adoptOwnedCatalog(access, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
+            // The definitions registry was loaded at startup. A provider added
+            // or removed since then lives only in settings, so it is re-read
+            // here: without this, the picker and the catalog would keep
+            // resolving against the startup set and a newly added provider would
+            // have no definition to fetch from.
+            reloadConfiguredProviders(app);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
 
             const body = try app.alloc.print(
