@@ -128,6 +128,10 @@ pub const UserSettingsPatch = struct {
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
     remove: ?[]const u8 = null,
+    /// Saves or replaces one named connection under `providers`. The key
+    /// itself is never here: a local runtime reads it from the named
+    /// environment variable, and one with a keychain stores it there.
+    provider_definition: ?ConfiguredProviderPatch = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -156,8 +160,21 @@ pub const UserSettingsPatch = struct {
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
-            self.remove == null;
+            self.remove == null and
+            self.provider_definition == null;
     }
+};
+
+/// One named connection saved under `providers`. Every field but the name is
+/// written only when set, so a patch can add a provider without disturbing a
+/// sibling it does not mention. The key is deliberately absent: it belongs to
+/// the environment or the keychain, never to settings.
+pub const ConfiguredProviderPatch = struct {
+    name: []const u8,
+    protocol: []const u8,
+    base_url: []const u8,
+    /// The environment variable the key is read from.
+    env: []const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -993,6 +1010,15 @@ pub fn validateProviderSlug(slug: []const u8) bool {
 
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
+    if (patch.provider_definition) |definition| {
+        // `putConfiguredProvider` validates the same fields at write time;
+        // validating here keeps a bad patch from reaching the write at all.
+        if (definition.name.len == 0 or definition.name.len > 64) return error.InvalidProviderName;
+        for (definition.name) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidProviderName;
+        }
+        if (definition.protocol.len == 0 or definition.base_url.len == 0) return error.InvalidProviderDefinition;
+    }
     if (patch.theme) |theme| {
         if (theme_mod.classifyValue(theme)) |choice| switch (choice) {
             .pin_light, .pin_dark => {},
@@ -1243,6 +1269,9 @@ fn applyUserPatchToRoot(
     var application = PatchApplication{};
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
+    }
+    if (patch.provider_definition) |definition| {
+        application.changed = try putConfiguredProvider(arena, &root.object, definition) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", value.label()) or application.changed;
@@ -1891,6 +1920,51 @@ fn renamedGroup(
         changed.* = true;
     }
     return &root.getPtr(current).?.object;
+}
+
+/// Saves one named connection under `providers`, creating the object when the
+/// settings have none. An existing connection of the same name is replaced
+/// whole: a half-edited definition is worse than a retyped one.
+fn putConfiguredProvider(
+    arena: Allocator,
+    root: *std.json.ObjectMap,
+    definition: ConfiguredProviderPatch,
+) !bool {
+    if (definition.name.len == 0 or definition.name.len > 64) return error.InvalidProviderName;
+    for (definition.name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidProviderName;
+    }
+    if (definition.protocol.len == 0 or definition.base_url.len == 0) return error.InvalidProviderDefinition;
+    var changed = false;
+    const providers = if (root.getPtr("providers")) |value| blk: {
+        if (value.* != .object) return error.InvalidSettingsFormat;
+        break :blk &value.object;
+    } else blk: {
+        try root.put(arena, "providers", .{ .object = .empty });
+        changed = true;
+        break :blk &root.getPtr("providers").?.object;
+    };
+    var body: std.json.ObjectMap = .empty;
+    try body.put(arena, "protocol", .{ .string = definition.protocol });
+    try body.put(arena, "base_url", .{ .string = definition.base_url });
+    if (definition.env.len > 0) {
+        var auth: std.json.ObjectMap = .empty;
+        try auth.put(arena, "type", .{ .string = "bearer" });
+        try auth.put(arena, "env", .{ .string = definition.env });
+        try body.put(arena, "auth", .{ .object = auth });
+    } else {
+        try body.put(arena, "auth", .{ .string = "none" });
+    }
+    const existing = providers.getPtr(definition.name);
+    if (existing) |prior| {
+        // Replacing whole: the object above is already complete.
+        prior.* = .{ .object = body };
+        changed = true;
+    } else {
+        try providers.put(arena, definition.name, .{ .object = body });
+        changed = true;
+    }
+    return changed;
 }
 
 fn putModelPreference(

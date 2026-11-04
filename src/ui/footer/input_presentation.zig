@@ -463,17 +463,22 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
         "enter  tab  esc",
         "enter tab esc",
     };
-    const variants = switch (view.stage) {
-        .root => root_variants,
-        .connections => connections_variants,
-        .provider, .switch_credential => selection_variants,
-        .change_team => team_variants,
+    const add_provider_variants: []const []const u8 = &.{
+        "enter continues     esc cancels",
+        "enter  esc",
+    };
+    const variants: []const []const u8 = switch (view.stage) {
+        .root => &root_variants,
+        .connections => &connections_variants,
+        .provider, .switch_credential => &selection_variants,
+        .add_provider => add_provider_variants,
+        .change_team => &team_variants,
         .sign_in => switch (view.sign_in_source) {
-            .chatgpt_subscription => codex_sign_in_variants,
+            .chatgpt_subscription => &codex_sign_in_variants,
             .grok_subscription => if (view.sign_in_code_visible)
-                grok_manual_variants
+                &grok_manual_variants
             else
-                grok_browser_variants,
+                &grok_browser_variants,
             else => return null,
         },
         .api_key => return null,

@@ -1,5 +1,6 @@
 const std = @import("std");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+const provider_presets = @import("../../core/auth/provider_presets.zig");
 const credentials = @import("../../core/auth/credentials.zig");
 const login_flow = @import("../../core/auth/login_flow.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
@@ -64,6 +65,14 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
         };
     }
     if (view.stage == .api_key) return 4;
+    if (view.stage == .add_provider) {
+        // The preset step shows the whole list; the field steps show a fixed
+        // panel like the API key's.
+        if (view.add_provider) |draft| {
+            if (draft.field == .preset) return @intCast(2 + provider_presets.option_count);
+        }
+        return 4;
+    }
     if (view.stage == .root and view.include_skip) return 18;
     if (isSetupListStage(view.stage)) return @intCast(2 + @max(view.choiceCount(), 1));
     return @intCast(1 + @max(view.choiceCount(), 1));
@@ -72,7 +81,7 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
 fn isSetupListStage(stage: auth_runtime.PickerStage) bool {
     return switch (stage) {
         .root, .connections, .provider, .change_team, .switch_credential => true,
-        .sign_in, .api_key => false,
+        .sign_in, .api_key, .add_provider => false,
     };
 }
 
@@ -86,7 +95,7 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .switch_credential => "Credential source",
                 .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
             },
-            .provider, .source, .team => "",
+            .provider, .source, .team, .add_provider => "",
         },
         .connections => switch (choice) {
             .action => |action| switch (action) {
@@ -96,10 +105,10 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .setup => "AI Gateway API key",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
-            .provider, .source, .team => "",
+            .provider, .source, .team, .add_provider => "",
         },
         .provider, .change_team, .switch_credential => view.choiceLabel(choice),
-        .sign_in, .api_key => "",
+        .sign_in, .api_key, .add_provider => "",
     };
 }
 
@@ -116,7 +125,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     "not connected",
                 .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
             },
-            .provider, .source, .team => "",
+            .provider, .source, .team, .add_provider => "",
         },
         .connections => switch (choice) {
             .action => |action| switch (action) {
@@ -131,10 +140,10 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     "not configured",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
-            .provider, .source, .team => "",
+            .provider, .source, .team, .add_provider => "",
         },
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
-        .sign_in, .api_key => "",
+        .sign_in, .api_key, .add_provider => "",
     };
 }
 
@@ -209,7 +218,7 @@ fn composeSetupHeaderRow(
             .connections => "Connections",
             .provider => "Model provider",
             .switch_credential => "Credential source",
-            .sign_in, .api_key, .change_team => unreachable,
+            .sign_in, .api_key, .change_team, .add_provider => unreachable,
         };
         try row_text.appendClipped(alloc, &row, heading, width);
     }
@@ -232,7 +241,7 @@ fn composeSetupEmptyRow(
         else
             "  No matching Vercel teams",
         .switch_credential => "  No credentials available",
-        .root, .connections, .sign_in, .api_key => "",
+        .root, .connections, .sign_in, .api_key, .add_provider => "",
     }, width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -295,6 +304,9 @@ pub noinline fn composeAuthPickerRow(
     }
     if (view.stage == .api_key) {
         return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
+    }
+    if (view.stage == .add_provider) {
+        return composeAddProviderPickerRow(alloc, view, row_index, width);
     }
     if (view.stage == .root and view.include_skip) {
         return composeOnboardingPickerRow(alloc, view, row_index, row_count, width);
@@ -640,6 +652,81 @@ fn composeApiKeyPickerRow(
             try row_text.appendClipped(alloc, &row, label, width);
         },
         else => {},
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+/// One row of the add-provider panel. The panel mirrors the walk: the preset
+/// list first, then one line per field with its value or placeholder, and the
+/// key masked rather than shown.
+fn composeAddProviderPickerRow(
+    alloc: Allocator,
+    view: auth_runtime.PickerView,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    const draft = view.add_provider.?;
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width == 0) return row;
+
+    try row.appendSlice(alloc, ui_render.dim_style);
+    switch (draft.field) {
+        .preset => {
+            // The preset list, plus the custom row. The selected row is the one
+            // Enter will take.
+            const index: usize = draft.preset_index orelse 0;
+            if (row_index == 0) {
+                try row_text.appendClipped(alloc, &row, "   Add a model provider", width);
+            } else if (row_index == 1) {
+                try row.appendSlice(alloc, "   ");
+                try row_text.appendClipped(alloc, &row, "enter continues     esc cancels", width -| 3);
+            } else if (row_index - 2 < provider_presets.option_count) {
+                const option = row_index - 2;
+                const selected = option == index;
+                try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
+                if (provider_presets.presetAt(option)) |preset| {
+                    var label_buf: [160]u8 = undefined;
+                    const label = std.mem.print(&label_buf, " {s}  {s}", .{ if (selected) "›" else " ", preset.label }) catch preset.name;
+                    try row_text.appendClipped(alloc, &row, label, width -| 3);
+                } else {
+                    try row_text.appendClipped(alloc, &row, if (selected) " › Custom - another endpoint" else "   Custom - another endpoint", width -| 3);
+                }
+            }
+        },
+        .name, .base_url, .protocol, .api_key => {
+            switch (row_index) {
+                0 => try row_text.appendClipped(alloc, &row, "   Add a model provider", width),
+                1 => {
+                    var field_buf: [512]u8 = undefined;
+                    const label = switch (draft.field) {
+                        .name => std.mem.print(&field_buf, "   Name: {s}", .{draft.name}) catch "   Name",
+                        .base_url => std.mem.print(&field_buf, "   Base URL: {s}", .{draft.base_url}) catch "   Base URL",
+                        .protocol => std.mem.print(&field_buf, "   Protocol: {s}", .{draft.protocol}) catch "   Protocol",
+                        .api_key => std.mem.print(&field_buf, "   API key ({s}): {s}", .{ draft.env, "" }) catch "   API key",
+                        .preset => unreachable,
+                    };
+                    try row_text.appendClipped(alloc, &row, label, width);
+                },
+                2 => {
+                    // The key field shows its masked length; other fields show
+                    // where the value goes.
+                    if (draft.field == .api_key) {
+                        try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+                        if (draft.key_mask_count == 0) {
+                            try row_text.appendClipped(alloc, &row, "Paste a key, or leave empty if already in the environment", width -| 5);
+                        } else {
+                            for (0..@min(draft.key_mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
+                        }
+                    } else {
+                        try row_text.appendClipped(alloc, &row, "   enter continues     esc cancels", width);
+                    }
+                },
+                3 => try row_text.appendClipped(alloc, &row, "   The key is saved to the credential store, never to settings", width),
+                else => {},
+            }
+        },
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;

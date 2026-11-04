@@ -2,6 +2,14 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## Never Discard Uncommitted Work
+
+Never run `git checkout`, `git restore`, `git reset --hard`, `git stash`, `git clean`, or any other command that discards or rewinds working-tree changes. Uncommitted work is the user's, and losing it is not recoverable.
+
+When a file is damaged — a bad scripted edit flattened it, a write truncated it, an edit went to the wrong place — repair that file in place with targeted edits. If the damage is too large to repair that way, ask the user before doing anything that would restore a previous version. A `git checkout -- <path>` on a file with hours of uncommitted work destroys it silently, and "I was fixing my own mistake" does not make that acceptable.
+
+Reading history is fine: `git log`, `git show`, `git diff` never change the working tree. Committing and staging are fine too: both add to history rather than removing anything.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.

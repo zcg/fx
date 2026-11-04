@@ -715,6 +715,17 @@ pub fn Runtime(comptime App: type) type {
             }
             switch (choice) {
                 .provider => |provider| try switchProvider(app, agent, provider, true, .manual),
+                .add_provider => {
+                    // The add-provider flow starts from the picker's last row.
+                    if (!app.auth.beginAddProvider()) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "A provider is already being added.",
+                        }, true);
+                    }
+                    app.shell.render_requests.request(.footer);
+                },
                 .source => |source| _ = try applySourceChoice(app, agent, source),
                 .action => |action| switch (action) {
                     .connections => unreachable,
@@ -772,6 +783,16 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                     return true;
                 }
+            }
+            if (app.auth.addProviderFlowActive()) {
+                switch (byte) {
+                    3, 4 => app.auth.cancelAddProvider(app.alloc),
+                    '\r', '\n' => try submitAddProviderField(app, agent),
+                    8, 127 => _ = app.auth.deleteAddProviderByte(),
+                    else => _ = try app.auth.appendAddProviderByte(app.alloc, byte),
+                }
+                app.shell.render_requests.request(.footer);
+                return true;
             }
             if (!app.auth.apiKeyEntryActive()) return false;
             switch (byte) {
@@ -922,6 +943,55 @@ pub fn Runtime(comptime App: type) type {
                     .body = "Still saving the previous API key. Nothing was stored for this one; try again in a moment.",
                 }, true),
             }
+        }
+
+        /// Enter on the add-provider flow: advance to the next field, or, when
+        /// the key is entered, save the connection. The save goes through the
+        /// same settings commit every other preference uses; the pasted key,
+        /// when there is one, is read from the environment slot the definition
+        /// names, so it is never in settings.
+        fn submitAddProviderField(app: *App, agent: *AppAgent) !void {
+            _ = agent;
+            const draft = if (app.auth.addProviderDraftView()) |view| view else return;
+            if (app.auth.advanceAddProvider(app.alloc)) |_| {
+                try saveAddProviderDraft(app, draft);
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Writes the finished draft into settings.
+        fn saveAddProviderDraft(app: *App, draft: auth_runtime.AddProviderProjection) !void {
+            const name = try app.alloc.dupe(u8, draft.name);
+            defer app.alloc.free(name);
+            const base_url = try app.alloc.dupe(u8, draft.base_url);
+            defer app.alloc.free(base_url);
+            const protocol = try app.alloc.dupe(u8, draft.protocol);
+            defer app.alloc.free(protocol);
+            const env = try app.alloc.dupe(u8, draft.env);
+            defer app.alloc.free(env);
+            _ = config_runtime.setUserPreferences(app.alloc, .{
+                .provider_definition = .{
+                    .name = name,
+                    .protocol = protocol,
+                    .base_url = base_url,
+                    .env = env,
+                },
+            }) catch |err| {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "The provider could not be saved. Check ~/.fx/settings.json is writable, then try again.",
+                }, true);
+                debug_trace.logf("auth", "add provider save failed err={s}", .{@errorName(err)});
+                app.auth.cancelAddProvider(app.alloc);
+                return;
+            };
+            app.auth.cancelAddProvider(app.alloc);
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = try std.mem.concat(app.alloc, u8, &.{ "Saved provider ", name, ". Its models are listed the next time it is selected." }),
+            }, true);
         }
 
         /// Polled from the event loop so a save that blocks on a locked key store

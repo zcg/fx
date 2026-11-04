@@ -13,6 +13,7 @@ const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_presets = @import("provider_presets.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
@@ -528,7 +529,64 @@ pub const PickerStage = enum {
     api_key,
     change_team,
     switch_credential,
+    /// Adding a custom provider: a preset or custom, then name, base URL,
+    /// protocol, and API key, one field at a time. Enter advances; the last
+    /// step saves the provider.
+    add_provider,
 };
+
+/// One step of the add-provider flow, in the order the user walks it. The
+/// preset comes first: choosing one pre-fills the name, URL, and protocol, so
+/// the walk after it is confirmation rather than transcription.
+pub const AddProviderField = enum {
+    preset,
+    name,
+    base_url,
+    protocol,
+    api_key,
+};
+
+/// The add-provider flow's gathered state. The name and URL become settings
+/// entries; the key is read from the environment slot the definition names, so
+/// it is never written to settings.
+pub const AddProviderDraft = struct {
+    field: AddProviderField = .preset,
+    /// Index into the preset list, or the custom row.
+    preset_index: ?usize = null,
+    name: std.ArrayList(u8) = .empty,
+    base_url: std.ArrayList(u8) = .empty,
+    /// The chosen protocol's name, borrowed from a static string.
+    protocol: []const u8 = "",
+    /// The environment variable the key is read from, borrowed when a preset
+    /// chose it and empty when the user types none.
+    env: []const u8 = "",
+    key: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *AddProviderDraft, alloc: Allocator) void {
+        self.name.deinit(alloc);
+        self.base_url.deinit(alloc);
+        // The key is a secret: it is zeroed, not just freed.
+        const allocated = self.key.allocatedSlice();
+        secret.zeroAndFree(alloc, allocated);
+        self.key = .empty;
+    }
+};
+
+/// The add-provider flow's gathered state, for rendering only: every field is
+/// borrowed, and the key is represented by its length, never its bytes.
+pub const AddProviderProjection = struct {
+    field: AddProviderField,
+    name: []const u8,
+    base_url: []const u8,
+    protocol: []const u8,
+    env: []const u8,
+    /// Index of the selected preset row, or null on the custom row.
+    preset_index: ?usize,
+    key_mask_count: usize,
+};
+
+/// How many glyphs the masked key field shows; longer keys show this many.
+const max_add_provider_key_mask_glyphs = 24;
 
 pub const ApiKeySaveStart = enum {
     started,
@@ -1370,24 +1428,30 @@ pub const Choice = union(enum) {
     source: credentials.Source,
     action: AcquisitionAction,
     team: usize,
+    /// The add-provider entry in the provider picker.
+    add_provider: void,
 
     pub fn eql(self: Choice, other: Choice) bool {
         return switch (self) {
             .provider => |provider| switch (other) {
                 .provider => |other_provider| provider.eql(other_provider),
-                .source, .action, .team => false,
+                .source, .action, .team, .add_provider => false,
             },
             .source => |source| switch (other) {
                 .source => |other_source| source == other_source,
-                .provider, .action, .team => false,
+                .provider, .action, .team, .add_provider => false,
             },
             .action => |action| switch (other) {
-                .provider, .source, .team => false,
+                .provider, .source, .team, .add_provider => false,
                 .action => |other_action| action == other_action,
             },
             .team => |team| switch (other) {
-                .provider, .source, .action => false,
+                .provider, .source, .action, .add_provider => false,
                 .team => |other_team| team == other_team,
+            },
+            .add_provider => switch (other) {
+                .add_provider => true,
+                .provider, .source, .action, .team => false,
             },
         };
     }
@@ -1421,6 +1485,8 @@ pub const PickerView = struct {
     /// The names of the profile's configured providers, in the order the picker
     /// offers them after the built-in ones. Borrowed from the profile runtime.
     configured_providers: []const []const u8 = &.{},
+    /// The add-provider flow's gathered state, borrowed from the runtime.
+    add_provider: ?AddProviderProjection = null,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -1445,10 +1511,10 @@ pub const PickerView = struct {
                 4,
             .connections => connectionChoiceCount(),
             .provider => if (comptime host_target.is_wasm)
-                2 + self.configured_providers.len
+                2 + self.configured_providers.len + 1
             else
-                3 + self.configured_providers.len,
-            .sign_in, .api_key => 0,
+                3 + self.configured_providers.len + 1,
+            .sign_in, .api_key, .add_provider => 0,
             .change_team => teamFilter(self.teams, self.team_query).count(),
             .switch_credential => gatewaySourceCount(self.available_sources) + 1,
         };
@@ -1478,9 +1544,14 @@ pub const PickerView = struct {
                     self.configuredProviderAt(0)
                 else
                     .{ .provider = .grok },
-                else => self.configuredProviderAt(index - (if (comptime host_target.is_wasm) 2 else 3)),
+                else => if (self.configuredProviderAt(index - (if (comptime host_target.is_wasm) 2 else 3))) |choice|
+                    choice
+                else if (index == (if (comptime host_target.is_wasm) 2 else 3) + self.configured_providers.len)
+                    .{ .add_provider = {} }
+                else
+                    null,
             },
-            .sign_in, .api_key => null,
+            .sign_in, .api_key, .add_provider => null,
             .change_team => if (teamFilter(self.teams, self.team_query).at(index)) |team_index| .{ .team = team_index } else null,
             .switch_credential => if (index < gatewaySourceCount(self.available_sources))
                 .{ .source = gatewaySourceAtIndex(self.available_sources, index).? }
@@ -1521,6 +1592,7 @@ pub const PickerView = struct {
                 .automatic => "Automatic",
             },
             .team => |index| if (index < self.teams.len) self.teams[index].name else "",
+            .add_provider => "Add a provider...",
         };
     }
 
@@ -1543,6 +1615,7 @@ pub const PickerView = struct {
                     "sign in first",
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
+            .add_provider => "",
         };
     }
 
@@ -1551,7 +1624,7 @@ pub const PickerView = struct {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
                 (action != .chatgpt_login or !host_target.is_wasm) and
                 (action != .grok_login or !host_target.is_wasm),
-            .provider, .source, .team => true,
+            .provider, .source, .team, .add_provider => true,
         };
     }
 
@@ -1886,6 +1959,9 @@ pub const Runtime = struct {
     /// in the `/provider` picker. Owned by the runtime and refreshed whenever the
     /// profile's definitions change.
     configured_provider_names: std.ArrayList([]const u8) = .empty,
+    /// The in-progress custom provider the user is adding, when the picker is on
+    /// its `add_provider` stage.
+    add_provider_draft: ?AddProviderDraft = null,
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
     /// Revocations of signed-out sessions still talking to their issuer.
@@ -1937,7 +2013,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 36) {
+            if (@typeInfo(Self).@"struct".field_names.len != 37) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1971,6 +2047,7 @@ pub const Runtime = struct {
         storage.api_key_returns_to_root = false;
         storage.api_key_save = .{};
         storage.configured_provider_names = .empty;
+        storage.add_provider_draft = null;
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.remote_revocation_tasks = .empty;
@@ -1983,6 +2060,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Self, alloc: Allocator) void {
         if (self.startup_credential_task) |task| task.deinit();
         self.startup_credential_task = null;
+        self.cancelAddProvider(alloc);
         self.stopProviderPreparation();
         if (self.inventory_refresh_task) |task| task.deinit();
         self.inventory_refresh_task = null;
@@ -2439,11 +2517,26 @@ pub const Runtime = struct {
             .api_key_mask_count = self.apiKeyMaskCount(),
             .api_key_inline = self.api_key_inline,
             .configured_providers = self.configured_provider_names.items,
+            .add_provider = if (self.add_provider_draft) |*draft|
+                AddProviderProjection{
+                    .field = draft.field,
+                    .name = draft.name.items,
+                    .base_url = draft.base_url.items,
+                    .protocol = draft.protocol,
+                    .env = draft.env,
+                    .preset_index = draft.preset_index,
+                    .key_mask_count = @min(draft.key.items.len, max_add_provider_key_mask_glyphs),
+                }
+            else
+                null,
         };
     }
 
     pub fn movePicker(self: *Self, delta: i32) bool {
         if (!self.picker_active or delta == 0) return false;
+        // The add-provider flow's list steps select their row directly, with no
+        // choice objects to move between.
+        if (self.picker_stage == .add_provider) return self.moveAddProviderSelection(delta);
         const picker = self.pickerView();
         const choice_count = picker.choiceCount();
         if (choice_count < 2) return false;
@@ -2539,6 +2632,168 @@ pub const Runtime = struct {
     /// The profile's configured provider names, for menus that offer them.
     pub fn configuredProviderNames(self: *const Self) []const []const u8 {
         return self.configured_provider_names.items;
+    }
+
+    /// Starts adding a custom provider. Returns false when a draft is already in
+    /// progress, so a repeated Enter cannot discard gathered fields.
+    pub fn beginAddProvider(self: *Self) bool {
+        if (self.add_provider_draft != null) return false;
+        self.add_provider_draft = .{};
+        self.picker_active = true;
+        self.picker_stage = .add_provider;
+        self.picker_selection = null;
+        return true;
+    }
+
+    /// Cancels the add-provider flow and clears what was typed, including the
+    /// key. Safe when no draft is in progress.
+    pub fn cancelAddProvider(self: *Self, alloc: Allocator) void {
+        if (self.add_provider_draft) |*draft| draft.deinit(alloc);
+        self.add_provider_draft = null;
+        self.picker_active = false;
+        self.picker_stage = .root;
+    }
+
+    /// True while the add-provider flow owns the composer's keystrokes.
+    pub fn addProviderFlowActive(self: *const Self) bool {
+        return self.picker_active and self.picker_stage == .add_provider;
+    }
+
+    /// The draft as the picker renders it, or null when the flow is not active.
+    pub fn addProviderDraftView(self: *const Self) ?AddProviderProjection {
+        const draft = &(self.add_provider_draft orelse return null);
+        return .{
+            .field = draft.field,
+            .name = draft.name.items,
+            .base_url = draft.base_url.items,
+            .protocol = draft.protocol,
+            .env = draft.env,
+            .preset_index = draft.preset_index,
+            .key_mask_count = @min(draft.key.items.len, max_add_provider_key_mask_glyphs),
+        };
+    }
+
+    /// A typed byte for the current field. Returns false when the flow is not
+    /// active or the field is chosen rather than typed, so ordinary typing keeps
+    /// reaching the composer.
+    pub fn appendAddProviderByte(self: *Self, alloc: Allocator, byte: u8) !bool {
+        var draft = &(self.add_provider_draft orelse return false);
+        if (byte < 0x20 or byte == 0x7f) return false;
+        switch (draft.field) {
+            .name => try draft.name.append(alloc, byte),
+            .base_url => try draft.base_url.append(alloc, byte),
+            // The preset and protocol are chosen from a list, not typed.
+            .preset, .protocol => return false,
+            .api_key => {
+                if (draft.key.items.len < 4096) try draft.key.append(alloc, byte);
+            },
+        }
+        return true;
+    }
+
+    /// Deletes the last typed byte of the current field.
+    pub fn deleteAddProviderByte(self: *Self) bool {
+        var draft = &(self.add_provider_draft orelse return false);
+        const target = switch (draft.field) {
+            .name => &draft.name,
+            .base_url => &draft.base_url,
+            .preset, .protocol => return false,
+            .api_key => &draft.key,
+        };
+        if (target.items.len == 0) return false;
+        const end = text_utils.utf8BackwardBoundary(target.items, target.items.len - 1);
+        target.shrinkRetainingCapacity(end);
+        return true;
+    }
+
+    /// The protocol names the add-provider flow offers, in picker order.
+    pub const add_provider_protocols = [_][]const u8{
+        "openai-chat-completions",
+        "anthropic-messages",
+        "openai-responses",
+    };
+
+    /// Moves the preset or protocol selection by one row, wrapping. Returns
+    /// false when the current field is typed rather than chosen.
+    pub fn moveAddProviderSelection(self: *Self, delta: i32) bool {
+        var draft = &(self.add_provider_draft orelse return false);
+        const count = switch (draft.field) {
+            .preset => provider_presets.option_count,
+            .protocol => add_provider_protocols.len,
+            else => return false,
+        };
+        if (count == 0) return false;
+        const current: usize = switch (draft.field) {
+            .preset => draft.preset_index orelse 0,
+            .protocol => for (add_provider_protocols, 0..) |name, index| {
+                if (std.mem.eql(u8, name, draft.protocol)) break index;
+            } else 0,
+            else => return false,
+        };
+        var next: usize = current;
+        if (delta < 0) {
+            next = if (next == 0) count - 1 else next - 1;
+        } else {
+            next = if (next + 1 == count) 0 else next + 1;
+        }
+        switch (draft.field) {
+            .preset => draft.preset_index = next,
+            .protocol => draft.protocol = add_provider_protocols[next],
+            else => return false,
+        }
+        return true;
+    }
+
+    /// Advances to the next field. Returns the completed field when Enter
+    /// finished the last one, so the caller saves from the draft; null on a
+    /// normal step or when a required value is still empty.
+    pub fn advanceAddProvider(self: *Self, alloc: Allocator) ?AddProviderField {
+        var draft = &(self.add_provider_draft orelse return null);
+        switch (draft.field) {
+            .preset => {
+                const index = draft.preset_index orelse return null;
+                if (provider_presets.presetAt(index)) |preset| {
+                    // A chosen preset pre-fills the rest of the walk: the name,
+                    // the URL, the protocol, and the key's environment slot.
+                    draft.name.clearRetainingCapacity();
+                    draft.name.appendSlice(alloc, preset.name) catch return null;
+                    draft.base_url.clearRetainingCapacity();
+                    draft.base_url.appendSlice(alloc, preset.base_url) catch return null;
+                    draft.protocol = preset.protocol;
+                    draft.env = preset.env;
+                    // Only the key is left to enter.
+                    draft.field = .api_key;
+                } else {
+                    // The custom row starts empty, including the key slot.
+                    draft.protocol = "";
+                    draft.env = "";
+                    draft.field = .name;
+                }
+                return null;
+            },
+            .name, .base_url => {
+                const value = if (draft.field == .name) draft.name.items else draft.base_url.items;
+                if (value.len == 0) return null;
+            },
+            .protocol => {
+                if (draft.protocol.len == 0) return null;
+            },
+            // A key may be absent: a local runtime may already have the
+            // environment variable set, so Enter on an empty key skips it.
+            .api_key => {},
+        }
+        const next: ?AddProviderField = switch (draft.field) {
+            .preset => unreachable,
+            .name => .base_url,
+            .base_url => .protocol,
+            .protocol => .api_key,
+            .api_key => null,
+        };
+        if (next) |field| {
+            draft.field = field;
+            return null;
+        }
+        return draft.field;
     }
 
     pub fn teamPickerActive(self: *const Self) bool {
@@ -2907,6 +3162,7 @@ pub const Runtime = struct {
             .api_key => .setup,
             .change_team => .change_team,
             .switch_credential => .switch_credential,
+            .add_provider => .switch_provider,
         } };
         return true;
     }
@@ -2927,7 +3183,7 @@ pub const Runtime = struct {
         if (!self.pickerView().choiceEnabled(selected)) return null;
 
         switch (self.picker_stage) {
-            .sign_in, .api_key => unreachable,
+            .sign_in, .api_key, .add_provider => unreachable,
             .connections => switch (selected) {
                 .action => |action| switch (action) {
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
@@ -2939,14 +3195,17 @@ pub const Runtime = struct {
                     .automatic,
                     => unreachable,
                 },
-                .provider, .source, .team => unreachable,
+                .provider, .source, .team, .add_provider => unreachable,
             },
             .provider => switch (selected) {
                 .provider => self.closePicker(alloc),
+                // The add-provider row opens the flow instead of closing.
+                .add_provider => {},
                 .source, .action, .team => unreachable,
             },
             .root => switch (selected) {
                 .provider => unreachable,
+                .add_provider => unreachable,
                 .source => self.closePicker(alloc),
                 .action => |action| switch (action) {
                     .connections => {
@@ -2968,14 +3227,14 @@ pub const Runtime = struct {
             },
             .change_team => switch (selected) {
                 .team => {},
-                .provider, .source, .action => unreachable,
+                .provider, .source, .action, .add_provider => unreachable,
             },
             .switch_credential => switch (selected) {
                 .source => self.closePicker(alloc),
                 // Automatic is the only action this stage offers; the app
                 // handler clears the stored choice and closes the picker.
                 .action => |action| std.debug.assert(action == .automatic),
-                .provider, .team => unreachable,
+                .provider, .team, .add_provider => unreachable,
             },
         }
         return choice;
