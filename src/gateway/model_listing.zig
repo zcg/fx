@@ -34,6 +34,10 @@ pub const Entry = struct {
     id: []const u8,
     /// The provider's own name for the model, when it has one.
     display_name: ?[]const u8 = null,
+    /// The vendor the endpoint says serves the model, when it says so. A
+    /// gateway that fronts several vendors reports each model's upstream,
+    /// which is what tells two similarly named models apart.
+    owned_by: ?[]const u8 = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
 };
@@ -47,6 +51,7 @@ pub const Listing = struct {
         for (self.entries) |entry| {
             self.alloc.free(entry.id);
             if (entry.display_name) |name| self.alloc.free(name);
+            if (entry.owned_by) |owner| self.alloc.free(owner);
         }
         self.alloc.free(self.entries);
         self.* = undefined;
@@ -92,6 +97,7 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
         for (entries.items) |entry| {
             alloc.free(entry.id);
             if (entry.display_name) |name| alloc.free(name);
+            if (entry.owned_by) |owner| alloc.free(owner);
         }
         entries.deinit(alloc);
     }
@@ -119,9 +125,17 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
             break :blk try alloc.dupe(u8, value_display.string);
         };
         errdefer if (display) |name| alloc.free(name);
+        const owner = blk: {
+            // An OpenAI-compatible listing names the vendor in `owned_by`.
+            const value_owner = object.get("owned_by") orelse break :blk null;
+            if (value_owner != .string or value_owner.string.len == 0) break :blk null;
+            break :blk try alloc.dupe(u8, value_owner.string);
+        };
+        errdefer if (owner) |vendor| alloc.free(vendor);
         entries.appendAssumeCapacity(.{
             .id = try alloc.dupe(u8, id),
             .display_name = display,
+            .owned_by = owner,
             .context_window = readLimit(object, shape, .context),
             .max_output_tokens = readLimit(object, shape, .output),
         });
@@ -186,6 +200,7 @@ pub fn mergeInto(
         errdefer catalog.freeModelCatalogEntry(alloc, entry);
         if (listingEntry(listing.entries, metadata.id)) |listed| {
             if (listed.display_name) |name| entry.name = try alloc.dupe(u8, name);
+            if (listed.owned_by) |vendor| entry.owned_by = try alloc.dupe(u8, vendor);
             if (entry.context_window == 0) {
                 if (listed.context_window) |window| entry.context_window = window;
             }
@@ -206,6 +221,7 @@ pub fn mergeInto(
         };
         errdefer catalog.freeModelCatalogEntry(alloc, entry);
         if (listed.display_name) |name| entry.name = try alloc.dupe(u8, name);
+        if (listed.owned_by) |vendor| entry.owned_by = try alloc.dupe(u8, vendor);
         out.appendAssumeCapacity(entry);
     }
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const codec = @import("chat_completions_protocol.zig");
+const anthropic = @import("anthropic_messages.zig");
 const client_mod = @import("client.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
@@ -62,7 +63,14 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return switch (definition.protocol) {
+        .@"openai-chat-completions" => codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity }),
+        .@"anthropic-messages" => anthropic.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity }),
+        // The Responses protocol has its own encoder in `responses_protocol`; a
+        // configured provider does not reach it yet, so the request is refused
+        // rather than sent in a shape the endpoint would reject.
+        .@"openai-responses" => error.UnsupportedConfiguredProtocol,
+    };
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -221,6 +229,33 @@ pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelR
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
+/// Parses a streamed Anthropic reply. Anthropic frames events as `event:` and
+/// `data:` lines and ends a message with `message_stop`, so the reducer reads
+/// the `data:` payloads in order and finishes when it sees that event.
+pub fn consumeAnthropic(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+    var reducer = anthropic.Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var line_buffer: std.ArrayList(u8) = .empty;
+    defer line_buffer.deinit(alloc);
+    while (true) {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        line_buffer.clearRetainingCapacity();
+        const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.StreamTooLong => return error.InvalidChunk,
+            else => return err,
+        };
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (trimmed.len == 0) continue;
+        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+        const payload = std.mem.trimStart(u8, trimmed[5..], " ");
+        if (payload.len == 0) continue;
+        try reducer.applyJson(alloc, payload);
+        if (reducer.finished) break;
+    }
+    return reducer.finish(alloc, request.cancel_flag.load(.seq_cst));
+}
+
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
@@ -343,10 +378,11 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
     switch (result) {
         .failure => |failure| return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = failure } },
         .catalog => |value| {
-            var entries = value;
-            defer catalog.freeModelCatalog(alloc, &entries);
-            const ids = catalog.projectModelIds(alloc, entries.items) catch return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } };
-            return .{ .loaded = .{ .ids = ids, .provenance = provenance } };
+            // The entries carry the metadata the listing read: each model's own
+            // upstream vendor and limits. Returning them alongside the ids keeps
+            // the caller from having to ask again.
+            return .{ .loaded = .{ .ids = catalog.projectModelIds(alloc, value.items) catch
+                return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } }, .entries = value, .provenance = provenance } };
         },
     }
 }

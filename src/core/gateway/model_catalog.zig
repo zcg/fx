@@ -339,6 +339,10 @@ pub const ModelCatalogEntry = struct {
     context_window: u32 = 0,
     max_tokens: u32 = 0,
     web_search_price: ?[]u8 = null,
+    /// The vendor the endpoint says serves the model, when it says so. A
+    /// gateway that fronts several vendors reports each model's own upstream
+    /// here, which is what tells two similarly named models apart.
+    owned_by: ?[]u8 = null,
 };
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {
@@ -353,6 +357,7 @@ pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry)
     var reasoning_efforts = entry.reasoning_efforts;
     reasoning_efforts.deinit(alloc);
     if (entry.web_search_price) |price| alloc.free(price);
+    if (entry.owned_by) |owner| alloc.free(owner);
 }
 
 /// Returns owned model id strings in catalog order; caller frees with `collections.freeStringList`.

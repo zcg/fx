@@ -1265,6 +1265,9 @@ pub const PermissionsSnapshot = struct {
 /// exposes. `efforts` excludes `auto`, which every model accepts.
 pub const ModelDetail = struct {
     name: ?[]const u8 = null,
+    /// The vendor the endpoint says serves the model, when it says so. A
+    /// gateway that fronts several vendors reports each model's upstream.
+    owned_by: ?[]const u8 = null,
     efforts: model_capabilities.ReasoningEffortOptions = .{},
     fast: bool = false,
     ultrafast: bool = false,
@@ -1301,9 +1304,17 @@ pub const ModelListSnapshot = struct {
         try out.writer.print("[models] {d} available\n", .{self.ids.len});
 
         const shown = self.shownCount();
-        for (self.ids[0..shown]) |id| {
+        for (self.ids[0..shown], 0..) |id, index| {
             if (self.provider != .gateway) {
-                try out.writer.print(" - {s} · {s}\n", .{ id, providerDisplayName(&self.provider) });
+                // A gateway reports each model's own upstream vendor, so that is
+                // what identifies the model; the connection name would only
+                // repeat itself on every row.
+                const upstream = if (index < self.details.len) self.details[index].owned_by else null;
+                if (upstream) |vendor| {
+                    try out.writer.print(" - {s} · {s}\n", .{ id, vendor });
+                } else {
+                    try out.writer.print(" - {s} · {s}\n", .{ id, providerDisplayName(&self.provider) });
+                }
             } else {
                 try out.writer.print(" - {s}\n", .{id});
             }

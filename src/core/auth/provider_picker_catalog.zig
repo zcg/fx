@@ -20,7 +20,9 @@ pub const Method = enum {
     api_key,
 };
 
-pub const max_provider_options = provider_catalog.entries.len;
+/// The picker offers the built-in providers and the profile's configured ones;
+/// a profile defines at most 32 connections.
+pub const max_provider_options = provider_catalog.entries.len + 32;
 const max_method_options = 2;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
@@ -115,11 +117,22 @@ fn providerVisible(id: model_provider.ProviderId) bool {
 }
 
 /// Writes the visible provider slugs into `out` and returns how many landed.
-pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
+/// Fills `out` with the provider names the `/provider` picker offers: the
+/// built-in ones, then the profile's own configured connections. A configured
+/// connection is a provider a user may switch to, so it belongs in the same
+/// menu; leaving it out is why a working connection never appeared there.
+pub fn providerOptions(out: [][]const u8, configured: []const []const u8) usize {
     var count: usize = 0;
     for (&provider_catalog.entries) |*entry| {
         if (!providerVisible(entry.id)) continue;
+        if (count >= out.len) return count;
         out[count] = entry.slug;
+        count += 1;
+    }
+    for (configured) |name| {
+        if (count >= out.len) return count;
+        if (name.len == 0) continue;
+        out[count] = name;
         count += 1;
     }
     return count;

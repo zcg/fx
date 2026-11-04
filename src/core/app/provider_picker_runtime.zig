@@ -84,7 +84,7 @@ pub fn Runtime(comptime App: type) type {
             switch (query.stage) {
                 .provider => {
                     var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-                    count = provider_picker_catalog.providerOptions(&slugs);
+                    count = provider_picker_catalog.providerOptions(&slugs, app.auth.configuredProviderNames());
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
@@ -604,7 +604,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn syncProviderSelection(app: *App, slug: []const u8) void {
             var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-            const count = provider_picker_catalog.providerOptions(&slugs);
+            const count = provider_picker_catalog.providerOptions(&slugs, app.auth.configuredProviderNames());
             for (slugs[0..count], 0..) |candidate, index| {
                 if (!std.mem.eql(u8, candidate, slug)) continue;
                 app.input_runtime.picker.provider_column_index = index;

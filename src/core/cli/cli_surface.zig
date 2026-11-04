@@ -3117,6 +3117,7 @@ fn modelDetails(
         );
         detail.* = .{
             .name = if (entry) |found| found.name else null,
+            .owned_by = if (entry) |found| found.owned_by else null,
             .efforts = capabilities.reasoning_efforts,
             .fast = capabilities.supports_fast_mode,
             .ultrafast = provider == .gateway and capabilities.supports_ultrafast_mode,

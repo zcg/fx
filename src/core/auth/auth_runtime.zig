@@ -2536,6 +2536,11 @@ pub const Runtime = struct {
         self.configured_provider_names = .empty;
     }
 
+    /// The profile's configured provider names, for menus that offer them.
+    pub fn configuredProviderNames(self: *const Self) []const []const u8 {
+        return self.configured_provider_names.items;
+    }
+
     pub fn teamPickerActive(self: *const Self) bool {
         return self.picker_active and self.picker_stage == .change_team;
     }
