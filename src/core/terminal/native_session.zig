@@ -582,15 +582,7 @@ fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
     // terminal race, so one wait ends it and the stopped states below cannot
     // occur.
     if (comptime builtin.target.os.tag == .windows) {
-        const outcome = io_mod.waitProcess(pid, true) orelse return error.ChildWaitFailed;
-        std.debug.assert(child.stdin == null);
-        std.debug.assert(child.stdout == null);
-        std.debug.assert(child.stderr == null);
-        child.id = null;
-        return switch (outcome) {
-            .exited => |code| .{ .exited = @intCast(code) },
-            .signaled => |signal| .{ .signal = @fromBackingInt(signal) },
-        };
+        return child.wait(io_mod.getIo());
     }
     var observe_stops = true;
     while (true) {

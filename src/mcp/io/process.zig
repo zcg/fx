@@ -32,26 +32,16 @@ const Bell = @import("bell.zig").Bell;
 // block is skipped on other targets, where the POSIX signal path is used
 // instead, so no Linux or macOS link looks for them.
 const windows_terminate = if (builtin.target.os.tag != .windows) struct {} else struct {
-    const terminate_access: u32 = 0x0001; // PROCESS_TERMINATE
-
-    extern "kernel32" fn OpenProcess(desired_access: u32, inherit_handle: c_int, process_id: u32) callconv(.winapi) ?std.posix.fd_t;
     extern "kernel32" fn TerminateProcess(process: std.posix.fd_t, exit_code: u32) callconv(.winapi) c_int;
     extern "kernel32" fn CloseHandle(handle: std.posix.fd_t) callconv(.winapi) c_int;
+    extern "kernel32" fn WaitForSingleObject(handle: std.posix.fd_t, milliseconds: u32) callconv(.winapi) u32;
 
-    const openProcess = OpenProcess;
     const terminateProcess = TerminateProcess;
-    const closeHandle = CloseHandle;
 };
 
 const windows_child = if (builtin.target.os.tag != .windows) struct {} else struct {
-    /// `PROCESS_QUERY_LIMITED_INFORMATION`, the least access that reports an
-    /// exit code.
-    const query_access: u32 = 0x1000;
-    const still_active: u32 = 259;
-
-    extern "kernel32" fn OpenProcess(desired_access: u32, inherit_handle: c_int, process_id: u32) callconv(.winapi) ?std.posix.fd_t;
     extern "kernel32" fn GetExitCodeProcess(process: std.posix.fd_t, exit_code: *u32) callconv(.winapi) c_int;
-    extern "kernel32" fn CloseHandle(handle: std.posix.fd_t) callconv(.winapi) c_int;
+    extern "kernel32" fn WaitForSingleObject(handle: std.posix.fd_t, milliseconds: u32) callconv(.winapi) u32;
 };
 
 /// Every `Process` between `init` and `deinit`, and whether the program
@@ -96,9 +86,9 @@ const helper = struct {
     // POSIX has no way to make a process outlive fx without help, because the
     // kernel gives no handle on a descendant set. A long-lived POSIX shell reads
     // the ids of the servers fx started and signals their groups once fx's stdin
-    // closes, which is what happens when fx exits. Windows does not need this: a
-    // job object kills the whole tree when its owner goes away, so none of these
-    // scripts runs there.
+    // closes, which is what happens when fx exits. Windows does not run this
+    // POSIX helper; its direct child is stopped through the process handle.
+    // Descendant-tree cleanup still requires a Windows job object.
     const script =
         \\trap '' INT HUP
         \\g=
@@ -114,9 +104,7 @@ const helper = struct {
         \\for x in $g; do kill -s KILL -- "-$x"; done
     ;
 
-    /// Starts it, once, before the first server. Windows has no helper to start:
-    /// a job object owns the servers' lifetime there, which is why `tell` and
-    /// `stop` do nothing on that platform.
+    /// Starts it, once, before the first server. Windows skips the POSIX helper.
     fn start(io: std.Io) void {
         if (comptime builtin.target.os.tag == .windows) return;
         mutex.lockUncancelable(io);
@@ -253,16 +241,18 @@ const WaitOutcome = struct {
 /// Checks whether `pid` has exited, without blocking.
 ///
 /// POSIX reaps with `waitpid(WNOHANG)` and decodes the status word. Windows has
-/// no wait to reap with: `GetExitCodeProcess` reports the code while the handle
-/// is held, and `STILL_ACTIVE` means it is still running.
+/// no wait to reap with: the process handle signals its exit, after which
+/// `GetExitCodeProcess` reports its code, including a legitimate code 259.
 fn waitOnce(pid: std.posix.pid_t) WaitOutcome {
     if (comptime builtin.target.os.tag == .windows) {
-        const process = windows_child.OpenProcess(windows_child.query_access, 0, @truncate(@intFromPtr(pid))) orelse
-            return .{ .gone = true };
-        defer _ = windows_child.CloseHandle(process);
+        // `Child.id` is hProcess, not the numeric process id.
+        switch (windows_child.WaitForSingleObject(pid, 0)) {
+            0 => {},
+            0x102 => return .{ .gone = false },
+            else => return .{ .gone = true },
+        }
         var code: u32 = 0;
-        if (windows_child.GetExitCodeProcess(process, &code) == 0) return .{ .gone = true };
-        if (code == windows_child.still_active) return .{ .gone = false };
+        if (windows_child.GetExitCodeProcess(pid, &code) == 0) return .{ .gone = true };
         return .{ .gone = true, .exit = exitOf(code) };
     }
     var status: c_int = 0;
@@ -271,6 +261,23 @@ fn waitOnce(pid: std.posix.pid_t) WaitOutcome {
     if (result == pid) return .{ .gone = true, .exit = exitOf(@bitCast(status)) };
     if (result == -1) return .{ .gone = true };
     return .{ .gone = false };
+}
+
+test "Windows MCP wait recognizes a process that exits with code 259" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "cmd.exe", "/d", "/c", "exit 259" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    });
+    defer child.kill(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 0), windows_child.WaitForSingleObject(child.id.?, 5_000));
+    const outcome = waitOnce(child.id.?);
+    try std.testing.expect(outcome.gone);
+    try std.testing.expectEqual(Exit{ .code = 3 }, outcome.exit.?);
+    _ = try child.wait(std.testing.io);
 }
 
 pub const Error = core.StepError || std.Io.Cancelable || std.Io.ConcurrentError || std.mem.Allocator.Error || error{TraceFailed};
@@ -391,9 +398,13 @@ pub const Process = struct {
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
             // The whole group, as `signal` does.
-            if (comptime builtin.target.os.tag != .windows) {
+            if (comptime builtin.target.os.tag == .windows) {
+                _ = windows_terminate.TerminateProcess(pid, 1);
+                _ = windows_terminate.WaitForSingleObject(pid, 0xFFFFFFFF);
+                _ = windows_terminate.CloseHandle(pid);
+            } else {
                 std.posix.kill(-pid, .KILL) catch std.posix.kill(pid, .KILL) catch {};
-                _ = waitOnce(pid);
+                _ = std.c.waitpid(pid, null, 0);
             }
             helper.tell(p.io, '-', pid);
             p.pid = null;
@@ -577,6 +588,7 @@ pub const Process = struct {
             return err;
         };
         const pid = child.id.?;
+        if (comptime builtin.target.os.tag == .windows) _ = windows_terminate.CloseHandle(child.thread_handle);
         p.pid_lock.lockUncancelable(p.io);
         p.pid = pid;
         p.pid_lock.unlock(p.io);
@@ -610,7 +622,10 @@ pub const Process = struct {
         p.signal(.kill);
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
-            _ = waitOnce(pid);
+            if (comptime builtin.target.os.tag == .windows) {
+                _ = windows_terminate.WaitForSingleObject(pid, 0xFFFFFFFF);
+                _ = windows_terminate.CloseHandle(pid);
+            } else _ = std.c.waitpid(pid, null, 0);
             helper.tell(p.io, '-', pid);
         }
         p.pid = null;
@@ -629,11 +644,7 @@ pub const Process = struct {
             // to address: ending the server is the whole operation. The MCP
             // engine imports only the standard library, so it calls the kernel
             // directly rather than through fx's io helpers.
-            const process_id: u32 = @truncate(@intFromPtr(pid));
-            if (windows_terminate.openProcess(windows_terminate.terminate_access, 0, process_id)) |handle| {
-                defer _ = windows_terminate.closeHandle(handle);
-                _ = windows_terminate.terminateProcess(handle, 1);
-            }
+            _ = windows_terminate.terminateProcess(pid, 1);
             return;
         }
         const sig: std.posix.SIG = switch (which) {
@@ -773,12 +784,17 @@ pub const Process = struct {
     fn watch(p: *Process, generation: core.Generation, pid: std.posix.pid_t) std.Io.Cancelable!void {
         while (true) {
             p.pid_lock.lockUncancelable(p.io);
+            if (p.pid == null or p.pid.? != pid) {
+                p.pid_lock.unlock(p.io);
+                return;
+            }
             const outcome = waitOnce(pid);
             const gone = outcome.gone;
             if (outcome.exit) |exit| p.exit = exit;
             if (gone) {
                 // Told while its id can't yet come round.
                 helper.tell(p.io, '-', pid);
+                if (comptime builtin.target.os.tag == .windows) _ = windows_terminate.CloseHandle(pid);
                 p.pid = null;
             }
             p.pid_lock.unlock(p.io);

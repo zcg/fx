@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const profile_paths = @import("../shared/profile_paths.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
@@ -57,7 +58,7 @@ pub const OpenedSkillCandidate = struct {
         return &self.skill_file;
     }
 
-    pub fn openResource(self: *OpenedSkillCandidate, resource: []const u8) !std.Io.File {
+    pub fn openResource(self: *OpenedSkillCandidate, alloc: Allocator, resource: []const u8) !std.Io.File {
         const trimmed = std.mem.trim(u8, resource, " \t\r\n");
         if (trimmed.len == 0 or std.Io.Dir.path.isAbsolute(trimmed)) return error.InvalidSkillResourcePath;
         var segments = std.mem.tokenizeAny(u8, trimmed, "/\\");
@@ -65,15 +66,12 @@ pub const OpenedSkillCandidate = struct {
         if (invalidResourceSegment(segment)) return error.InvalidSkillResourcePath;
 
         const child_segment = segments.next() orelse {
-            return self.dir.openFile(io_mod.getIo(), segment, .{
-                .allow_directory = false,
-                .follow_symlinks = true,
-            });
+            return self.openResourceFile(alloc, self.dir, segment);
         };
         if (invalidResourceSegment(child_segment)) return error.InvalidSkillResourcePath;
 
         var current_dir = try self.dir.openDir(io_mod.getIo(), segment, .{
-            .follow_symlinks = true,
+            .follow_symlinks = builtin.target.os.tag == .windows,
         });
         defer current_dir.close(io_mod.getIo());
         segment = child_segment;
@@ -81,16 +79,26 @@ pub const OpenedSkillCandidate = struct {
         while (segments.next()) |next_segment| {
             if (invalidResourceSegment(next_segment)) return error.InvalidSkillResourcePath;
             const next_dir = try current_dir.openDir(io_mod.getIo(), segment, .{
-                .follow_symlinks = true,
+                .follow_symlinks = builtin.target.os.tag == .windows,
             });
             current_dir.close(io_mod.getIo());
             current_dir = next_dir;
             segment = next_segment;
         }
-        return current_dir.openFile(io_mod.getIo(), segment, .{
-            .allow_directory = false,
-            .follow_symlinks = true,
-        });
+        return self.openResourceFile(alloc, current_dir, segment);
+    }
+
+    fn openResourceFile(self: *OpenedSkillCandidate, alloc: Allocator, parent: std.Io.Dir, name: []const u8) !std.Io.File {
+        var file = try io_mod.openExistingReadOnlyRegularFile(parent, name, if (builtin.target.os.tag == .windows) .follow else .no_follow);
+        errdefer file.close(io_mod.getIo());
+        if (comptime builtin.target.os.tag == .windows) {
+            const root = try io_mod.dirRealpathAlloc(alloc, self.dir, ".");
+            defer alloc.free(root);
+            const opened = try io_mod.openedFilePathAlloc(alloc, file);
+            defer alloc.free(opened);
+            if (!pathing.pathInside(root, opened)) return error.InvalidSkillResourcePath;
+        }
+        return file;
     }
 };
 
@@ -110,7 +118,28 @@ pub fn resourceIsSkillFile(resource: []const u8) bool {
 }
 
 fn invalidResourceSegment(segment: []const u8) bool {
-    return std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..");
+    return std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..") or
+        (builtin.target.os.tag == .windows and std.mem.findScalar(u8, segment, ':') != null);
+}
+
+test "skill resources cannot follow a symlink outside the opened candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "skill/SKILL.md", "skill");
+    try writeTempFile(&tmp, "outside.txt", "outside");
+    try createTempSymlinkOrSkip(&tmp, "../outside.txt", "skill/linked.txt");
+    var dir = try tmp.dir.openDir(std.testing.io, "skill", .{});
+    const primary = dir.openFile(std.testing.io, "SKILL.md", .{}) catch |err| {
+        dir.close(std.testing.io);
+        return err;
+    };
+    var candidate = OpenedSkillCandidate{ .dir = dir, .skill_file = primary };
+    defer candidate.deinit();
+    if (candidate.openResource(alloc, "linked.txt")) |file| {
+        file.close(std.testing.io);
+        return error.TestUnexpectedSymlink;
+    } else |_| {}
 }
 
 pub fn writeDiagnosticSummary(alloc: Allocator, writer: *std.Io.Writer, diagnostics: []const SkillDiagnostic) !void {
@@ -392,6 +421,24 @@ fn appendConfiguredSkillRoots(
     }
 }
 
+/// The roots discovery would walk, for a diagnostic probe. Test and probe
+/// callers only; production code reaches the same list through discovery.
+pub fn skillRootsForProbe(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    home: ?[]const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+) ![]SkillRoot {
+    var roots: std.ArrayList(SkillRoot) = .empty;
+    errdefer {
+        for (roots.items) |root| alloc.free(root.path);
+        roots.deinit(alloc);
+    }
+    try appendConfiguredSkillRoots(alloc, &roots, workspace_root, home, skills_dir, root_policy);
+    return roots.toOwnedSlice(alloc);
+}
+
 fn collectRootFingerprints(
     alloc: Allocator,
     workspace_root: ?[]const u8,
@@ -548,6 +595,14 @@ fn appendOwnedRoot(
     source: SkillSource,
     read_authority: ?[]const u8,
 ) !void {
+    // A caller with no home and no managed directory produces an empty path.
+    // Keeping it turned an absent root into a relative one, and opening a
+    // relative path as absolute is an assertion, not an error: the refresh
+    // crashed instead of finding no skills.
+    if (path.len == 0) {
+        alloc.free(path);
+        return;
+    }
     if (containsRootPath(roots.items, path)) {
         alloc.free(path);
         return;
@@ -754,10 +809,16 @@ fn openSkillRoot(
     // several tools is the usual way people keep skills.
     var follow_options = options;
     follow_options.follow_symlinks = true;
-    return if (root.read_authority) |authority|
-        openContainedDir(alloc, root.path, authority, follow_options)
-    else
-        std.Io.Dir.openDirAbsolute(io_mod.getIo(), root.path, follow_options);
+    if (root.read_authority) |authority| {
+        return openContainedDir(alloc, root.path, authority, follow_options);
+    }
+    // `openDirAbsolute` asserts on a relative path, so a root that is not
+    // absolute has to be opened from the current directory instead of crashing
+    // the refresh.
+    if (!std.Io.Dir.path.isAbsolute(root.path)) {
+        return std.Io.Dir.cwd().openDir(io_mod.getIo(), root.path, follow_options);
+    }
+    return std.Io.Dir.openDirAbsolute(io_mod.getIo(), root.path, follow_options);
 }
 
 fn rootPathIsMissing(path: []const u8) bool {
@@ -818,7 +879,32 @@ fn openPrimarySkillFileWithOptions(
     read_authority: ?[]const u8,
     options: PrimarySkillFileOpenOptions,
 ) error{OutOfMemory}!PrimarySkillFileOpenResult {
-    const path_stat = candidate_dir.statFile(io_mod.getIo(), "SKILL.md", .{ .follow_symlinks = true }) catch |err| {
+    if (comptime builtin.target.os.tag == .windows) {
+        var file = io_mod.openExistingReadOnlyRegularFile(candidate_dir.*, "SKILL.md", .follow) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return if (err == error.FileNotFound) .missing else .rejected;
+        };
+        var accepted = false;
+        defer if (!accepted) file.close(io_mod.getIo());
+        const opened = io_mod.openedFilePathAlloc(alloc, file) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .rejected;
+        };
+        defer alloc.free(opened);
+        const authority = if (read_authority) |root| root else root: {
+            const root = io_mod.dirRealpathAlloc(alloc, candidate_dir.*, ".") catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return .rejected;
+            };
+            break :root root;
+        };
+        defer if (read_authority == null) alloc.free(authority);
+        if (!try canonicalPathHasReadAuthority(alloc, authority, opened)) return .rejected;
+        if (options.after_open) |hook| hook.run(hook.ctx);
+        accepted = true;
+        return .{ .opened = file };
+    }
+    const path_stat = candidate_dir.statFile(io_mod.getIo(), "SKILL.md", .{ .follow_symlinks = false }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return if (err == error.FileNotFound) .missing else .rejected;
     };
@@ -2011,6 +2097,10 @@ const CatalogRefreshTask = struct {
             self.root_policy,
             self.base_catalog,
         ) catch |err| {
+            // The caller only learns "failed", so the cause has to land
+            // somewhere readable or a broken skills directory shows up as a
+            // prompt that will not submit and nothing else.
+            debug_trace.logf("skills", "catalog refresh failed step=known err={s}", .{@errorName(err)});
             self.failure = err;
             self.done.store(true, .release);
             return;
@@ -2035,6 +2125,7 @@ const CatalogRefreshTask = struct {
             self.skills_dir,
             self.root_policy,
         ) catch |err| {
+            debug_trace.logf("skills", "catalog refresh failed step=discovery err={s}", .{@errorName(err)});
             self.failure = err;
             self.done.store(true, .release);
             return;
@@ -2046,6 +2137,7 @@ const CatalogRefreshTask = struct {
             self.skills_dir,
             self.root_policy,
         ) catch |err| {
+            debug_trace.logf("skills", "catalog refresh failed step=roots err={s}", .{@errorName(err)});
             var owned = discovery;
             owned.deinit(self.alloc);
             self.failure = err;

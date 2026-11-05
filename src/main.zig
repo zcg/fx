@@ -2186,7 +2186,21 @@ const App = struct {
         return switch (self.skills.generationStatus(generation)) {
             .pending => .pending,
             .current => .current,
-            .failed => error.SkillCatalogRefreshFailed,
+            // A skills directory that cannot be read is a problem with an
+            // optional resource, not with the prompt. Reporting it as a failure
+            // here refused to send anything at all, which turned a broken
+            // skills folder into a session that could not be used. The prompt
+            // goes, and the message says the skill list is stale so the cause is
+            // still visible.
+            .failed => blk: {
+                debug_trace.logf("skills", "refresh failed generation={d} sending prompt anyway", .{generation});
+                try self.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .warning,
+                    .body = "The skill list could not be refreshed. This prompt is sent without it.",
+                }, true);
+                break :blk .current;
+            },
         };
     }
 

@@ -1082,9 +1082,17 @@ pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
     // Some platforms cannot sync a directory handle, and some report more than
-    // one way; both mean the same thing to the caller, which has synced the file
-    // data already.
-    io_mod.syncVerifiedDir(snapshot_dir) catch return;
+    // one way of saying so. A platform with no directory sync reports only
+    // that, so the error set there holds a single case and a general catch
+    // would not compile.
+    if (comptime builtin.target.os.tag == .windows) {
+        io_mod.syncVerifiedDir(snapshot_dir) catch return;
+        return;
+    }
+    io_mod.syncVerifiedDir(snapshot_dir) catch |err| switch (err) {
+        error.OperationUnsupported => {},
+        else => return err,
+    };
 }
 
 fn deleteSnapshotFile(dir: std.Io.Dir, name: []const u8, reason: []const u8) void {

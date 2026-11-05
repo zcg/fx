@@ -244,11 +244,16 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
+    const anthropic_headers = [_]std.http.Header{
+        .{ .name = "accept", .value = "text/event-stream" },
+        .{ .name = "anthropic-version", .value = anthropic.api_version },
+        .{ .name = "x-api-key", .value = token orelse "" },
+    };
     var operation = client_mod.PostOperation{
         .client = &client,
         .uri = uri,
-        .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .authorization = if (definition.protocol == .@"anthropic-messages") null else authorization,
+        .extra_headers = if (definition.protocol == .@"anthropic-messages") anthropic_headers[0..(if (token != null) @as(usize, 3) else 2)] else &.{.{ .name = "accept", .value = "text/event-stream" }},
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
@@ -527,7 +532,14 @@ fn fetchListing(alloc: Allocator, definition: *const definitions.Definition, inp
     defer if (token) |value| secret.zeroAndFree(alloc, value);
     var cancel = std.atomic.Value(bool).init(false);
     const cancel_flag = input.cancel_flag orelse &cancel;
-    const result = try client_mod.fetchGatewayJsonCancellable(alloc, token, null, url, cancel_flag);
+    const anthropic_headers = [_]std.http.Header{
+        .{ .name = "anthropic-version", .value = anthropic.api_version },
+        .{ .name = "x-api-key", .value = token orelse "" },
+    };
+    const result = if (definition.protocol == .@"anthropic-messages")
+        try client_mod.fetchProviderJsonCancellable(alloc, url, anthropic_headers[0..(if (token != null) @as(usize, 2) else 1)], cancel_flag)
+    else
+        try client_mod.fetchGatewayJsonCancellable(alloc, token, null, url, cancel_flag);
     return switch (result) {
         .success => |body| blk: {
             defer alloc.free(body);

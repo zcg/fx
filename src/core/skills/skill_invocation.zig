@@ -1421,7 +1421,7 @@ fn readSkillResourceWithCeiling(
         );
     }
 
-    var file = try candidate.openResource(resource);
+    var file = try candidate.openResource(alloc, resource);
     defer file.close(io_mod.getIo());
     return readSkillResourceFile(alloc, &file, limit, safety_ceiling, cancel_flag);
 }

@@ -510,7 +510,7 @@ fn traverseBoundedAbsoluteFileTarget(
     var path_len: usize = walk_root.len;
     var component_count: usize = 0;
     const workspace_target = pathInside(workspace_root, absolute);
-    var workspace_anchor_end: ?usize = if (workspace_target and std.mem.eql(u8, workspace_root, "/"))
+    var workspace_anchor_end: ?usize = if (workspace_target and samePath(workspace_root, walk_root))
         1
     else
         null;
@@ -555,7 +555,7 @@ fn traverseBoundedAbsoluteFileTarget(
                 else => |mapped| return mapped,
             };
 
-            if (workspace_target and std.mem.eql(u8, path_scratch[0..path_len], workspace_root)) {
+            if (workspace_target and samePath(path_scratch[0..path_len], workspace_root)) {
                 return .{ .complete = .{
                     .path_len = path_len,
                     .anchor_path_end = path_len,
@@ -613,7 +613,7 @@ fn traverseBoundedAbsoluteFileTarget(
 
         if (workspace_target) {
             if (workspace_anchor_end == null) {
-                if (std.mem.eql(u8, path_scratch[0..path_len], workspace_root)) {
+                if (samePath(path_scratch[0..path_len], workspace_root)) {
                     workspace_anchor_end = path_len;
                 }
             } else {
@@ -654,14 +654,14 @@ fn resolveBoundedIntermediateSymlink(
     if (link_len == 0) return error.InvalidPath;
 
     const link_target = pending_scratch[0..link_len];
-    var resolved_len: usize = if (std.Io.Dir.path.isAbsolute(link_target)) absolute: {
-        if (output_scratch.len == 0) return error.InvalidPath;
-        output_scratch[0] = std.Io.Dir.path.sep;
-        break :absolute 1;
-    } else parent_path_end;
-
-    if (resolved_len > output_scratch.len) return error.InvalidPath;
-    try normalizeRelativePathPartInto(output_scratch, &resolved_len, link_target);
+    var resolved_len: usize = if (std.Io.Dir.path.isAbsolute(link_target))
+        (try normalizeAbsolutePathInto(output_scratch, link_target)).len
+    else relative: {
+        if (parent_path_end > output_scratch.len) return error.InvalidPath;
+        var len = parent_path_end;
+        try normalizeRelativePathPartInto(output_scratch, &len, link_target);
+        break :relative len;
+    };
     try normalizeRelativePathPartInto(
         output_scratch,
         &resolved_len,
@@ -677,18 +677,18 @@ const PathComponentIterator = struct {
     fn init(path: []const u8) PathComponentIterator {
         return .{
             .path = path,
-            .index = if (path.len > 0 and path[0] == std.Io.Dir.path.sep) 1 else 0,
+            .index = if (path.len > 0 and isPathSeparator(path[0])) 1 else 0,
         };
     }
 
     fn next(self: *PathComponentIterator) ?[]const u8 {
-        while (self.index < self.path.len and self.path[self.index] == std.Io.Dir.path.sep) {
+        while (self.index < self.path.len and isPathSeparator(self.path[self.index])) {
             self.index += 1;
         }
         if (self.index >= self.path.len) return null;
 
         const start = self.index;
-        while (self.index < self.path.len and self.path[self.index] != std.Io.Dir.path.sep) {
+        while (self.index < self.path.len and !isPathSeparator(self.path[self.index])) {
             self.index += 1;
         }
         const end = self.index;
@@ -723,16 +723,17 @@ fn driveRoot(path: []const u8) ?[]const u8 {
     if (path.len < 3) return null;
     // A drive-letter root: C:\ or C:/
     if (std.ascii.isAlphabetic(path[0]) and path[1] == ':' and
-        (path[2] == '\\' or path[2] == '/')) return path[0..3];
+        isPathSeparator(path[2])) return path[0..3];
     // A UNC root: \\server\share\
-    if (path.len > 2 and path[0] == '\\' and path[1] == '\\') {
+    if (path.len > 2 and isPathSeparator(path[0]) and isPathSeparator(path[1])) {
         var index: usize = 2;
         var separators: usize = 0;
         while (index < path.len) : (index += 1) {
-            if (path[index] != '\\' and path[index] != '/') continue;
+            if (!isPathSeparator(path[index])) continue;
             separators += 1;
             if (separators == 2) return path[0 .. index + 1];
         }
+        if (separators == 1 and !isPathSeparator(path[path.len - 1])) return path;
     }
     return null;
 }
@@ -750,6 +751,9 @@ fn normalizeAbsolutePathInto(scratch: []u8, raw_path: []const u8) FileTargetReso
         const root = driveRoot(raw_path) orelse return error.InvalidPath;
         if (root.len > scratch.len) return error.InvalidPath;
         @memcpy(scratch[0..root.len], root);
+        for (scratch[0..root.len]) |*byte| if (isPathSeparator(byte.*)) {
+            byte.* = std.Io.Dir.path.sep;
+        };
         var len: usize = root.len;
         try normalizeRelativePathPartInto(scratch, &len, raw_path[root.len..]);
         return scratch[0..len];
@@ -792,13 +796,13 @@ fn normalizeRelativePathPartInto(
 ) FileTargetResolveError!void {
     var index: usize = 0;
     while (index < raw_path.len) {
-        while (index < raw_path.len and raw_path[index] == std.Io.Dir.path.sep) {
+        while (index < raw_path.len and isPathSeparator(raw_path[index])) {
             index += 1;
         }
         if (index >= raw_path.len) return;
 
         const start = index;
-        while (index < raw_path.len and raw_path[index] != std.Io.Dir.path.sep) : (index += 1) {
+        while (index < raw_path.len and !isPathSeparator(raw_path[index])) : (index += 1) {
             if (raw_path[index] == 0) return error.InvalidPath;
         }
         const component = raw_path[start..index];
@@ -814,13 +818,21 @@ fn normalizeRelativePathPartInto(
 }
 
 fn popNormalizedPathComponent(path: []const u8, path_len: *usize) void {
-    if (path_len.* <= 1) return;
+    const root_len = if (comptime builtin_mod.target.os.tag == .windows)
+        if (driveRoot(path[0..path_len.*])) |root| root.len else @as(usize, 1)
+    else
+        1;
+    if (path_len.* <= root_len) return;
 
     var index = path_len.* - 1;
-    while (index > 0 and path[index] != std.Io.Dir.path.sep) {
+    while (index > root_len and !isPathSeparator(path[index])) {
         index -= 1;
     }
-    path_len.* = if (index == 0) 1 else index;
+    path_len.* = @max(root_len, index);
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or (builtin_mod.target.os.tag == .windows and byte == '\\');
 }
 
 fn appendBoundedPathComponent(
@@ -832,7 +844,7 @@ fn appendBoundedPathComponent(
         return error.InvalidPath;
     }
 
-    const needs_separator = path_len.* > 1;
+    const needs_separator = path_len.* > 0 and !isPathSeparator(scratch[path_len.* - 1]);
     const required_len = path_len.* + component.len + @intFromBool(needs_separator);
     if (required_len > scratch.len) return error.InvalidPath;
 
@@ -1207,11 +1219,25 @@ fn invalidPathEntryBasename(basename: []const u8) bool {
 }
 
 pub fn pathInside(root: []const u8, candidate: []const u8) bool {
+    if (comptime builtin_mod.target.os.tag == .windows) {
+        if (candidate.len < root.len) return false;
+        for (root, candidate[0..root.len]) |a, b| {
+            if (isPathSeparator(a) and isPathSeparator(b)) continue;
+            if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+        }
+        if (candidate.len == root.len) return true;
+        if (root.len == 0) return false;
+        return isPathSeparator(root[root.len - 1]) or isPathSeparator(candidate[root.len]);
+    }
     if (std.mem.eql(u8, root, candidate)) return true;
     if (!std.mem.startsWith(u8, candidate, root)) return false;
     if (root.len == 0) return false;
     if (root[root.len - 1] == std.Io.Dir.path.sep) return true;
     return candidate.len > root.len and candidate[root.len] == std.Io.Dir.path.sep;
+}
+
+fn samePath(a: []const u8, b: []const u8) bool {
+    return a.len == b.len and pathInside(a, b);
 }
 
 /// The model-visible form of `path`: relative to `workspace_root` when it lies
@@ -1220,7 +1246,7 @@ pub fn pathInside(root: []const u8, candidate: []const u8) bool {
 pub fn workspaceRelative(workspace_root: []const u8, path: []const u8) []const u8 {
     if (workspace_root.len <= 1 or !std.Io.Dir.path.isAbsolute(workspace_root)) return path;
     if (!pathInside(workspace_root, path)) return path;
-    const start = if (workspace_root[workspace_root.len - 1] == std.Io.Dir.path.sep) workspace_root.len else workspace_root.len + 1;
+    const start = if (isPathSeparator(workspace_root[workspace_root.len - 1])) workspace_root.len else workspace_root.len + 1;
     return if (start >= path.len) "." else path[start..];
 }
 
@@ -1244,6 +1270,18 @@ test "pathInside preserves exact child empty-root and prefix semantics" {
     try std.testing.expect(pathInside("", ""));
     try std.testing.expect(!pathInside("", "/workspace"));
     try std.testing.expect(!pathInside("/workspace", "/workspace-evil/file.txt"));
+}
+
+test "Windows bounded path normalization preserves drive and UNC roots" {
+    if (comptime builtin_mod.target.os.tag != .windows) return error.SkipZigTest;
+    var scratch: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\repo\\file.txt", try normalizeAbsolutePathInto(&scratch, "C:/repo/nested/../file.txt"));
+    try std.testing.expectEqualStrings("C:\\", try normalizeAbsolutePathInto(&scratch, "C:/../../.."));
+    try std.testing.expectEqualStrings("\\\\server\\share\\file.txt", try normalizeAbsolutePathInto(&scratch, "//server/share/../../file.txt"));
+    try std.testing.expectEqualStrings("\\\\server\\share", try normalizeAbsolutePathInto(&scratch, "\\\\server\\share"));
+    try std.testing.expectEqualStrings("C:\\file.txt", try normalizeBaseRelativePathInto(&scratch, "C:\\repo", "../../file.txt"));
+    try std.testing.expect(pathInside("C:\\Repo", "c:/repo/file.txt"));
+    try std.testing.expect(!pathInside("C:\\Repo", "c:/repo-other/file.txt"));
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {

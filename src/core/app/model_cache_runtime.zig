@@ -715,6 +715,7 @@ pub const Runtime = struct {
     pub fn resetForProviderChange(self: *Self) void {
         debug_trace.logf("catalog", "model catalog reset reason=provider_changed", .{});
         self.reset();
+        if (self.menu_loader) |loader| loader.resetForProviderChange();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
@@ -1077,7 +1078,7 @@ pub const Runtime = struct {
             },
             .loaded => |loaded| {
                 var catalog = loaded.catalog;
-                const reuse_previous = catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0;
+                const reuse_previous = !self.from_profile_settings and catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0;
                 if (reuse_previous) {
                     model_catalog.freeModelCatalog(self.alloc, &catalog);
                     self.outcome.last_failure = if (loaded.provenance.fallback_failure) |failure| .{
@@ -1563,6 +1564,21 @@ test "model cache expires successful catalogs only when the provider requests re
         _ = try runtime.pollLoadTransition();
         try std.testing.expectEqualStrings(if (expires) "new-release" else "first", runtime.catalog.items[0].id);
     }
+}
+
+test "configured model cache drops models removed by a successful empty refresh" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/models");
+    defer runtime.deinit();
+    const access = model_catalog.AccessMetadata.init(.{ .public_only = .no_credential });
+    runtime.catalog = try testCatalogIds(alloc, &.{"old-model"});
+    runtime.state = .ready;
+    runtime.from_profile_settings = true;
+    runtime.outcome = .{ .loaded = .{ .access = access } };
+    const applied = runtime.applyFetchLocked(.{ .loaded = .{ .catalog = .empty, .provenance = .{ .access = access } } });
+    try std.testing.expect(!applied.ready.reused_previous);
+    try std.testing.expectEqual(@as(usize, 0), runtime.catalog.items.len);
+    try std.testing.expectEqual(ModelCacheState.ready, runtime.state);
 }
 
 test "model cache clears an old failure after a clean empty refresh" {

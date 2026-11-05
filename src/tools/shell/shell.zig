@@ -275,6 +275,29 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
     return @min(requested_ms, managed_contract.max_yield_time_ms);
 }
 
+// A gateway can leak its argument delimiters into one string. This only builds
+// advisory retry JSON; execution still requires a separate, valid tool call.
+fn repairEncodedRunAction(alloc: Allocator, object: *std.json.ObjectMap, action: []const u8) Allocator.Error!bool {
+    if (object.contains("command")) return false;
+    const opening = "run<arg_key:";
+    const closing = "run</arg_key:";
+    const offset: usize = if (std.mem.startsWith(u8, action, opening)) opening.len else if (std.mem.startsWith(u8, action, closing)) closing.len else return false;
+    const end = std.mem.findScalarPos(u8, action, offset, '>') orelse return false;
+    const nonce = action[offset..end];
+    if (nonce.len == 0 or nonce.len > 32) return false;
+    for (nonce) |byte| if (!std.ascii.isHex(byte)) return false;
+    const prefix = if (offset == opening.len)
+        try alloc.print("run<arg_key:{s}>command</arg_key:{s}><arg_value:{s}>", .{ nonce, nonce, nonce })
+    else
+        try alloc.print("run</arg_key:{s}><arg_value:{s}>command</arg_key:{s}><arg_value:{s}>", .{ nonce, nonce, nonce, nonce });
+    if (!std.mem.startsWith(u8, action, prefix)) return false;
+    const command = action[prefix.len..];
+    if (command.len == 0 or std.mem.find(u8, command, "<arg_") != null or std.mem.find(u8, command, "</arg_") != null) return false;
+    try object.put(alloc, "action", .{ .string = "run" });
+    try object.put(alloc, "command", .{ .string = command });
+    return true;
+}
+
 // Advisory only: none of these values enters the executable decode path.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -326,6 +349,10 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     const action: Action = if (action_value) |value| blk: {
         if (value == .string) {
             if (std.meta.stringToEnum(Action, value.string)) |action| break :blk action;
+            if (try repairEncodedRunAction(arena, &object, value.string)) {
+                try problems.append(arena, "Argument delimiter tokens leaked into action. Use separate JSON fields action and command from retry_with.");
+                break :blk .run;
+            }
         }
         try problems.append(arena, "action must be run, interact, or stop; put the shell command in command.");
         return correction_json(alloc, problems.items, null);
@@ -2134,6 +2161,10 @@ test "shell timeout minimum is enforced before correction and execution" {
 test "shell request correction suggests only unambiguous repairs without executing" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { input: []const u8, retry: ?[]const u8 }{
+        .{ .input = "{\"action\":\"run<arg_key:a12b>command</arg_key:a12b><arg_value:a12b>git status --short\"}", .retry = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .{ .input = "{\"action\":\"run</arg_key:a12b><arg_value:a12b>command</arg_key:a12b><arg_value:a12b>git status --short\",\"cwd\":\"/tmp/workspace\"}", .retry = "{\"action\":\"run\",\"command\":\"git status --short\",\"cwd\":\"/tmp/workspace\"}" },
+        .{ .input = "{\"action\":\"run<arg_key:a12b>command</arg_key:c34d><arg_value:a12b>git status\"}", .retry = null },
+        .{ .input = "{\"action\":\"run<arg_key:a12b>command</arg_key:a12b><arg_value:a12b>git status\",\"command\":\"different\"}", .retry = null },
         .{ .input = "{\"command\":\"sleep 30\",\"timeout_ms\":\"40000\",\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000,\"timeout_ms\":40000}" },
         .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },

@@ -5046,6 +5046,7 @@ describe("gateway stream lifecycle", () => {
       }
       const trace = readFileSync(tracePath, "utf8");
       expect(trace).toContain("terminal_validation_retry");
+      expect(history.at(-1).assistant).toContain("Repeated shell validation failures");
       expect(trace).toContain("call_id=invalid_2");
       expect(trace.split("\n").filter((line) =>
         /call_id=invalid_[12]\b/.test(line) &&

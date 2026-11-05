@@ -121,6 +121,7 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
         if (id_value != .string) continue;
         const id = stripGooglePrefix(id_value.string, shape);
         if (id.len == 0) continue;
+        definitions.validate_model_id(id) catch continue;
         const display = blk: {
             const key = switch (shape) {
                 .generic => "display_name",
@@ -154,6 +155,18 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
     return .{ .entries = try entries.toOwnedSlice(alloc), .alloc = alloc };
 }
 
+test "compatible model listings retain native capabilities and ignore invalid model IDs" {
+    var listing = try parse(std.testing.allocator,
+        \\{"data":[{"id":"vendor/model","tool_call":true,"reasoning":true,"modalities":{"input":["text","image"]},"max_input_tokens":128000},{"id":"bad\nmodel"}]}
+    );
+    defer listing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listing.entries.len);
+    try std.testing.expect(listing.entries[0].has_tool_use);
+    try std.testing.expect(listing.entries[0].has_reasoning);
+    try std.testing.expect(listing.entries[0].has_vision);
+    try std.testing.expectEqual(@as(?u32, 128000), listing.entries[0].context_window);
+}
+
 fn stripGooglePrefix(id: []const u8, shape: Shape) []const u8 {
     if (shape != .google) return id;
     const prefix = "models/";
@@ -165,6 +178,7 @@ const Limit = enum { context, output };
 
 fn capability(object: std.json.ObjectMap, field: []const u8, parameter: []const u8) bool {
     if (object.get(field)) |value| if (value == .bool) return value.bool;
+    if (object.get(if (std.mem.eql(u8, parameter, "tools")) "tool_call" else parameter)) |value| if (value == .bool) return value.bool;
     if (object.get("capabilities")) |value| if (value == .object) {
         if (value.object.get(parameter)) |supported| if (supported == .bool) return supported.bool;
     };
@@ -172,6 +186,12 @@ fn capability(object: std.json.ObjectMap, field: []const u8, parameter: []const 
         for (value.array.items) |item| if (item == .string and std.mem.eql(u8, item.string, parameter)) return true;
     };
     if (std.mem.eql(u8, parameter, "vision")) {
+        if (object.get("modalities")) |value| {
+            const input = if (value == .object) value.object.get("input") else value;
+            if (input) |modalities| if (modalities == .array) for (modalities.array.items) |item| {
+                if (item == .string and std.mem.eql(u8, item.string, "image")) return true;
+            };
+        }
         const architecture = object.get("architecture") orelse return false;
         if (architecture == .object) {
             const modalities = architecture.object.get("input_modalities") orelse return false;
@@ -187,7 +207,7 @@ fn readLimit(object: std.json.ObjectMap, shape: Shape, limit: Limit) ?u32 {
     const keys: []const []const u8 = switch (shape) {
         // OpenAI-compatible listings rarely carry limits; OpenRouter does.
         .generic => switch (limit) {
-            .context => &.{ "context_length", "context_window", "max_context_length" },
+            .context => &.{ "context_length", "context_window", "max_context_length", "max_input_tokens" },
             .output => &.{ "max_output_tokens", "max_completion_tokens", "max_tokens", "top_provider_max_completion_tokens", "top_provider" },
         },
         .google => switch (limit) {
@@ -250,19 +270,26 @@ pub fn mergeInto(
     // Then anything the listing adds.
     for (listing.entries) |listed| {
         if (declares(definition.model_metadata, listed.id)) continue;
+        const id = try alloc.dupe(u8, listed.id);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
         var entry = catalog.ModelCatalogEntry{
-            .id = try alloc.dupe(u8, listed.id),
+            .id = id,
             .added = listed.added,
             .has_tool_use = listed.has_tool_use,
             .has_reasoning = listed.has_reasoning,
             .has_vision = listed.has_vision,
             .has_file_input = listed.has_file_input or listed.has_vision,
             .has_web_search = listed.has_web_search,
-            .model_type = try alloc.dupe(u8, "language"),
+            .model_type = model_type,
             .context_window = listed.context_window orelse 0,
             .max_tokens = listed.max_output_tokens orelse 0,
         };
-        errdefer catalog.freeModelCatalogEntry(alloc, entry);
+        errdefer {
+            alloc.free(model_type);
+            if (entry.name) |name| alloc.free(name);
+            if (entry.owned_by) |owner| alloc.free(owner);
+        }
         if (listed.display_name) |name| entry.name = try alloc.dupe(u8, name);
         if (listed.owned_by) |vendor| entry.owned_by = try alloc.dupe(u8, vendor);
         out.appendAssumeCapacity(entry);
@@ -270,8 +297,10 @@ pub fn mergeInto(
 }
 
 fn declaredEntry(alloc: Allocator, metadata: definitions.ModelMetadata) Allocator.Error!catalog.ModelCatalogEntry {
+    const id = try alloc.dupe(u8, metadata.id);
+    errdefer alloc.free(id);
     return .{
-        .id = try alloc.dupe(u8, metadata.id),
+        .id = id,
         .model_type = try alloc.dupe(u8, "language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
         .has_vision = metadata.supports_vision orelse false,

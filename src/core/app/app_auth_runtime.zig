@@ -20,6 +20,7 @@ const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
 const types = @import("../shared/types.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
@@ -958,6 +959,24 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn rejectProviderDefinitionMutation(app: *App, agent: *AppAgent) !bool {
+            const work_busy = if (comptime @hasField(App, "child_agents")) blk: {
+                if (app_agents_runtime.Runtime(App).anyWorkGoing(app)) break :blk true;
+                if (app.main_agent.session_persistence.title_generation.task != null) break :blk true;
+                for (app.child_agents.items) |child| if (child.agent.session_persistence.title_generation.task != null) break :blk true;
+                break :blk false;
+            } else agent.stream.active or agent.worker.queuedPromptCount() > 0;
+            const preparation_busy = if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) app.auth.providerPreparationPending() else false;
+            const busy = work_busy or preparation_busy;
+            if (!busy) return false;
+            try app.writeDomainNotice(.{
+                .topic = "provider",
+                .tone = .warning,
+                .body = "Wait for active and queued agent work to finish before changing provider settings.",
+            }, true);
+            return true;
+        }
+
         /// Re-reads the profile's provider definitions and the names the picker
         /// offers. A failed read leaves the previous registry in place, because
         /// a settings file fx cannot parse is not a reason to lose the
@@ -978,7 +997,7 @@ pub fn Runtime(comptime App: type) type {
                 registry.deinit(app.alloc);
                 return;
             };
-            if (comptime @hasDecl(@TypeOf(app.model_cache), "cancelAndJoin")) app.model_cache.cancelAndJoin();
+            if (comptime @hasDecl(@TypeOf(app.model_cache), "resetForProviderChange")) app.model_cache.resetForProviderChange();
             app.provider_selection.definitions.deinit(app.alloc);
             app.provider_selection.definitions = registry;
         }
@@ -1040,6 +1059,7 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 },
                 .clear_key => {
+                    if (try rejectProviderDefinitionMutation(app, agent)) return;
                     const definition = app.provider_selection.definitions.get(target.label()) orelse return;
                     _ = try config_runtime.setUserPreferences(app.alloc, .{ .provider_definition = .{
                         .name = definition.id,
@@ -1062,6 +1082,7 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 },
                 .remove => {
+                    if (try rejectProviderDefinitionMutation(app, agent)) return;
                     const name = try app.alloc.dupe(u8, target.label());
                     defer app.alloc.free(name);
                     _ = config_runtime.setUserPreferences(app.alloc, .{ .remove_provider = name }) catch |err| {
@@ -1112,6 +1133,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Saves the connection and key before fetching its catalog.
         fn saveAddProviderDraft(app: *App, agent: *AppAgent, draft: auth_runtime.AddProviderProjection) !void {
+            if (try rejectProviderDefinitionMutation(app, agent)) return;
             // A connection with a name and a URL but no key is not usable, and
             // saving it as a definition turns its preset row into "switch to
             // this" the next time the picker opens, which hides the key step
@@ -1715,12 +1737,6 @@ pub fn Runtime(comptime App: type) type {
 
             app.model_cache.adoptOwnedCatalog(access, target, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
-            // The definitions registry was loaded at startup. A provider added
-            // or removed since then lives only in settings, so it is re-read
-            // here: without this, the picker and the catalog would keep
-            // resolving against the startup set and a newly added provider would
-            // have no definition to fetch from.
-            reloadConfiguredProviders(app);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
 
             const body = try app.alloc.print(

@@ -506,15 +506,77 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
 /// the POSIX path: `writeRequest` and `readResponse` take an `Io.Writer` and an
 /// `Io.Reader` and never see a descriptor.
 fn connectWindows(alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    const effective = hopOptions(options);
     const zio = io_mod.getIo();
-    const address = windowsAdmittedAddress(target.admitted_addresses) orelse return error.NoAddressReturned;
-    checkControl(options) catch |err| {
-        traceFailure(.connect, err);
+    const Condition = struct {
+        options: FetchOptions,
+
+        pub fn cancelled(self: @This()) bool {
+            return if (self.options.cancel_flag) |flag| flag.load(.seq_cst) else false;
+        }
+
+        pub fn expired(self: @This(), _: std.Io) bool {
+            return monotonicMillis() >= self.options.deadline.?.deadline_ms;
+        }
+    };
+    const Watch = select_watch.Watch(Condition);
+    const Event = union(enum) {
+        request: anyerror!ConnectorResponse,
+        watch: std.Io.Cancelable!select_watch.Outcome,
+    };
+    const Cleanup = struct {
+        fn drain(gpa: Allocator, select: *std.Io.Select(Event)) void {
+            while (select.cancel()) |event| switch (event) {
+                .request => |result| {
+                    var response = result catch continue;
+                    response.deinit(gpa);
+                },
+                .watch => {},
+            };
+        }
+    };
+    var watch: Watch = .{};
+    var events: [2]Event = undefined;
+    var select: std.Io.Select(Event) = .init(zio, &events);
+    try select.concurrent(.watch, Watch.run, .{ &watch, zio, Condition{ .options = effective } });
+    select.concurrent(.request, connectWindowsRequest, .{ alloc, target, effective }) catch |err| {
+        watch.finish(&select);
         return err;
     };
-    var stream = address.connect(zio, .{ .mode = .stream }) catch |err| {
-        traceFailure(.connect, err);
+    const event = select.await() catch |err| {
+        watch.stop(zio);
+        Cleanup.drain(alloc, &select);
         return err;
+    };
+    return switch (event) {
+        .request => |result| result: {
+            watch.finish(&select);
+            break :result result;
+        },
+        .watch => |result| result: {
+            Cleanup.drain(alloc, &select);
+            break :result switch (try result) {
+                .cancelled => error.Canceled,
+                .deadline => error.Timeout,
+                .stopped => error.Canceled,
+            };
+        },
+    };
+}
+
+fn connectWindowsRequest(alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    const zio = io_mod.getIo();
+    if (target.admitted_addresses.len == 0) return error.NoAddressReturned;
+    var stream = connect: {
+        for (target.admitted_addresses, 0..) |address, index| {
+            try checkControl(options);
+            break :connect address.connect(zio, .{ .mode = .stream }) catch |err| {
+                traceDialFailure(index, target.admitted_addresses.len, err);
+                if ((!isRetryableConnectError(err) and err != error.AddressFamilyUnsupported) or index + 1 == target.admitted_addresses.len) return err;
+                continue;
+            };
+        }
+        unreachable;
     };
     defer stream.close(zio);
 
@@ -522,6 +584,18 @@ fn connectWindows(alloc: Allocator, target: PinnedTarget, options: FetchOptions)
         .http => fetchWindowsPlain(alloc, stream, target, options),
         .https => fetchWindowsTls(alloc, stream, target, options),
     };
+}
+
+test "Windows web fetch honors cancellation and deadline before dialing" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var url = try url_policy.normalize(alloc, "https://example.com/");
+    defer url.deinit(alloc);
+    const addresses = [_]IpAddress{try IpAddress.parse("93.184.216.34", 443)};
+    const target = PinnedTarget{ .url = url, .admitted_addresses = &addresses, .tls_server_name = "example.com", .host_header = "example.com" };
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, connectWindows(alloc, target, .{ .cancel_flag = &cancelled }));
+    try std.testing.expectError(error.Timeout, connectWindows(alloc, target, .{ .deadline = .{ .deadline_ms = monotonicMillis() - 1 } }));
 }
 
 fn fetchWindowsPlain(alloc: Allocator, stream: std.Io.net.Stream, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
@@ -555,13 +629,6 @@ fn fetchWindowsTls(alloc: Allocator, stream: std.Io.net.Stream, target: PinnedTa
     var encrypted_reader = stream.reader(zio, &read_buffer);
     var encrypted_writer = stream.writer(zio, &write_buffer);
     return fetchTlsTransport(alloc, &encrypted_reader, &encrypted_writer, target, options);
-}
-
-/// The address to connect to, chosen from the addresses the URL policy admitted.
-/// Each one was already checked to be public, so the first is taken.
-fn windowsAdmittedAddress(admitted: []const IpAddress) ?IpAddress {
-    if (admitted.len == 0) return null;
-    return admitted[0];
 }
 
 fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {

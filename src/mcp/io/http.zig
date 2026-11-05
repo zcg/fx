@@ -8,6 +8,7 @@
 //! rejected requests, with their challenge, and `fetch` for any other URL.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const lines = @import("lines.zig");
 const Bell = @import("bell.zig").Bell;
@@ -705,26 +706,34 @@ fn now(io: Io) i64 {
 /// Whether the server closed or reset a kept connection while it sat idle.
 /// Nothing is due on one between requests, so anything to read, its end
 /// included, means it can't carry another.
-///
-/// A zero-deadline read is the portable question: both platforms answer it with
-/// a byte count, zero for a closed connection, or `WouldBlock` while it is still
-/// open and silent. This replaces a zero-timeout `poll`, which Zig refuses to
-/// compile on Windows because a Windows stream is not a pollable descriptor.
 fn closedByServer(kept: *std.http.Client.Connection) bool {
     if (kept.reader().bufferedLen() > 0 or kept.stream_reader.interface.bufferedLen() > 0) return true;
-    // `receiveTimeout` asks the socket for data with a deadline, and Zig
-    // implements it on Winsock and on POSIX sockets alike. A single byte is
-    // enough to answer: anything waiting, a close included, means the connection
-    // cannot carry another request. Nothing waiting times out.
-    var buffer: [1]u8 = undefined;
-    const io = kept.client.io;
-    const incoming = kept.stream_reader.stream.socket.receiveTimeout(
-        io,
-        &buffer,
-        .{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } },
-    ) catch return true;
-    if (incoming.data.len > 0) return true;
-    return false;
+    const socket = kept.stream_reader.stream.socket.handle;
+    if (comptime builtin.target.os.tag == .windows) {
+        const windows = std.os.windows;
+        const Poll = extern struct {
+            timeout: i64 = 0,
+            count: u32 = 1,
+            exclusive: u32 = 0,
+            handle: windows.HANDLE,
+            events: u32 = 0x1bb,
+            status: windows.NTSTATUS = .SUCCESS,
+        };
+        var poll: Poll = .{ .handle = socket };
+        const result = kept.client.io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = socket, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.POLL,
+            .in = std.mem.asBytes(&poll),
+            .out = std.mem.asBytes(&poll),
+        } }) catch return true;
+        return switch (result.device_io_control.u.Status) {
+            .TIMEOUT => false,
+            .SUCCESS => poll.count != 0 and poll.events != 0,
+            else => true,
+        };
+    }
+    var ready = [_]std.posix.pollfd{.{ .fd = socket, .events = std.posix.POLL.IN, .revents = 0 }};
+    return (std.posix.poll(&ready, 0) catch return true) > 0;
 }
 
 /// A Content-Type naming JSON, with any parameters such as `charset`.
@@ -1092,6 +1101,7 @@ fn answerKept(stream: Io.net.Stream, drop: Drop, requests: *std.atomic.Value(u32
             .reset => {
                 // Once the client has read the answer: a reset, not an end.
                 try Io.sleep(testing.io, .fromMilliseconds(50), .awake);
+                if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
                 try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&std.posix.linger{ .onoff = 1, .linger = 0 }));
                 return;
             },
@@ -1152,6 +1162,8 @@ fn fetchedStatus(c: *Client) !u16 {
 
 test "a kept connection the server reset or closed while idle isn't sent on again: each request goes out once, on a new one" {
     for ([_]Drop{ .reset, .close }) |drop| {
+        // std.Io's native AFD sockets have no portable SO_LINGER setter.
+        if (builtin.target.os.tag == .windows and drop == .reset) continue;
         var kept: Kept = undefined;
         try kept.start(drop);
         defer kept.stop();

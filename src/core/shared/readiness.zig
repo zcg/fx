@@ -7,16 +7,16 @@
 //! poll.
 //!
 //! `pollDescriptors` is the equivalent. On POSIX it calls `poll` directly. On
-//! Windows it waits on the handles with `WaitForSingleObject`, which reports the
-//! same two facts fx needs: whether input arrived, and whether the other end
-//! closed. A console reports a keystroke through its input event count instead,
-//! which is the only way to see one without consuming it.
+//! Windows probes pipes with `PeekNamedPipe`, sockets with `AFD_POLL`, and
+//! console input with its event count. Every watch shares one timeout, and
+//! probing leaves bytes for the caller's next read.
 //!
 //! Nothing here allocates. Every buffer lives in the caller's stack frame, and
-//! the handle probe closes what it opens before returning.
+//! probes borrow their handles.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const io_mod = @import("io.zig");
 
 pub const is_windows = builtin.target.os.tag == .windows;
 
@@ -28,14 +28,6 @@ pub const Timeout = union(enum) {
     milliseconds: u32,
     /// Wait until something arrives.
     forever,
-
-    fn toMilliseconds(self: Timeout) u32 {
-        return switch (self) {
-            .now => 0,
-            .milliseconds => |value| value,
-            .forever => windows_infinite,
-        };
-    }
 
     fn toPosixMilliseconds(self: Timeout) i32 {
         return switch (self) {
@@ -88,7 +80,7 @@ pub fn pollDescriptors(watches: []Watch, timeout: Timeout) error{Unsupported}!us
     // allocating; a larger set falls back to polling each descriptor in turn.
     var poll_set: [max_inline_watches]std.posix.pollfd = undefined;
     if (watches.len <= poll_set.len) {
-        for (watches, 0..) |watch, i| {
+        for (watches, 0..) |*watch, i| {
             poll_set[i] = .{
                 .fd = if (watch.isActive()) watch.fd else -1,
                 .events = std.posix.POLL.IN,
@@ -153,48 +145,91 @@ pub fn hasInput(fd: std.posix.fd_t) bool {
     return (waitReadable(fd, .now) catch return false).readable;
 }
 
-/// Windows branch: `WaitForSingleObject` on the handle reports both input and
-/// closure, and a console reports a queued keystroke through its event count.
+/// Probes every watch before sleeping, with one deadline for the whole set.
 fn windowsPoll(watches: []Watch, timeout: Timeout) error{Unsupported}!usize {
-    var reported: usize = 0;
-    for (watches) |*watch| {
-        watch.events = .{};
-        if (!watch.isActive()) continue;
-        if (windowsHasConsoleInput(watch.fd)) {
-            watch.events = .{ .readable = true };
-            reported += 1;
-            continue;
+    const started = windows_wait.GetTickCount64();
+    while (true) {
+        var reported: usize = 0;
+        for (watches) |*watch| {
+            watch.events = .{};
+            if (!watch.isActive()) continue;
+            watch.events = try windowsProbe(watch.fd);
+            if (watch.events.any()) reported += 1;
         }
-        switch (windows_wait.WaitForSingleObject(watch.fd, timeout.toMilliseconds())) {
-            windows_wait.object_0 => {
-                watch.events = .{ .readable = true };
-                reported += 1;
-            },
-            windows_wait.timeout => {},
-            windows_wait.wait_failed => return error.Unsupported,
-            else => return error.Unsupported,
-        }
+        if (reported > 0) return reported;
+        const elapsed = windows_wait.GetTickCount64() - started;
+        const remaining = switch (timeout) {
+            .now => return 0,
+            .milliseconds => |ms| if (elapsed >= ms) return 0 else ms - elapsed,
+            .forever => 5,
+        };
+        windows_wait.Sleep(@intCast(@min(remaining, 5)));
     }
-    return reported;
 }
 
-/// Whether a console has events queued. This reports a keystroke and a resize
-/// alike, which the screen needs to redraw for. A handle that is not a console
-/// answers through the wait instead.
-fn windowsHasConsoleInput(fd: std.posix.fd_t) bool {
+fn windowsProbe(fd: std.posix.fd_t) error{Unsupported}!Events {
     var event_count: u32 = 0;
-    if (windows_console.GetNumberOfConsoleInputEvents(fd, &event_count) == 0) return false;
-    return event_count > 0;
+    if (windows_console.GetNumberOfConsoleInputEvents(fd, &event_count) != 0) return .{ .readable = event_count > 0 };
+
+    // A signaled pipe handle does not prove bytes are waiting. Peek without
+    // consuming them so the next read cannot block after this probe.
+    var available: u32 = 0;
+    if (windows_wait.PeekNamedPipe(fd, null, 0, null, &available, null) != 0) return .{ .readable = available > 0 };
+    switch (windows_wait.GetLastError()) {
+        109, 233 => return .{ .readable = true, .hung_up = true }, // BROKEN_PIPE, PIPE_NOT_CONNECTED
+        else => {},
+    }
+
+    if (windows_wait.GetFileType(fd) == 1) return .{ .readable = true };
+    // std.Io opens AFD handles directly, so Winsock's WSAPoll cannot poll them.
+    if (windowsSocketProbe(fd)) |events| return events;
+    return switch (windows_wait.WaitForSingleObject(fd, 0)) {
+        windows_wait.object_0 => .{ .readable = true },
+        windows_wait.timeout => .{},
+        else => error.Unsupported,
+    };
 }
 
-const windows_infinite: u32 = 0xFFFFFFFF;
+fn windowsSocketProbe(fd: std.posix.fd_t) ?Events {
+    const windows = std.os.windows;
+    const Poll = extern struct {
+        timeout: i64 = 0,
+        count: u32 = 1,
+        exclusive: u32 = 0,
+        handle: windows.HANDLE,
+        events: u32 = 0x1bb, // receive, disconnect, abort, close, accept, connect failure
+        status: windows.NTSTATUS = .SUCCESS,
+    };
+    var poll: Poll = .{ .handle = fd };
+    const result = io_mod.getIo().operate(.{ .device_io_control = .{
+        .file = .{ .handle = fd, .flags = .{ .nonblocking = true } },
+        .code = windows.IOCTL.AFD.POLL,
+        .in = std.mem.asBytes(&poll),
+        .out = std.mem.asBytes(&poll),
+    } }) catch return null;
+    switch (result.device_io_control.u.Status) {
+        .TIMEOUT => return .{},
+        .SUCCESS => {},
+        else => return null,
+    }
+    if (poll.count == 0) return .{};
+    return .{
+        .readable = (poll.events & 0xbb) != 0,
+        .hung_up = (poll.events & 0x38) != 0,
+        .errored = (poll.events & 0x110) != 0 or poll.status != .SUCCESS,
+    };
+}
 
 const windows_wait = if (!is_windows) struct {} else struct {
     const object_0: u32 = 0x00000000;
     const timeout: u32 = 0x00000102;
-    const wait_failed: u32 = 0xFFFFFFFF;
 
     extern "kernel32" fn WaitForSingleObject(handle: std.posix.fd_t, milliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn PeekNamedPipe(handle: std.posix.fd_t, buffer: ?*anyopaque, size: u32, read: ?*u32, available: ?*u32, remaining: ?*u32) callconv(.winapi) c_int;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    extern "kernel32" fn GetFileType(handle: std.posix.fd_t) callconv(.winapi) u32;
+    extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+    extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 };
 
 const windows_console = if (!is_windows) struct {} else struct {
@@ -240,4 +275,58 @@ test "pollDescriptors reports hang up after the writer closes" {
     const ready = try pollDescriptors(&watches, .{ .milliseconds = 100 });
     try std.testing.expect(ready >= 1);
     try std.testing.expect(watches[0].events.hung_up or watches[0].events.readable);
+}
+
+test "Windows readiness probes all pipes without consuming bytes" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const quiet = try threaded.windowsCreatePipe(.{
+        .server = .{ .mode = .{ .IO = .ASYNCHRONOUS } },
+        .client = .{ .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
+        .inbound = true,
+    });
+    defer for (quiet) |fd| std.os.windows.CloseHandle(fd);
+    const ready = try threaded.windowsCreatePipe(.{
+        .server = .{ .mode = .{ .IO = .ASYNCHRONOUS } },
+        .client = .{ .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
+        .inbound = true,
+    });
+    defer std.os.windows.CloseHandle(ready[0]);
+    var writer: ?std.Io.File = .{ .handle = ready[1], .flags = .{ .nonblocking = false } };
+    defer if (writer) |file| file.close(std.testing.io);
+    try writer.?.writeStreamingAll(std.testing.io, "x");
+
+    var watches = [_]Watch{ .{ .fd = quiet[0] }, .{ .fd = ready[0] } };
+    try std.testing.expectEqual(@as(usize, 1), try pollDescriptors(&watches, .{ .milliseconds = 100 }));
+    try std.testing.expect(!watches[0].events.any());
+    try std.testing.expect(watches[1].events.readable);
+    const reader: std.Io.File = .{ .handle = ready[0], .flags = .{ .nonblocking = true } };
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try reader.readStreaming(std.testing.io, &.{&byte}));
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    try std.testing.expectEqual(@as(usize, 0), try pollDescriptors(&watches, .now));
+
+    writer.?.close(std.testing.io);
+    writer = null;
+    try std.testing.expectEqual(@as(usize, 1), try pollDescriptors(&watches, .now));
+    try std.testing.expect(watches[1].events.hung_up);
+}
+
+test "Windows readiness reports a socket becoming readable" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const client = try server.socket.address.connect(std.testing.io, .{ .mode = .stream });
+    defer client.close(std.testing.io);
+    try std.testing.expect((try waitReadable(server.socket.handle, .{ .milliseconds = 100 })).readable);
+    const accepted = try server.accept(std.testing.io);
+    defer accepted.close(std.testing.io);
+    try std.testing.expect(!(try waitReadable(accepted.socket.handle, .now)).any());
+    var buffer: [1]u8 = undefined;
+    var writer = client.writer(std.testing.io, &buffer);
+    try writer.interface.writeAll("x");
+    try writer.interface.flush();
+    try std.testing.expect((try waitReadable(accepted.socket.handle, .{ .milliseconds = 100 })).readable);
 }

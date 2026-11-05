@@ -518,7 +518,8 @@ fn applyWithTestControls(
         .resolve_beneath = true,
     }) catch return resources.reject(.io_failure);
     resources.temp_name = temp_name;
-    defer stage.close(io_mod.getIo());
+    var stage_open = true;
+    defer if (stage_open) stage.close(io_mod.getIo());
 
     const initial_stage_stat = stage.stat(io_mod.getIo()) catch
         return resources.reject(.io_failure);
@@ -637,7 +638,7 @@ fn applyWithTestControls(
     // closed so the deferred close below does not close it a second time.
     if (comptime builtin.target.os.tag == .windows) {
         stage.close(io_mod.getIo());
-        stage.handle = @ptrFromInt(std.math.maxInt(usize));
+        stage_open = false;
     }
     commit_parent.rename(
         temp_name,

@@ -1370,11 +1370,13 @@ pub fn currentProcessId() u64 {
 
 const windows_process = if (builtin.target.os.tag != .windows) struct {} else struct {
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn GetProcessId(process: std.posix.fd_t) callconv(.winapi) u32;
     extern "kernel32" fn OpenProcess(desired_access: u32, inherit_handle: c_int, process_id: u32) callconv(.winapi) ?std.posix.fd_t;
     extern "kernel32" fn TerminateProcess(process: std.posix.fd_t, exit_code: u32) callconv(.winapi) c_int;
     extern "kernel32" fn CloseHandle(handle: std.posix.fd_t) callconv(.winapi) c_int;
     extern "kernel32" fn GetExitCodeProcess(process: std.posix.fd_t, exit_code: *u32) callconv(.winapi) c_int;
     extern "kernel32" fn WaitForSingleObject(handle: std.posix.fd_t, milliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn ResumeThread(thread: std.posix.fd_t) callconv(.winapi) u32;
 };
 
 /// Whether a process id refers to a process at all.
@@ -1392,7 +1394,7 @@ pub fn pidIsValid(pid: std.posix.pid_t) bool {
 /// or a file name. A POSIX caller should use the pid directly.
 pub fn pidAsNumber(pid: std.posix.pid_t) u64 {
     if (comptime builtin.target.os.tag == .windows) {
-        return @intFromPtr(pid);
+        return windows_process.GetProcessId(pid);
     }
     return @intCast(pid);
 }
@@ -1409,8 +1411,8 @@ pub const ProcessExit = union(enum) {
 ///
 /// POSIX reaps with `waitpid`, decoding a status word, and `WNOHANG` asks
 /// without blocking. Windows has no such call: a process handle ends by
-/// signalling and `GetExitCodeProcess` reports the code, with `STILL_ACTIVE`
-/// meaning "not yet". Both report the same three facts.
+/// signalling and `GetExitCodeProcess` reports the code after that signal.
+/// Both report the same three facts.
 pub fn waitProcess(pid: std.posix.pid_t, block: bool) ?ProcessExit {
     if (comptime builtin.target.os.tag == .windows) return windowsWaitProcess(pid, block);
     if (comptime builtin.target.os.tag == .wasi) return null;
@@ -1425,29 +1427,15 @@ pub fn waitProcess(pid: std.posix.pid_t, block: bool) ?ProcessExit {
     return null;
 }
 
-/// The Windows form of `waitProcess`. The process id is reopened with the least
-/// access that reports an exit code, because a `pid_t` there is a handle whose
-/// value identifies the process rather than a handle to wait on.
+/// Borrows the process handle returned by `std.process.spawn`; its owner closes it.
 fn windowsWaitProcess(pid: std.posix.pid_t, block: bool) ?ProcessExit {
     if (@intFromPtr(pid) == 0) return null;
-    const process_id: u32 = @truncate(@intFromPtr(pid));
-    const process = windows_process.OpenProcess(windows_process_query, 0, process_id) orelse
-        return null;
-    defer _ = windows_process.CloseHandle(process);
-
-    if (block) {
-        _ = windows_process.WaitForSingleObject(process, windows_infinite);
-    }
+    if (windows_process.WaitForSingleObject(pid, if (block) windows_infinite else 0) != 0) return null;
     var code: u32 = 0;
-    if (windows_process.GetExitCodeProcess(process, &code) == 0) return null;
-    if (code == windows_process_still_active) return null;
+    if (windows_process.GetExitCodeProcess(pid, &code) == 0) return null;
     return .{ .exited = code };
 }
 
-/// `PROCESS_QUERY_LIMITED_INFORMATION`, the least access that reports an exit
-/// code.
-const windows_process_query: u32 = 0x1000;
-const windows_process_still_active: u32 = 259;
 const windows_infinite: u32 = 0xFFFFFFFF;
 
 /// Terminates a process, with the meaning of a POSIX kill that cannot be caught.
@@ -1468,14 +1456,48 @@ pub fn killProcess(pid: std.posix.pid_t) error{ ProcessNotFound, AccessDenied, U
         return;
     }
     if (@intFromPtr(pid) == 0) return error.ProcessNotFound;
-    // A Windows `pid_t` is a `HANDLE`, but the handle a child reports is not an
-    // owned handle fx may terminate through, so the id is read as a number and
-    // reopened with the access `TerminateProcess` requires.
-    const process_id: u32 = @truncate(@intFromPtr(pid));
-    const process = windows_process.OpenProcess(windows_process_terminate, 0, process_id) orelse
-        return error.ProcessNotFound;
-    defer _ = windows_process.CloseHandle(process);
-    if (windows_process.TerminateProcess(process, 1) == 0) return error.Unexpected;
+    if (windows_process.TerminateProcess(pid, 1) == 0) {
+        if (windowsWaitProcess(pid, false) != null) return error.ProcessNotFound;
+        return error.Unexpected;
+    }
+}
+
+test "Windows child handles expose the process id and preserve exit code 259" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "cmd.exe", "/d", "/c", "exit 259" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .start_suspended = true,
+        .create_no_window = true,
+    });
+    defer child.kill(std.testing.io);
+    const process = child.id.?;
+    try std.testing.expect(pidAsNumber(process) != 0);
+    try std.testing.expect(pidAsNumber(process) != currentProcessId());
+    try std.testing.expect(waitProcess(process, false) == null);
+    try std.testing.expect(windows_process.ResumeThread(child.thread_handle) != std.math.maxInt(u32));
+    const exited = waitProcess(process, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 259), exited.exited);
+    _ = try child.wait(std.testing.io);
+}
+
+test "Windows killProcess terminates the spawned handle" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "cmd.exe", "/d", "/c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .start_suspended = true,
+        .create_no_window = true,
+    });
+    defer child.kill(std.testing.io);
+    try killProcess(child.id.?);
+    const exited = waitProcess(child.id.?, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), exited.exited);
+    _ = try child.wait(std.testing.io);
 }
 
 /// `PROCESS_TERMINATE`, the access `TerminateProcess` requires.
@@ -1537,17 +1559,55 @@ pub fn readFd(fd: std.posix.fd_t, out: []u8) !usize {
     if (comptime builtin.target.os.tag == .wasi) return error.Unexpected;
     if (comptime builtin.target.os.tag == .windows) {
         if (out.len == 0) return 0;
-        // A console is read with `ReadConsoleA`, so it is tried first. Only
-        // `ERROR_INVALID_HANDLE` means this is not a console.
-        if (windowsReadSome(fd, out)) |count| {
-            return count;
-        } else |err| switch (err) {
-            error.NotAConsole => {},
-            else => return err,
-        }
+        if (isConsoleHandle(fd)) return windowsReadSome(fd, out);
     }
-    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    return file.readStreaming(getIo(), &.{out});
+    const file = fileFromHandle(fd);
+    return file.readStreaming(getIo(), &.{out}) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => return err,
+    };
+}
+
+fn fileFromHandle(fd: std.posix.fd_t) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = handleIsAsynchronous(fd) } };
+}
+
+fn handleIsAsynchronous(fd: std.posix.fd_t) bool {
+    if (comptime builtin.target.os.tag != .windows) return false;
+    const windows = std.os.windows;
+    var status: windows.IO_STATUS_BLOCK = undefined;
+    var mode: windows.FILE.MODE.INFORMATION = undefined;
+    // Inherited and child pipes can use overlapped I/O. Giving one to std.Io
+    // as a synchronous file reaches unreachable when a read or write is pending.
+    if (windows.ntdll.NtQueryInformationFile(fd, &status, &mode, @sizeOf(@TypeOf(mode)), .Mode) != .SUCCESS) return false;
+    return mode.Mode.IO == .ASYNCHRONOUS;
+}
+
+test "Windows readFd handles an asynchronous pipe waiting for bytes and EOF" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const pipe = try threaded.windowsCreatePipe(.{
+        .server = .{ .mode = .{ .IO = .ASYNCHRONOUS } },
+        .client = .{ .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
+        .inbound = true,
+    });
+    defer closeFd(pipe[0]);
+    try std.testing.expect(handleIsAsynchronous(pipe[0]));
+    try std.testing.expect(!handleIsAsynchronous(pipe[1]));
+    const WriteLater = struct {
+        fn run(fd: std.posix.fd_t) void {
+            defer closeFd(fd);
+            sleep(10 * std.time.ns_per_ms);
+            writeFd(fd, &.{ 0xff, 0x80, 0x00 }) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, WriteLater.run, .{pipe[1]});
+    defer thread.join();
+    var buffer: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try readFd(pipe[0], &buffer));
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x80, 0x00 }, &buffer);
+    try std.testing.expectEqual(@as(usize, 0), try readFd(pipe[0], &buffer));
 }
 
 /// Reads once from a console, returning what the console had.
@@ -1578,22 +1638,14 @@ pub fn readByte(fd: std.posix.fd_t, out: *[1]u8) !usize {
 /// Zig 0.17's Windows IO is built on `NtWriteFile`, which refuses a console
 /// handle with `INVALID_HANDLE` (the source notes that console device names are
 /// not handled yet), and that surfaces as `NotOpenForWriting`. A console handle
-/// therefore takes `WriteConsoleA`, which is the call a console accepts.
+/// therefore takes `WriteConsoleW`, which is the call a console accepts.
 pub fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     if (comptime builtin.target.os.tag == .wasi) return error.Unexpected;
     if (comptime builtin.target.os.tag == .windows) {
         if (bytes.len == 0) return;
-        // `WriteConsoleA` is the console write call, so it is tried first. Only
-        // `ERROR_INVALID_HANDLE` means the handle is not a console and belongs on
-        // the file path; any other error is a real write that did not happen.
-        if (windowsWriteAll(fd, bytes)) |_| {
-            return;
-        } else |err| switch (err) {
-            error.NotAConsole => {},
-            else => return err,
-        }
+        if (isConsoleHandle(fd)) return windowsWriteAll(fd, bytes);
     }
-    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const file = fileFromHandle(fd);
     return file.writeStreamingAll(getIo(), bytes);
 }
 
@@ -1843,17 +1895,17 @@ pub fn isTty(fd: std.posix.fd_t) bool {
 
 /// This process's standard input as a `std.Io.File`.
 pub fn stdinFile() std.Io.File {
-    return .{ .handle = stdinHandle(), .flags = .{ .nonblocking = false } };
+    return fileFromHandle(stdinHandle());
 }
 
 /// This process's standard output as a `std.Io.File`.
 pub fn stdoutFile() std.Io.File {
-    return .{ .handle = stdoutHandle(), .flags = .{ .nonblocking = false } };
+    return fileFromHandle(stdoutHandle());
 }
 
 /// This process's standard error as a `std.Io.File`.
 pub fn stderrFile() std.Io.File {
-    return .{ .handle = stderrHandle(), .flags = .{ .nonblocking = false } };
+    return fileFromHandle(stderrHandle());
 }
 
 /// The handle of a standard stream, for code that needs a descriptor value
@@ -2191,48 +2243,17 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) RealpathError![
 
 /// Resolves `path` to its absolute, canonical form on Windows.
 ///
-/// Windows has no `realpath`. `GetFullPathNameW` is its equivalent: it makes a
-/// path absolute, collapses `.` and `..`, and normalizes separators. It does not
-/// require the path to exist, so existence is checked afterwards to keep the
-/// same contract the POSIX branch has.
-///
-/// The error set matches the POSIX branch on purpose: callers switch on these
-/// names on every platform, and a Windows-only set would force each of them to
-/// spell out two shapes.
+/// Resolve the opened handle so junctions and symbolic links cannot retain
+/// their lexical workspace path after redirecting to another location.
 fn windowsRealpathAlloc(alloc: std.mem.Allocator, path: []const u8) anyerror![]u8 {
     if (path.len == 0) return error.BadPathName;
-    var wide_buffer: [windows_path_max_wide]u16 = undefined;
-    const wide_len = std.unicode.utf8ToUtf16Le(&wide_buffer, path) catch return error.BadPathName;
-    if (wide_len + 1 > wide_buffer.len) return error.NameTooLong;
-    wide_buffer[wide_len] = 0;
-
-    var resolved_buffer: [windows_path_max_wide]u16 = undefined;
-    const resolved_len = windows_path_api.GetFullPathNameW(
-        @ptrCast(&wide_buffer),
-        resolved_buffer.len,
-        &resolved_buffer,
-        null,
-    );
-    if (resolved_len == 0) return error.Unexpected;
-    if (resolved_len >= resolved_buffer.len) return error.NameTooLong;
-
-    // The POSIX call fails for a path that does not exist, so this one does too.
-    const invalid_attributes: u32 = 0xFFFFFFFF;
-    if (windows_path_api.GetFileAttributesW(@ptrCast(&resolved_buffer)) == invalid_attributes) {
-        return error.FileNotFound;
-    }
-    return std.unicode.utf16LeToUtf8Alloc(alloc, resolved_buffer[0..resolved_len]);
+    var file = try std.Io.Dir.cwd().openFile(getIo(), path, .{
+        .allow_directory = true,
+        .follow_symlinks = true,
+    });
+    defer file.close(getIo());
+    return windowsHandlePathAlloc(alloc, file.handle);
 }
-
-const windows_path_api = if (builtin.target.os.tag != .windows) struct {} else struct {
-    extern "kernel32" fn GetFullPathNameW(
-        file_name: [*:0]const u16,
-        buffer_length: u32,
-        buffer: [*]u16,
-        file_part: ?*?[*:0]u16,
-    ) callconv(.winapi) u32;
-    extern "kernel32" fn GetFileAttributesW(file_name: [*:0]const u16) callconv(.winapi) u32;
-};
 
 fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
     if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
@@ -2768,6 +2789,28 @@ test "realpathAlloc on nonexistent path returns FileNotFound" {
     defer alloc.free(missing);
 
     try std.testing.expectError(error.FileNotFound, realpathAlloc(alloc, missing));
+}
+
+test "Windows realpath resolves file and directory links to their targets" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(getIo(), "target", .default_dir);
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "target/file.txt", .data = "content" });
+    tmp.dir.symLink(getIo(), "target", "linked-dir", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.OperationUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "linked-dir/file.txt" });
+    defer alloc.free(path);
+    const expected = try std.Io.Dir.path.join(alloc, &.{ root, "target/file.txt" });
+    defer alloc.free(expected);
+    const actual = try realpathAlloc(alloc, path);
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "realpathAlloc distinguishes non-directory and symlink-loop paths" {

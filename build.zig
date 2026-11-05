@@ -77,11 +77,10 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .stack_check = false,
             .stack_protector = false,
-            // A sanitized build keeps its frame pointers and symbols, so race
-            // reports show whole stacks and name the code.
-            .omit_frame_pointer = !sanitize_thread,
-            .unwind_tables = .none,
-            .error_tracing = false,
+            // Debug and sanitizer builds retain enough information to locate runtime crashes.
+            .omit_frame_pointer = optimize != .debug and !sanitize_thread,
+            .unwind_tables = if (optimize == .debug or sanitize_thread) .sync else .none,
+            .error_tracing = optimize == .debug,
             .strip = optimize != .debug and !sanitize_thread,
             .sanitize_thread = sanitize_thread,
         }),
@@ -125,45 +124,45 @@ pub fn build(b: *std.Build) void {
         const exe_tests = b.addTest(.{
             .root_module = exe.root_module,
         });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-    run_exe_tests.step.dependOn(b.getInstallStep());
-    // Tests launch the installed fx binary, and the session boundary test
-    // walks the source tree.
-    // The session manager's own tests, as fx compiles it (no hooks).
-    const session_manager_tests = b.addTest(.{ .root_module = session_manager });
+        const run_exe_tests = b.addRunArtifact(exe_tests);
+        run_exe_tests.step.dependOn(b.getInstallStep());
+        // Tests launch the installed fx binary, and the session boundary test
+        // walks the source tree.
+        // The session manager's own tests, as fx compiles it (no hooks).
+        const session_manager_tests = b.addTest(.{ .root_module = session_manager });
 
-    const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
-    // And with its fault and trace hooks, whose tests fx's build leaves out.
-    const session_manager_hook_tests = b.addTest(.{
-        .root_module = sessionManagerModule(b, target, optimize, null, true, fuzz_corpora),
-    });
-    session_manager_hook_tests.root_module.sanitize_thread = sanitize_thread;
-    if (sanitize_thread and target.result.os.tag == .linux and
-        (target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .aarch64))
-    {
-        // Lets ThreadSanitizer see pages that `mremap` releases (see the
-        // file). fx and its tests reach it through the session manager.
-        const tsan_mremap = b.addObject(.{
-            .name = "tsan_mremap",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/tsan_mremap.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-                .sanitize_thread = true,
-            }),
+        const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
+        // And with its fault and trace hooks, whose tests fx's build leaves out.
+        const session_manager_hook_tests = b.addTest(.{
+            .root_module = sessionManagerModule(b, target, optimize, null, true, fuzz_corpora),
         });
-        session_manager.addObject(tsan_mremap);
-        session_manager_hook_tests.root_module.addObject(tsan_mremap);
-    }
-    const run_session_manager_hook_tests = b.addRunArtifact(session_manager_hook_tests);
-    session_manager_test_step.dependOn(&run_session_manager_tests.step);
-    session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
+        session_manager_hook_tests.root_module.sanitize_thread = sanitize_thread;
+        if (sanitize_thread and target.result.os.tag == .linux and
+            (target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .aarch64))
+        {
+            // Lets ThreadSanitizer see pages that `mremap` releases (see the
+            // file). fx and its tests reach it through the session manager.
+            const tsan_mremap = b.addObject(.{
+                .name = "tsan_mremap",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/tsan_mremap.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                    .sanitize_thread = true,
+                }),
+            });
+            session_manager.addObject(tsan_mremap);
+            session_manager_hook_tests.root_module.addObject(tsan_mremap);
+        }
+        const run_session_manager_hook_tests = b.addRunArtifact(session_manager_hook_tests);
+        session_manager_test_step.dependOn(&run_session_manager_tests.step);
+        session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
 
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_session_manager_tests.step);
-    test_step.dependOn(&run_session_manager_hook_tests.step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
+        test_step.dependOn(&run_exe_tests.step);
+        test_step.dependOn(&run_session_manager_tests.step);
+        test_step.dependOn(&run_session_manager_hook_tests.step);
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
     }
 
     const fuzz_step = b.step(
@@ -264,6 +263,20 @@ pub fn build(b: *std.Build) void {
     const run_shell_probe = b.addRunArtifact(shell_probe);
     const shell_probe_step = b.step("probe-shell", "Report the shell this machine resolves");
     shell_probe_step.dependOn(&run_shell_probe.step);
+
+    // Which step of the skills refresh fails, and with what error.
+    const skills_refresh_probe = b.addExecutable(.{
+        .name = "skills-refresh-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/skills_refresh_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_skills_refresh_probe = b.addRunArtifact(skills_refresh_probe);
+    const skills_refresh_probe_step = b.step("probe-skills", "Report which skills refresh step fails");
+    skills_refresh_probe_step.dependOn(&run_skills_refresh_probe.step);
 
     const run_bench = b.addRunArtifact(file_index_bench);
     run_bench.step.dependOn(&install_bench.step);

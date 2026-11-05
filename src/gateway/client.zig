@@ -506,6 +506,29 @@ pub fn fetchGatewayJsonCancellable(
     return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms);
 }
 
+/// Fetches provider JSON with protocol-specific headers under the catalog deadline.
+pub fn fetchProviderJsonCancellable(
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    headers: []const std.http.Header,
+    cancel_flag: *std.atomic.Value(bool),
+) !GatewayJsonResult {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var operation = GatewayJsonFetchOperation{
+        .alloc = alloc,
+        .api_key = null,
+        .gateway_team = null,
+        .url = url,
+        .cancel_flag = cancel_flag,
+        .extra_headers = headers,
+    };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(gateway_json_fetch_timeout_ms),
+    });
+    return runBoundedHttpOperation(GatewayJsonResult, alloc, cancel_flag, deadline, &operation);
+}
+
 /// A stalled catalog request fails with `error.Timeout` after this long, so a
 /// hung endpoint cannot hold a background refresh or an ACP options request.
 const gateway_json_fetch_timeout_ms: i64 = 30_000;
@@ -538,6 +561,7 @@ const GatewayJsonFetchOperation = struct {
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    extra_headers: ?[]const std.http.Header = null,
 
     fn run(self: *@This()) !GatewayJsonResult {
         return fetchGatewayJsonAtUrlCore(
@@ -546,6 +570,7 @@ const GatewayJsonFetchOperation = struct {
             self.gateway_team,
             self.url,
             self.cancel_flag,
+            self.extra_headers,
         );
     }
 };
@@ -556,6 +581,7 @@ fn fetchGatewayJsonAtUrlCore(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    protocol_headers: ?[]const std.http.Header,
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -575,7 +601,7 @@ fn fetchGatewayJsonAtUrlCore(
         headers.authorization = .{ .override = auth_header.? };
     }
     var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
+    const extra_headers = protocol_headers orelse gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
     var req = client.request(.GET, uri, .{
         .headers = headers,

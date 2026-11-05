@@ -61,6 +61,7 @@ const Function = struct {
 };
 
 const max_selected_tools = 256;
+const max_content_blocks = 4096;
 
 /// Builds the request body. The caller owns the result.
 pub fn build_request(alloc: Allocator, input: streams.RequestData, options: Options) Error![]u8 {
@@ -76,7 +77,10 @@ pub fn build_request(alloc: Allocator, input: streams.RequestData, options: Opti
     request.messages = projected orelse input.messages;
 
     var functions: std.ArrayList(Function) = .empty;
-    defer functions.deinit(alloc);
+    defer {
+        for (functions.items) |function| alloc.free(function.schema);
+        functions.deinit(alloc);
+    }
     try select_functions(alloc, &functions, request.tools, request.tool_choice);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -154,10 +158,12 @@ fn append_function(
         .builtin => |object| std.json.Stringify.value(object, .{}, &buffer.writer) catch return error.OutOfMemory,
         .dynamic => |value| std.json.Stringify.value(value, .{}, &buffer.writer) catch return error.OutOfMemory,
     }
+    const schema_json = try buffer.toOwnedSlice();
+    errdefer alloc.free(schema_json);
     try out.append(alloc, .{
         .name = name,
         .description = description,
-        .schema = try buffer.toOwnedSlice(),
+        .schema = schema_json,
     });
 }
 
@@ -372,6 +378,7 @@ pub const Reducer = struct {
     blocks: std.ArrayList(Block) = .empty,
     usage: types.Usage = .{},
     finished: bool = false,
+    finish_reason: ?types.ProviderFinishReason = null,
 
     pub const Block = struct {
         kind: Kind = .unknown,
@@ -380,6 +387,7 @@ pub const Reducer = struct {
         name: std.ArrayList(u8) = .empty,
         /// The `input` JSON assembled from `input_json_delta` fragments.
         input: std.ArrayList(u8) = .empty,
+        input_delta_started: bool = false,
         /// For a `thinking` block: the reasoning text.
         thinking: std.ArrayList(u8) = .empty,
 
@@ -455,6 +463,7 @@ pub const Reducer = struct {
         const block_object = block_value.object;
         const kind_name = fieldString(block_object, "type") orelse "";
         var block = Block{};
+        errdefer block.deinit(alloc);
         if (std.mem.eql(u8, kind_name, "text")) {
             block.kind = .text;
             if (fieldString(block_object, "text")) |initial| {
@@ -483,7 +492,13 @@ pub const Reducer = struct {
         }
         const block = try self.blockAt(alloc, index);
         if (std.mem.eql(u8, kind_name, "input_json_delta")) {
-            if (fieldString(delta.object, "partial_json")) |partial| try block.input.appendSlice(alloc, partial);
+            if (fieldString(delta.object, "partial_json")) |partial| {
+                if (!block.input_delta_started) {
+                    block.input.clearRetainingCapacity();
+                    block.input_delta_started = true;
+                }
+                try block.input.appendSlice(alloc, partial);
+            }
         } else if (std.mem.eql(u8, kind_name, "thinking_delta")) {
             if (fieldString(delta.object, "thinking")) |text| try block.thinking.appendSlice(alloc, text);
         }
@@ -492,6 +507,9 @@ pub const Reducer = struct {
     fn applyMessageDelta(self: *Reducer, object: std.json.ObjectMap) void {
         const delta = object.get("delta") orelse return;
         if (delta != .object) return;
+        if (fieldString(delta.object, "stop_reason")) |reason| {
+            self.finish_reason = if (std.mem.eql(u8, reason, "max_tokens")) .length else if (std.mem.eql(u8, reason, "tool_use")) .tool_calls else if (std.mem.eql(u8, reason, "refusal")) .content_filter else .stop;
+        }
         const usage = object.get("usage") orelse return;
         if (usage != .object) return;
         self.usage.output_tokens = readCount(usage.object, "output_tokens") orelse self.usage.output_tokens;
@@ -499,12 +517,14 @@ pub const Reducer = struct {
     }
 
     fn setBlock(self: *Reducer, alloc: Allocator, index: usize, block: Block) !void {
+        if (index >= max_content_blocks) return error.InvalidChunk;
         while (self.blocks.items.len <= index) try self.blocks.append(alloc, .{});
         self.blocks.items[index].deinit(alloc);
         self.blocks.items[index] = block;
     }
 
     fn blockAt(self: *Reducer, alloc: Allocator, index: usize) !*Block {
+        if (index >= max_content_blocks) return error.InvalidChunk;
         while (self.blocks.items.len <= index) try self.blocks.append(alloc, .{});
         return &self.blocks.items[index];
     }
@@ -530,9 +550,13 @@ pub const Reducer = struct {
                     else
                         try alloc.dupe(u8, block.input.items);
                     errdefer alloc.free(arguments_json);
+                    const id = try alloc.dupe(u8, block.id.items);
+                    errdefer alloc.free(id);
+                    const name = try alloc.dupe(u8, block.name.items);
+                    errdefer alloc.free(name);
                     try calls.append(alloc, .{
-                        .id = try alloc.dupe(u8, block.id.items),
-                        .name = try alloc.dupe(u8, block.name.items),
+                        .id = id,
+                        .name = name,
                         .arguments_json = arguments_json,
                     });
                 },
@@ -545,7 +569,7 @@ pub const Reducer = struct {
             .ownership = .owned,
             .completion = .{
                 .content = text,
-                .finish_reason = if (calls.items.len > 0) .tool_calls else .stop,
+                .finish_reason = self.finish_reason orelse if (calls.items.len > 0) .tool_calls else .stop,
                 .tool_calls = try calls.toOwnedSlice(alloc),
                 .usage = self.usage,
             },
@@ -582,4 +606,51 @@ fn appendJsonValue(alloc: Allocator, out: *std.ArrayList(u8), value: std.json.Va
     defer writer.deinit();
     std.json.Stringify.value(value, .{}, &writer.writer) catch return error.OutOfMemory;
     try out.appendSlice(alloc, writer.written());
+}
+
+test "Anthropic streamed tool arguments replace the empty start input and preserve output limits" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    try reducer.applyJson(alloc,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}}
+    );
+    try reducer.applyJson(alloc,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}
+    );
+    try reducer.applyJson(alloc,
+        \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}
+    );
+    try reducer.applyJson(alloc, "{\"type\":\"message_stop\"}");
+    var result = try reducer.finish(alloc, false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", result.completed.completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ProviderFinishReason.length, result.completed.completion.finish_reason.?);
+}
+
+test "Anthropic rejects an unbounded content block index" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    try std.testing.expectError(error.InvalidChunk, reducer.applyJson(alloc,
+        \\{"type":"content_block_start","index":4294967295,"content_block":{"type":"text","text":""}}
+    ));
+    try std.testing.expectEqual(@as(usize, 0), reducer.blocks.items.len);
+}
+
+test "Anthropic releases serialized tool schemas on every allocation failure" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const body = try build_request(alloc, .{
+                .model = "test-model",
+                .messages = &.{.{ .role = .user, .content = "hello" }},
+                .tool_choice = .auto,
+                .provider_options = .{},
+                .tools = .{ .additional_functions = &.{.{ .name = "test_tool", .description = "test", .input_schema = .{} }} },
+            }, .{});
+            defer alloc.free(body);
+            try std.testing.expect(std.mem.find(u8, body, "test_tool") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(@import("../core/shared/testing_allocator.zig").no_resize, Probe.run, .{});
 }
