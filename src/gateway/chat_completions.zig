@@ -1,6 +1,8 @@
 const std = @import("std");
 const codec = @import("chat_completions_protocol.zig");
 const anthropic = @import("anthropic_messages.zig");
+const responses = @import("responses_protocol.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const client_mod = @import("client.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
@@ -76,11 +78,81 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
     return switch (definition.protocol) {
         .@"openai-chat-completions" => codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity }),
         .@"anthropic-messages" => anthropic.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity }),
-        // The Responses protocol has its own encoder in `responses_protocol`; a
-        // configured provider does not reach it yet, so the request is refused
-        // rather than sent in a shape the endpoint would reject.
-        .@"openai-responses" => error.UnsupportedConfiguredProtocol,
+        .@"openai-responses" => build_responses_request(alloc, request, identity),
     };
+}
+
+/// Replay limits for a configured provider's Responses request. The numbers
+/// match what the subscription providers accept, which is the same shape the
+/// endpoint reads.
+const configured_replay_limits = responses.ReplayLimits{
+    .tool_calls = 128,
+    .tool_identity_bytes = 256,
+    .tool_arguments_bytes = 4096,
+    .provider_state_bytes = 4096,
+};
+
+/// The request body for a configured provider that speaks the Responses
+/// protocol. The wire shape is the one `openai_codex` already sends, minus the
+/// parts that only a subscription makes sense of: no stored conversation, no
+/// encrypted reasoning include, and no priority service tier.
+fn build_responses_request(
+    alloc: Allocator,
+    request: streams.RequestData,
+    identity: model_provider.ProviderId,
+) ![]u8 {
+    try request.validatePrompt();
+    const budget: image_attachments.CaptureBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        .{};
+
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{
+        .provider = identity,
+        .model = request.model,
+    });
+    defer if (projected) |messages| alloc.free(messages);
+
+    var instructions: std.Io.Writer.Allocating = .init(alloc);
+    defer instructions.deinit();
+    for (request.instructions) |instruction| {
+        const text = instruction.content orelse continue;
+        if (text.len == 0) continue;
+        if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
+        try instructions.writer.writeAll(text);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"model\":");
+    try std.json.Stringify.value(request.model, .{}, writer);
+    try writer.writeAll(",\"store\":false,\"stream\":true");
+    if (instructions.written().len > 0) {
+        try writer.writeAll(",\"instructions\":");
+        try std.json.Stringify.value(instructions.written(), .{}, writer);
+    }
+    try writer.writeAll(",\"input\":[");
+    try responses.writeInput(
+        writer,
+        std.heap.c_allocator,
+        projected orelse request.messages,
+        request.verified_images,
+        configured_replay_limits,
+        budget,
+    );
+    try writer.writeByte(']');
+
+    _ = try responses.writeTools(writer, alloc, request.tools);
+    try writer.writeAll(",\"tool_choice\":");
+    try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+    try writer.writeAll(",\"parallel_tool_calls\":true");
+    if (request.max_output_tokens) |max| {
+        try writer.writeAll(",\"max_output_tokens\":");
+        try writer.print("{d}", .{max});
+    }
+    try writer.writeAll("}");
+    return out.toOwnedSlice();
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -264,6 +336,56 @@ pub fn consumeAnthropic(alloc: Allocator, reader: *std.Io.Reader, request: strea
         if (reducer.finished) break;
     }
     return reducer.finish(alloc, request.cancel_flag.load(.seq_cst));
+}
+
+/// Default stream bounds for a configured provider's Responses reply. They
+/// match what the streaming codec already allows the other protocols, so a
+/// provider cannot make fx allocate without bound by sending a large reply.
+const configured_stream_limits = responses.StreamLimits{
+    .aggregate_bytes = 32 * 1024 * 1024,
+    .events = 100_000,
+    .tool_calls = 128,
+    .tool_identity_bytes = 256,
+    .tool_arguments_bytes = 1024 * 1024,
+    .provider_state_bytes = types.ProviderReplay.max_bytes,
+};
+
+/// Parses a streamed Responses reply. The shape differs enough from
+/// chat-completions - typed events, an output array, tool items that arrive as
+/// their own events - that the protocol has its own reducer, so the configured
+/// provider has to read it with that one rather than the chat decoder.
+pub fn consumeResponses(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+    var reducer = responses.Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var reader_sse: sse.Reader = .{};
+    defer reader_sse.deinit(alloc);
+
+    // `EventSink` already adapts its context to these callback shapes, which is
+    // the same adapter the chat and Anthropic decoders use.
+    const callbacks = responses.StreamCallbacks{
+        .context = @ptrCast(@constCast(&request.events)),
+        .on_content = streams.EventSink.onContentChunk,
+        .on_tool_start = streams.EventSink.onToolStart,
+        .on_reasoning = streams.EventSink.onReasoningChunk,
+        .on_tool_input = streams.EventSink.onToolInputChunk,
+    };
+
+    const cancel_flag = request.cancel_flag;
+    const completion = completion: {
+        while (reader_sse.next(alloc, reader, cancel_flag) catch |err| return err) |json_text| {
+            if (std.mem.eql(u8, json_text, "[DONE]")) break;
+            if (reducer.applyJson(
+                alloc,
+                json_text,
+                callbacks,
+                cancel_flag,
+                request.content_capture_limit,
+                configured_stream_limits,
+            ) catch |err| return err) break;
+        }
+        break :completion reducer.finish(alloc, cancel_flag, configured_stream_limits) catch |err| return err;
+    };
+    return .{ .completed = .{ .completion = completion, .ownership = .owned } };
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.

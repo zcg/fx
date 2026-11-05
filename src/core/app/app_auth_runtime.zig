@@ -792,6 +792,9 @@ pub fn Runtime(comptime App: type) type {
                     3, 4 => app.auth.cancelAddProvider(app.alloc),
                     '\r', '\n' => try submitAddProviderField(app, agent),
                     8, 127 => _ = app.auth.deleteAddProviderByte(),
+                    // A pasted key is long, so clearing the field has to be one
+                    // keystroke rather than a hundred backspaces.
+                    21 => _ = app.auth.clearAddProviderField(),
                     else => _ = try app.auth.appendAddProviderByte(app.alloc, byte),
                 }
                 app.shell.render_requests.request(.footer);

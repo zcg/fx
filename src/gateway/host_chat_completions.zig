@@ -93,7 +93,13 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
-    const result = chat_completions.consume(alloc, &reader.interface, request, null) catch |err| switch (err) {
+    // Each protocol frames its reply differently, so the decoder follows the
+    // definition rather than assuming the chat-completions shape.
+    const result = switch (definition.protocol) {
+        .@"openai-chat-completions" => chat_completions.consume(alloc, &reader.interface, request, null),
+        .@"anthropic-messages" => chat_completions.consumeAnthropic(alloc, &reader.interface, request),
+        .@"openai-responses" => chat_completions.consumeResponses(alloc, &reader.interface, request),
+    } catch |err| switch (err) {
         error.ReadFailed => return host_stream.readFailure(&reader, request.cancel_flag),
         else => return err,
     };

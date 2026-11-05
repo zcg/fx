@@ -613,7 +613,7 @@ pub const AddProviderDraft = struct {
 };
 
 /// The add-provider flow's gathered state, for rendering only: every field is
-/// borrowed, and the key is represented by its length, never its bytes.
+/// borrowed from the draft.
 pub const AddProviderProjection = struct {
     field: AddProviderField,
     name: []const u8,
@@ -622,11 +622,11 @@ pub const AddProviderProjection = struct {
     env: []const u8,
     /// Index of the selected preset row, or null on the custom row.
     preset_index: ?usize,
-    key_mask_count: usize,
+    /// The key as typed, shown in full. A pasted key is the user's own value on
+    /// the user's own screen, and masking it hides the one thing they need to
+    /// see when a provider refuses it: whether the paste landed whole.
+    key: []const u8,
 };
-
-/// How many glyphs the masked key field shows; longer keys show this many.
-const max_add_provider_key_mask_glyphs = 24;
 
 pub const ApiKeySaveStart = enum {
     started,
@@ -2604,7 +2604,7 @@ pub const Runtime = struct {
                     .protocol = draft.protocol,
                     .env = draft.env,
                     .preset_index = draft.preset_index,
-                    .key_mask_count = @min(draft.key.items.len, max_add_provider_key_mask_glyphs),
+                    .key = draft.key.items,
                 }
             else
                 null,
@@ -2788,7 +2788,7 @@ pub const Runtime = struct {
             .protocol = draft.protocol,
             .env = draft.env,
             .preset_index = draft.preset_index,
-            .key_mask_count = @min(draft.key.items.len, max_add_provider_key_mask_glyphs),
+            .key = draft.key.items,
         };
     }
 
@@ -2805,6 +2805,24 @@ pub const Runtime = struct {
             .preset, .protocol => return false,
             .api_key => {
                 if (draft.key.items.len < 4096) try draft.key.append(alloc, byte);
+            },
+        }
+        return true;
+    }
+
+    /// Clears the field being edited. A pasted key is long enough that deleting
+    /// it one byte at a time is not a way to replace it, so the whole field is
+    /// clearable at once. The key is zeroed rather than just truncated: it is a
+    /// secret, and a shorter length must not leave the bytes readable.
+    pub fn clearAddProviderField(self: *Self) bool {
+        const draft = &(self.add_provider_draft orelse return false);
+        switch (draft.field) {
+            .name => draft.name.clearRetainingCapacity(),
+            .base_url => draft.base_url.clearRetainingCapacity(),
+            .preset, .protocol => return false,
+            .api_key => {
+                std.crypto.secureZero(u8, @volatileCast(draft.key.items));
+                draft.key.clearRetainingCapacity();
             },
         }
         return true;
@@ -6010,7 +6028,7 @@ test "add provider flow pre-fills from a preset and finishes on the key" {
 
     // Enter on the key field completes the flow so the caller can save it.
     _ = try runtime.appendAddProviderByte(alloc, 'k');
-    try std.testing.expect(runtime.addProviderDraftView().?.key_mask_count == 1);
+    try std.testing.expectEqualStrings("k", runtime.addProviderDraftView().?.key);
     try std.testing.expectEqual(AddProviderField.api_key, runtime.advanceAddProvider(alloc).?);
 
     runtime.cancelAddProvider(alloc);

@@ -713,20 +713,22 @@ fn composeAddProviderPickerRow(
                     try row_text.appendClipped(alloc, &row, label, width);
                 },
                 2 => {
-                    // The key field shows its masked length; other fields show
-                    // where the value goes.
+                    // The key is shown as typed. It is the user's own value on
+                    // their own screen, and seeing it is how they tell whether a
+                    // paste arrived whole before it is saved.
                     if (draft.field == .api_key) {
                         try row_text.appendClipped(alloc, &row, "   ┃ ", width);
-                        if (draft.key_mask_count == 0) {
+                        if (draft.key.len == 0) {
                             try row_text.appendClipped(alloc, &row, "Paste a key, or leave empty if already in the environment", width -| 5);
                         } else {
-                            for (0..@min(draft.key_mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
+                            try row_text.appendClipped(alloc, &row, draft.key, width -| 5);
+                            try row.appendSlice(alloc, "▏");
                         }
                     } else {
                         try row_text.appendClipped(alloc, &row, "   enter continues     esc cancels", width);
                     }
                 },
-                3 => try row_text.appendClipped(alloc, &row, "   The key is saved to the credential store, never to settings", width),
+                3 => try row_text.appendClipped(alloc, &row, "   ctrl+u clears     the key is saved to the credential store, never to settings", width),
                 else => {},
             }
         },
