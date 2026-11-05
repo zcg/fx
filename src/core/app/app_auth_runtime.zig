@@ -1431,6 +1431,10 @@ pub fn Runtime(comptime App: type) type {
             try startProviderSwitch(app, agent, target, allow_login, intent, null);
         }
 
+        pub fn switchProviderModel(app: *App, agent: *AppAgent, target: model_provider.ProviderId, model: []const u8) !void {
+            try startProviderSwitchToModel(app, agent, target, false, .manual, null, model);
+        }
+
         fn startProviderSwitch(
             app: *App,
             agent: *AppAgent,
@@ -1438,6 +1442,18 @@ pub fn Runtime(comptime App: type) type {
             allow_login: bool,
             intent: ProviderSwitchIntent,
             fallback: ?model_provider.ProviderId,
+        ) !void {
+            try startProviderSwitchToModel(app, agent, target, allow_login, intent, fallback, null);
+        }
+
+        fn startProviderSwitchToModel(
+            app: *App,
+            agent: *AppAgent,
+            target: model_provider.ProviderId,
+            allow_login: bool,
+            intent: ProviderSwitchIntent,
+            fallback: ?model_provider.ProviderId,
+            selected_model: ?[]const u8,
         ) !void {
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "providerCatalog") or
@@ -1502,7 +1518,7 @@ pub fn Runtime(comptime App: type) type {
                 .catalog_provider = catalog_provider,
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
-                .primary_model = if (intent == .post_oauth and provider_runtime.providerOf(app, agent).eql(target)) provider_runtime.modelOf(app, agent) else null,
+                .primary_model = selected_model orelse if (intent == .post_oauth and provider_runtime.providerOf(app, agent).eql(target)) provider_runtime.modelOf(app, agent) else null,
                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
             });
         }
@@ -1656,6 +1672,18 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
+            if (task.input.primary_model) |selected| {
+                if (intent == .manual and selectCatalogModel(catalog.items, selected, null) != null and
+                    !std.mem.eql(u8, selected, selectCatalogModel(catalog.items, selected, null).?))
+                {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = "The selected model is no longer available. Refresh /model and choose another model.",
+                    }, true);
+                    return false;
+                }
+            }
             const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",

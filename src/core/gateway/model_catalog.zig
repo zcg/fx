@@ -149,6 +149,8 @@ pub const Provider = struct {
     /// When set, context must outlive every in-flight fetch and capability lookup.
     context: ?*anyopaque = null,
     fetch_fn: FetchFn,
+    /// Reads a saved catalog without a network request. Caller owns the result.
+    fetch_cached_fn: ?*const fn (?*anyopaque, Allocator) Allocator.Error!?std.ArrayList(ModelCatalogEntry) = null,
     /// Reads already-owned metadata without allocation, I/O, or waiting.
     lookup_capabilities_fn: ?*const fn (?*anyopaque, []const u8) model_capabilities.Capabilities = null,
     provider_id: model_provider.ProviderId = .gateway,

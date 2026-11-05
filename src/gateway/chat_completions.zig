@@ -42,6 +42,7 @@ pub fn model_catalog_provider(definition: *const definitions.Definition) catalog
     return .{
         .context = context,
         .fetch_fn = fetch_catalog,
+        .fetch_cached_fn = fetch_cached_catalog,
         .lookup_capabilities_fn = lookup_capabilities,
         .provider_id = bound_identity(definition),
         // A configured provider's list is the vendor's own, and vendors add
@@ -411,6 +412,24 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
     return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+}
+
+fn fetch_cached_catalog(raw: ?*anyopaque, alloc: Allocator) Allocator.Error!?std.ArrayList(catalog.ModelCatalogEntry) {
+    const definition = definition_at(raw);
+    const body = (listing_cache.load(alloc, definition) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    }) orelse return null;
+    defer alloc.free(body);
+    var listing = model_listing.parse(alloc, body) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+    defer listing.deinit();
+    var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
+    errdefer catalog.freeModelCatalog(alloc, &entries);
+    try model_listing.mergeInto(alloc, definition, listing, &entries);
+    return entries;
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {

@@ -33,6 +33,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const approval_decision = @import("../permissions/approval_decision.zig");
@@ -2047,6 +2048,17 @@ pub fn Runtime(comptime App: type) type {
         fn openModelMenu(app: *App) !void {
             if (comptime @hasDecl(App, "revalidateModelCache")) app.revalidateModelCache();
             try app.model_cache.openMenu();
+            try restoreModelMenuConnections(app);
+        }
+
+        fn restoreModelMenuConnections(app: *App) !void {
+            if (comptime !@hasField(App, "provider_selection") or !@hasDecl(App, "providerCatalog")) return;
+            for (app.provider_selection.definitions.definitions) |definition| {
+                if (definition.auth == .bearer and definition.auth.bearer.len == 0) continue;
+                const target = (model_provider.parse(definition.id) orelse continue).bind(app.provider_selection.definitions) catch continue;
+                const provider = app.providerCatalog(target) orelse continue;
+                try app.model_cache.restoreMenuCatalog(provider);
+            }
         }
 
         /// Opens the model picker at the end of adding a provider. The catalog
@@ -2058,6 +2070,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "model_cache")) return;
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
             try app.model_cache.openMenu();
+            try restoreModelMenuConnections(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
@@ -2244,7 +2257,11 @@ pub fn Runtime(comptime App: type) type {
         fn applyInlineSettingsModelSelection(app: *App, agent: *AppAgent) !void {
             const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
             defer app.alloc.free(selected);
-            try switchToSelectedConnection(app, agent);
+            if (try switchToSelectedConnection(app, agent, selected)) {
+                app.model_cache.closeMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             try session_commands.Commands(App).selectModelFromPicker(
                 app,
                 agent,
@@ -2262,15 +2279,16 @@ pub fn Runtime(comptime App: type) type {
         /// lists several connections' catalogs together, so choosing a row has
         /// to bring its connection with it; otherwise the model would be sent
         /// to a provider that has never heard of it.
-        fn switchToSelectedConnection(app: *App, agent: *AppAgent) !void {
+        fn switchToSelectedConnection(app: *App, agent: *AppAgent, model: []const u8) !bool {
             // The name is borrowed from the menu, and switching providers can
             // rebuild the menu, so it is copied before the call that may do so.
-            const borrowed = app.model_cache.menu.selectedConnection() orelse return;
+            const borrowed = app.model_cache.menu.selectedConnection() orelse return false;
             const connection = try app.alloc.dupe(u8, borrowed);
             defer app.alloc.free(connection);
-            const target = provider_picker_runtime.Runtime(App).resolveProvider(app, connection) orelse return;
-            if (provider_runtime.providerOf(app, agent).eql(target)) return;
-            try app_auth_runtime.Runtime(App).switchProvider(app, agent, target, false, .manual);
+            const target = provider_picker_runtime.Runtime(App).resolveProvider(app, connection) orelse return false;
+            if (provider_runtime.providerOf(app, agent).eql(target)) return false;
+            try app_auth_runtime.Runtime(App).switchProviderModel(app, agent, target, model);
+            return true;
         }
 
         fn submitSettingsMenuSelection(app: *App, agent: *AppAgent) !bool {
@@ -2527,7 +2545,8 @@ pub fn Runtime(comptime App: type) type {
             if (connection_owned) |name| {
                 if (provider_picker_runtime.Runtime(App).resolveProvider(app, name)) |target| {
                     if (!provider_runtime.providerOf(app, agent).eql(target)) {
-                        try app_auth_runtime.Runtime(App).switchProvider(app, agent, target, false, .manual);
+                        try app_auth_runtime.Runtime(App).switchProviderModel(app, agent, target, selected);
+                        return true;
                     }
                 }
             }
@@ -2779,7 +2798,15 @@ pub fn Runtime(comptime App: type) type {
         fn cycleModelMenuProvider(app: *App, delta: i32) bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            _ = app.model_cache.menu.moveProvider(delta);
+            if (app.model_cache.menu.moveProvider(delta)) {
+                if (comptime @hasDecl(App, "providerCatalog") and @hasField(App, "provider_selection")) {
+                    if (app.model_cache.menu.providerFilter()) |name| {
+                        if (provider_picker_runtime.Runtime(App).resolveProvider(app, name)) |target| {
+                            if (app.providerCatalog(target)) |provider| app.model_cache.startMenuWarmup(provider);
+                        }
+                    }
+                }
+            }
             return true;
         }
 

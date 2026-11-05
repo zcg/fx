@@ -209,7 +209,7 @@ const ProviderTabs = struct {
         var result: ProviderTabs = .{};
         for (tabs, 0..) |tab, index| {
             if (result.len >= result.indices.len) break;
-            if (tab.count == 0) continue;
+            _ = tab;
             result.indices[result.len] = index;
             result.len += 1;
         }
@@ -420,7 +420,7 @@ fn appendMetadataFact(alloc: Allocator, text: *std.ArrayList(u8), fact: []const 
 }
 
 fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16) !std.ArrayList(u8) {
-    const text = switch (projection.load_state) {
+    const text = if (projection.refreshing and projection.filteredItemCount() == 0) "Loading models…" else switch (projection.load_state) {
         .loading => "Loading models…",
         .failed => retryableFailureText(projection.catalog_state.failure) orelse "Unable to load models.",
         .ready => if (projection.items.len == 0) "No models available." else "No models found.",

@@ -300,8 +300,6 @@ pub const ModelMenu = struct {
             next += direction;
             if (next < 0) next = @as(i32, @intCast(tab_count)) - 1;
             if (next >= @as(i32, @intCast(tab_count))) next = 0;
-            const tab = self.provider_tabs.items[@intCast(next)];
-            if (tab.count == 0) continue;
             if (next == current) return false;
             self.provider_index = @intCast(next);
             self.selected_index = 0;
@@ -342,48 +340,39 @@ pub const ModelMenu = struct {
         self.provider_tabs = .empty;
     }
 
+    pub fn ensureProviderTab(self: *ModelMenu, alloc: Allocator, name: []const u8) Allocator.Error!usize {
+        if (self.provider_tabs.items.len == 0) try self.provider_tabs.append(alloc, .{ .count = self.items.items.len });
+        for (self.provider_tabs.items, 0..) |tab, index| {
+            if (tab.name) |existing| if (std.mem.eql(u8, existing, name)) return index;
+        }
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try self.provider_tabs.append(alloc, .{ .name = owned });
+        return self.provider_tabs.items.len - 1;
+    }
+
     /// Rebuilds the tabs from the rows: `All` first, then one per connection
     /// that has at least one model, in the order the rows first name them. The
     /// string for each name is owned here, once, and every row from that
     /// connection points at it, so the menu holds one name per connection
     /// rather than one per model.
     pub fn rebuildTabs(self: *ModelMenu, alloc: Allocator, previous: ?[]const u8) void {
-        // The rows borrow their name from the tabs, so the names have to be read
-        // before the old tabs are released. Collecting them first also means a
-        // row never keeps a pointer into freed memory.
-        var names: std.ArrayList([]const u8) = .empty;
-        defer names.deinit(alloc);
-        names.ensureTotalCapacity(alloc, self.items.items.len) catch return;
+        var next: ModelMenu = .{};
+        defer next.clearTabs(alloc);
+        next.provider_tabs.append(alloc, .{ .count = self.items.items.len }) catch return;
+        for (self.provider_tabs.items) |tab| {
+            if (tab.name) |name| _ = next.ensureProviderTab(alloc, name) catch return;
+        }
         for (self.items.items) |item| {
             if (item.provider.len == 0) continue;
-            var seen = false;
-            for (names.items) |existing| {
-                if (std.mem.eql(u8, existing, item.provider)) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) names.appendAssumeCapacity(item.provider);
-        }
-
-        self.clearTabs(alloc);
-        self.provider_tabs.append(alloc, .{ .name = null, .count = self.items.items.len }) catch return;
-        for (names.items) |name| {
-            const owned = alloc.dupe(u8, name) catch return;
-            var count: usize = 0;
-            for (self.items.items) |item| {
-                if (std.mem.eql(u8, item.provider, name)) count += 1;
-            }
-            self.provider_tabs.append(alloc, .{ .name = owned, .count = count }) catch {
-                alloc.free(owned);
-                return;
-            };
+            const index = next.ensureProviderTab(alloc, item.provider) catch return;
+            next.provider_tabs.items[index].count += 1;
         }
         // Point every row at the copy the tab owns, so freeing the tabs is the
         // only thing that decides those names' lifetime.
         for (self.items.items) |*item| {
             if (item.provider.len == 0) continue;
-            for (self.provider_tabs.items) |tab| {
+            for (next.provider_tabs.items) |tab| {
                 const owned = tab.name orelse continue;
                 if (!std.mem.eql(u8, owned, item.provider)) continue;
                 item.provider = owned;
@@ -391,15 +380,19 @@ pub const ModelMenu = struct {
             }
         }
         // Keep the tab the user was on when it still exists, else `All`.
-        self.provider_index = 0;
+        var selected: usize = 0;
         if (previous) |name| {
-            for (self.provider_tabs.items, 0..) |tab, index| {
+            for (next.provider_tabs.items, 0..) |tab, index| {
                 const candidate = tab.name orelse continue;
                 if (!std.mem.eql(u8, candidate, name)) continue;
-                self.provider_index = index;
+                selected = index;
                 break;
             }
         }
+        self.clearTabs(alloc);
+        self.provider_tabs = next.provider_tabs;
+        next.provider_tabs = .empty;
+        self.provider_index = selected;
     }
 };
 
@@ -429,8 +422,10 @@ fn modelMenuDisplayIndex(
     provider_filter: ?[]const u8,
     query: []const u8,
     id: []const u8,
+    connection: ?[]const u8,
 ) ?usize {
     const position = for (items, 0..) |item, position| {
+        if (connection) |name| if (!std.mem.eql(u8, item.provider, name)) continue;
         if (std.mem.eql(u8, item.id, id)) break position;
     } else return null;
     return modelMenuRanking(items, provider_filter, query).rankOf(position);
@@ -525,6 +520,7 @@ pub const Runtime = struct {
     /// the same reason `refresh_pending` is: the refresh rebuilds the menu.
     previous_ids: std.ArrayList([]u8) = .empty,
     menu: ModelMenu = .{},
+    menu_loader: ?*Self = null,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -535,6 +531,11 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Self) void {
         self.cancelAndJoin();
+        if (self.menu_loader) |loader| {
+            loader.deinit();
+            self.alloc.destroy(loader);
+            self.menu_loader = null;
+        }
         self.discardStagedLocked();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
@@ -794,7 +795,31 @@ pub const Runtime = struct {
     }
 
     pub fn closeMenu(self: *Self) void {
+        if (self.menu_loader) |loader| loader.cancelAndJoin();
         self.menu.deinit(self.alloc);
+    }
+
+    pub fn restoreMenuCatalog(self: *Self, provider: model_catalog.Provider) !void {
+        _ = try self.menu.ensureProviderTab(self.alloc, provider.provider_id.label());
+        self.menu.load_state = .ready;
+        self.menu.refreshing = self.menu.refreshing or fetchInFlight(self);
+        if (std.mem.eql(u8, provider.provider_id.label(), self.providerLabel()) and self.state == .ready) return;
+        const fetch_cached = provider.fetch_cached_fn orelse return;
+        var entries = (try fetch_cached(provider.context, self.alloc)) orelse return;
+        defer model_catalog.freeModelCatalog(self.alloc, &entries);
+        try mergeMenuSnapshot(self.alloc, &self.menu, entries.items, provider.provider_id.label(), &.{});
+    }
+
+    pub fn startMenuWarmup(self: *Self, provider: model_catalog.Provider) void {
+        const loader = self.menu_loader orelse blk: {
+            const created = self.alloc.create(Self) catch return;
+            created.* = Self.init(self.alloc, self.models_path);
+            self.menu_loader = created;
+            break :blk created;
+        };
+        if (!std.mem.eql(u8, loader.providerLabel(), provider.provider_id.label())) loader.resetForProviderChange();
+        loader.startWarmup(provider, .{ .public_only = .no_credential }, .picker_open);
+        self.menu.refreshing = fetchInFlight(loader);
     }
 
     pub fn setMenuQuery(self: *Self, query: []const u8) void {
@@ -804,6 +829,19 @@ pub const Runtime = struct {
     /// The owner's publication boundary: adopts a staged revalidation and
     /// refreshes an open menu. Call it where no borrowed catalog id is held.
     pub fn pollLoadTransition(self: *Self) !bool {
+        var menu_changed = false;
+        if (self.menu_loader) |loader| {
+            if (try loader.pollLoadTransition()) {
+                if (self.menu.active) {
+                    if (loader.state == .ready) try mergeMenuSnapshot(self.alloc, &self.menu, loader.catalog.items, loader.providerLabel(), &.{});
+                    if (self.menu.providerFilter()) |name| {
+                        if (std.mem.eql(u8, name, loader.providerLabel())) self.menu.catalog_state = modelMenuCatalogState(loader.outcome, loader.from_profile_settings);
+                    }
+                    self.menu.refreshing = false;
+                    menu_changed = true;
+                }
+            }
+        }
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -811,13 +849,13 @@ pub const Runtime = struct {
             self.staged = null;
             self.applyFetchLocked(staged).record();
         }
-        if (!self.completion_pending) return false;
+        if (!self.completion_pending) return menu_changed;
 
         if (self.menu.active) try self.refreshMenuLocked(&self.menu);
         // A refresh the user asked for ends here, whatever it produced: the
         // rows are in place, so the header must stop saying "refreshing".
         self.refresh_pending = false;
-        self.menu.refreshing = false;
+        self.menu.refreshing = if (self.menu_loader) |loader| fetchInFlight(loader) else false;
         self.completion_pending = false;
         return true;
     }
@@ -1076,6 +1114,7 @@ pub const Runtime = struct {
     }
 
     pub fn cancelAndJoin(self: *Self) void {
+        if (self.menu_loader) |loader| loader.cancelAndJoin();
         self.cancel_requested.store(true, .seq_cst);
         // The worker thread can join through `finishThreadIfDone`, so the
         // handle changes hands only under the mutex.
@@ -1104,15 +1143,13 @@ pub const Runtime = struct {
         if (!menu.active) return;
         switch (self.state) {
             .idle, .loading => {
-                menu.clearSnapshot(self.alloc);
-                menu.load_state = .loading;
+                menu.load_state = if (menu.items.items.len > 0) .ready else .loading;
             },
             .failed => {
-                menu.clearSnapshot(self.alloc);
                 // A retry runs behind the failed state; the picker shows it.
-                menu.load_state = if (self.fetch_in_flight) .loading else .failed;
+                menu.load_state = if (menu.items.items.len > 0) .ready else if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(
+            .ready => try mergeMenuSnapshot(
                 self.alloc,
                 menu,
                 self.catalog.items,
@@ -1234,6 +1271,7 @@ const MenuCarry = struct {
     ready: bool,
     tab: ?[]u8,
     selected_id: ?[]u8,
+    selected_connection: ?[]u8,
     window: usize,
     selected: usize,
     query_len: usize,
@@ -1245,6 +1283,7 @@ const MenuCarry = struct {
             .ready = ready,
             .tab = null,
             .selected_id = null,
+            .selected_connection = null,
             .window = menu.window_start,
             .selected = menu.selected_index,
             .query_len = menu.query_len,
@@ -1254,13 +1293,17 @@ const MenuCarry = struct {
         errdefer carry.deinit(alloc);
         if (!ready) return carry;
         if (menu.providerFilter()) |name| carry.tab = try alloc.dupe(u8, name);
-        if (menu.itemAt(menu.selected_index)) |previous| carry.selected_id = try alloc.dupe(u8, previous.id);
+        if (menu.itemAt(menu.selected_index)) |previous| {
+            carry.selected_id = try alloc.dupe(u8, previous.id);
+            carry.selected_connection = try alloc.dupe(u8, previous.provider);
+        }
         return carry;
     }
 
     fn deinit(self: *MenuCarry, alloc: Allocator) void {
         if (self.tab) |name| alloc.free(name);
         if (self.selected_id) |id| alloc.free(id);
+        if (self.selected_connection) |name| alloc.free(name);
     }
 };
 
@@ -1274,7 +1317,10 @@ fn adoptMenuItems(
     carry: MenuCarry,
     previous_ids: []const []const u8,
 ) void {
+    const tabs = menu.provider_tabs;
+    menu.provider_tabs = .empty;
     menu.clearSnapshot(alloc);
+    menu.provider_tabs = tabs;
     menu.items = items;
     for (menu.items.items) |*item| markAdded(previous_ids, item);
     menu.query_len = carry.query_len;
@@ -1284,7 +1330,7 @@ fn adoptMenuItems(
     const filter = menu.providerFilter();
     const selected_index = if (!carry.ready) 0 else selected: {
         const id = carry.selected_id orelse break :selected 0;
-        if (modelMenuDisplayIndex(menu.items.items, filter, menu.query(), id)) |index| break :selected index;
+        if (modelMenuDisplayIndex(menu.items.items, filter, menu.query(), id, carry.selected_connection)) |index| break :selected index;
         const match_count = modelMenuFilteredItemCount(menu.items.items, filter, menu.query());
         break :selected @min(carry.selected, match_count -| 1);
     };
@@ -1305,7 +1351,8 @@ fn hydrateMenuSnapshot(
 ) !void {
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
-    const items = try buildMenuItems(alloc, catalog, connection);
+    const tab = try menu.ensureProviderTab(alloc, connection);
+    const items = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?);
     adoptMenuItems(alloc, menu, items, carry, previous_ids);
 }
 
@@ -1322,7 +1369,8 @@ fn mergeMenuSnapshot(
 ) !void {
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
-    const incoming = try buildMenuItems(alloc, catalog, connection);
+    const tab = try menu.ensureProviderTab(alloc, connection);
+    const incoming = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?);
     var items = incoming;
     errdefer {
         for (items.items) |*item| item.deinit(alloc);
@@ -1350,8 +1398,10 @@ fn mergeMenuSnapshot(
     // The rows the menu kept now belong to `kept`, so the menu must not still
     // name them: clearing that list before the append that can fail is what
     // keeps a failed append from freeing them twice.
+    menu.items.deinit(alloc);
     menu.items = .empty;
-    try kept.appendSlice(alloc, items.items);
+    kept.appendSliceAssumeCapacity(items.items);
+    items.deinit(alloc);
     items = .empty;
     adoptMenuItems(alloc, menu, kept, carry, previous_ids);
 }
