@@ -452,6 +452,20 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn handlePastedBytes(app: *App, agent: *AppAgent, bytes: []const u8, max_input_len: usize) !void {
+            // The add-provider walk reads its own fields, so a paste belongs to
+            // the field being edited rather than to the prompt behind it. A key
+            // or a URL arrives by paste, and dropping it into the composer both
+            // lost the value and made the flow look broken.
+            if (comptime @hasField(App, "auth")) {
+                if (app.auth.addProviderFlowActive()) {
+                    for (bytes) |byte| {
+                        if (byte == '\r' or byte == '\n' or byte == '\t') continue;
+                        _ = app.auth.appendAddProviderByte(app.alloc, byte) catch false;
+                    }
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
+            }
             var stage: ImagePasteStage = .{};
             defer stage.deinit(app.alloc);
 

@@ -1119,7 +1119,14 @@ pub fn Runtime(comptime App: type) type {
                         try openModelPickerShortcut(app);
                     }
                 },
-                .paste_start => dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app)),
+                // A picker that owns the keys also owns the paste: closing it
+                // here is what sent a pasted URL into the prompt and dropped
+                // the provider being set up.
+                .paste_start => {
+                    if (!pickerOwnsInput(app, agents.screenAgentOf(app))) {
+                        dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    }
+                },
                 .paste_end => {},
                 .remapped_byte => unreachable,
                 .escape => unreachable,
@@ -1811,9 +1818,24 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// True while a picker owns every keystroke and the composer under it
+        /// must not react. The add-provider walk is the case that needs it: it
+        /// takes the bytes itself, so anything that edits the composer closes
+        /// the very flow the bytes are going to.
+        fn pickerOwnsInput(app: *App, agent: *AppAgent) bool {
+            _ = agent;
+            if (comptime !@hasField(App, "auth")) return false;
+            if (!app.auth.pickerView().active) return false;
+            return app.auth.addProviderFlowActive();
+        }
+
         fn dismissAuthPickerForComposerEdit(app: *App, agent: *AppAgent) bool {
             if (comptime !@hasField(App, "auth")) return false;
             if (!app.auth.pickerView().active) return false;
+            // A composer edit must not close a flow that is reading the
+            // keystrokes: doing so sent a pasted value into the prompt and
+            // dropped the provider half typed.
+            if (app.auth.addProviderFlowActive()) return false;
             cancelPromptRetryAfterAuth(app, agent);
             app.auth.closePicker(app.alloc);
             return true;

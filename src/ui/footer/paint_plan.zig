@@ -1032,6 +1032,23 @@ pub fn composeFooterFrame(
 
     frame.cursor = .{ .row = cursor_row, .col = cursor_col };
     if (!input.input_visible) frame.cursor_visible = false;
+    // The add-provider walk draws its own fields, so the cursor belongs on the
+    // field it is editing rather than nowhere at all. Without this the panel had
+    // no caret and every field had to be typed blind.
+    if (input.ctx.auth_picker.active and input.ctx.auth_picker.stage == .add_provider) {
+        if (input.ctx.auth_picker.add_provider) |draft| {
+            if (draft.field != .preset) {
+                frame.cursor = .{
+                    .row = rows.picker_start +| 2,
+                    .col = @intCast(@min(
+                        shell.layout.cols,
+                        3 + draft.valueLen(),
+                    )),
+                };
+                frame.cursor_visible = true;
+            }
+        }
+    }
     return frame;
 }
 

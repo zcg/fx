@@ -621,6 +621,19 @@ pub const AddProviderProjection = struct {
     /// the user's own screen, and masking it hides the one thing they need to
     /// see when a provider refuses it: whether the paste landed whole.
     key: []const u8,
+
+    /// How many characters the field being edited holds, so the caret can be
+    /// placed after them.
+    pub fn valueLen(self: AddProviderProjection) u16 {
+        const raw = switch (self.field) {
+            .name => self.name.len,
+            .base_url => self.base_url.len,
+            .protocol => self.protocol.len,
+            .api_key => self.key.len,
+            .preset => 0,
+        };
+        return @intCast(@min(raw, std.math.maxInt(u16)));
+    }
 };
 
 pub const ApiKeySaveStart = enum {
