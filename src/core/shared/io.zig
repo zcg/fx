@@ -901,7 +901,9 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
         setPermissions(dir, private_dir_permissions) catch return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateDirectory(dir);
-    if (created) try syncVerifiedDir(parent);
+    if (comptime builtin.target.os.tag != .windows) {
+        if (created) try syncVerifiedDir(parent);
+    }
     return .{ .dir = dir };
 }
 
@@ -1065,7 +1067,7 @@ pub fn durableReplaceVerifiedWithOps(
     // `OPEN_REPARSE_POINT`, and any later query on such a handle fails with
     // `STATUS_REPARSE_POINT_NOT_RESOLVED`, which would report a successful write
     // as an indeterminate one.
-    const final_stat = dir.dir.statFile(getIo(), name, .{ .follow_symlinks = modeIsEnforced }) catch {
+    const final_stat = dir.dir.statFile(getIo(), name, .{ .follow_symlinks = !modeIsEnforced }) catch {
         return error.DurableReplacePostRenameFailed;
     };
     if (final_stat.kind != .file) {

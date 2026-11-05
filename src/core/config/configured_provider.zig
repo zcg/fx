@@ -8,7 +8,7 @@ const max_models = 256;
 pub const max_id_bytes = 64;
 pub const max_model_bytes = 1024;
 const max_url_bytes = 2048;
-const max_env_bytes = 128;
+const max_key_bytes = 16 * 1024;
 const max_json_bytes = 1024 * 1024;
 
 pub const ParseError = Allocator.Error || error{
@@ -25,7 +25,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidBaseUrl,
     InsecureBaseUrl,
     InvalidAuth,
-    InvalidEnvironmentName,
+    InvalidApiKey,
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
@@ -81,8 +81,7 @@ pub const ModelListing = enum {
 };
 pub const ToolChoiceMode = enum { omit, send };
 
-/// Describes a credential slot, never a credential value. Resolution belongs at
-/// the effectful edge; `none` must omit Authorization rather than supply a token.
+/// Authentication saved in the profile. `none` omits Authorization.
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
@@ -130,8 +129,7 @@ pub const Definition = struct {
         return null;
     }
 
-    /// Non-secret route provenance, stable across credential rotation in the
-    /// same environment slot. Length framing prevents ambiguous concatenations.
+    /// Route provenance stays stable when the saved key changes.
     /// This does not snapshot model/compatibility policy or authorize a send.
     pub fn binding_identity(self: Definition) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -140,10 +138,6 @@ pub const Definition = struct {
         hash_part(&hash, @tagName(self.protocol));
         hash_part(&hash, self.base_url);
         hash_part(&hash, @tagName(self.auth));
-        switch (self.auth) {
-            .none => {},
-            .bearer => |env| hash_part(&hash, env),
-        }
         return hash.finalResult();
     }
 
@@ -152,7 +146,10 @@ pub const Definition = struct {
         alloc.free(self.base_url);
         switch (self.auth) {
             .none => {},
-            .bearer => |env| alloc.free(env),
+            .bearer => |key| {
+                std.crypto.secureZero(u8, @constCast(@volatileCast(key)));
+                alloc.free(key);
+            },
         }
         if (self.reviewer_model) |id| alloc.free(id);
         for (self.model_metadata) |metadata| alloc.free(metadata.id);
@@ -193,7 +190,7 @@ pub const Registry = struct {
         if (json.len > max_json_bytes) return error.LimitExceeded;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{
             .duplicate_field_behavior = .@"error",
-            .max_value_len = max_url_bytes,
+            .max_value_len = max_key_bytes,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.DuplicateField => return error.DuplicateField,
@@ -273,22 +270,19 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
 }
 
 fn parse_auth(value: std.json.Value) ParseError!Auth {
-    try check_fields(value, &.{ "type", "env" });
+    try check_fields(value, &.{ "type", "key" });
     const kind = try required(value, "type");
     if (kind != .string) return error.InvalidAuth;
     if (std.mem.eql(u8, kind.string, "none")) {
-        if (value.object.contains("env")) return error.InvalidAuth;
+        if (value.object.contains("key")) return error.InvalidAuth;
         return .none;
     }
     if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
-    const env = try required(value, "env");
-    if (env != .string) return error.InvalidEnvironmentName;
-    if (env.string.len > max_env_bytes) return error.LimitExceeded;
-    if (env.string.len == 0 or (!std.ascii.isAlphabetic(env.string[0]) and env.string[0] != '_')) return error.InvalidEnvironmentName;
-    for (env.string) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
-    }
-    return .{ .bearer = env.string };
+    const key = try required(value, "key");
+    if (key != .string) return error.InvalidApiKey;
+    if (key.string.len > max_key_bytes) return error.LimitExceeded;
+    for (key.string) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidApiKey;
+    return .{ .bearer = key.string };
 }
 
 fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const ModelMetadata {
@@ -434,7 +428,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","key":"test-router-key"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -452,7 +446,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
-    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
+    try std.testing.expectEqualStrings("test-router-key", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
     const metadata = router.model("openai/gpt-4.1").?;
@@ -506,7 +500,7 @@ test "configured provider binding identity separates name endpoint and auth slot
     try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
     changed = original;
     changed.auth = .{ .bearer = "OTHER_KEY" };
-    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
+    try std.testing.expectEqual(identity, changed.binding_identity());
     changed.auth = .none;
     try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
     changed = original;
@@ -582,23 +576,19 @@ test "configured provider invalid schemas fail explicitly" {
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
 }
 
-test "configured provider auth admits only explicit none or a portable environment slot" {
+test "configured provider auth accepts a saved API key or explicit none" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { json: []const u8, err: ParseError }{
         .{ .json = "null", .err = error.InvalidObject },
         .{ .json = "{}", .err = error.MissingField },
         .{ .json = "{\"type\":false}", .err = error.InvalidAuth },
         .{ .json = "{\"type\":\"basic\"}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"none\",\"env\":\"KEY\"}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"none\",\"env\":null}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"none\",\"key\":\"KEY\"}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"none\",\"key\":null}", .err = error.InvalidAuth },
         .{ .json = "{\"type\":\"bearer\"}", .err = error.MissingField },
-        .{ .json = "{\"type\":\"bearer\",\"env\":null}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"1KEY\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"${KEY}\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY=secret\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\\n\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\",\"token\":\"literal\"}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"bearer\",\"key\":null}", .err = error.InvalidApiKey },
+        .{ .json = "{\"type\":\"bearer\",\"key\":\"KEY\\n\"}", .err = error.InvalidApiKey },
+        .{ .json = "{\"type\":\"bearer\",\"key\":\"KEY\",\"token\":\"literal\"}", .err = error.UnknownField },
         .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.UnknownField },
     };
     for (cases) |case| {
@@ -606,7 +596,7 @@ test "configured provider auth admits only explicit none or a portable environme
         defer alloc.free(json);
         try std.testing.expectError(case.err, Registry.parse_json(alloc, json));
     }
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"key\":\"_key_2\"}", .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value)).bearer);
 }
@@ -627,14 +617,14 @@ test "configured provider scalar bounds and minimum input budget" {
     try std.testing.expectError(error.LimitExceeded, validate_url(prefix ++ text_utils.repeat("a", max_url_bytes - prefix.len + 1)));
 
     const alloc = std.testing.allocator;
-    for ([_]usize{ max_env_bytes, max_env_bytes + 1 }) |length| {
-        const env = text_utils.repeat("E", max_env_bytes + 1);
-        const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"bearer\",\"env\":\"{s}\"}}}}}}", .{env[0..length]});
+    for ([_]usize{ max_key_bytes, max_key_bytes + 1 }) |length| {
+        const env = text_utils.repeat("E", max_key_bytes + 1);
+        const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"bearer\",\"key\":\"{s}\"}}}}}}", .{env[0..length]});
         defer alloc.free(json);
-        if (length == max_env_bytes) {
+        if (length == max_key_bytes) {
             var registry = try Registry.parse_json(alloc, json);
             defer registry.deinit(alloc);
-            try std.testing.expectEqual(max_env_bytes, registry.get("local").?.auth.bearer.len);
+            try std.testing.expectEqual(max_key_bytes, registry.get("local").?.auth.bearer.len);
         } else try std.testing.expectError(error.LimitExceeded, Registry.parse_json(alloc, json));
     }
     const json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"small\":{\"context_window\":2,\"max_output_tokens\":1},\"large\":{\"context_window\":4294967295},\"output-only\":{\"max_output_tokens\":1}}}}";

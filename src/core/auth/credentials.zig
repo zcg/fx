@@ -7,7 +7,6 @@ const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
-const provider_key_store = @import("provider_key_store.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const oauth = @import("oauth.zig");
@@ -387,21 +386,7 @@ pub fn resolveForProvider(
         const bound = try provider.bind(registry);
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
-            // A configured provider's key has exactly one home: the store the
-            // add-provider flow writes. Reading an environment variable as well
-            // used to make two sources compete for the same connection, and
-            // which one won was invisible in the picker. The environment
-            // variable a definition names still ships in the profile so an
-            // export remains discoverable, but nothing here reads it.
-            .bearer => blk: {
-                if (try provider_key_store.load(alloc, bound.label())) |stored| {
-                    if (stored.len > 0) {
-                        break :blk .{ .credential = .{ .token = stored, .source = .configured } };
-                    }
-                    alloc.free(stored);
-                }
-                break :blk .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } };
-            },
+            .bearer => |key| if (key.len == 0) .{} else .{ .credential = .{ .token = try alloc.dupe(u8, key), .source = .configured } },
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
         };
     }

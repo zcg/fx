@@ -309,12 +309,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return true;
                     }
-                    // A preset always opens the add-provider flow, whether or
-                    // not the profile already defines it: choosing a preset is
-                    // choosing to paste its key, and that is the step a
-                    // half-saved connection is missing. Nothing about a preset
-                    // means "switch to it".
-                    if (provider_presets.find(selected)) |preset| {
+                    if (if (resolveProvider(app, selected) == null) provider_presets.find(selected) else null) |preset| {
                         debug_trace.logf("auth", "preset chosen name={s}", .{preset.name});
                         _ = app.auth.beginAddProviderWithPreset(app.alloc, preset);
                         app.input_runtime.picker.clearProviderPickerFlow();
@@ -356,17 +351,23 @@ pub fn Runtime(comptime App: type) type {
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     if (method == .api_key) {
-                        // With detected keys the next column asks which to use
-                        // (or `new` to paste one); with none there is nothing
-                        // to ask, so the paste field opens directly.
-                        const view = app.auth.pickerView();
-                        if (view.available_sources.contains(.ai_gateway_api_key) or
-                            view.available_sources.contains(.stored_key))
-                        {
-                            try openKeyStage(app, query.prefix, .key_source);
-                            return true;
-                        }
-                        try openKeyStage(app, query.prefix, .api_key);
+                        const preset = switch (provider) {
+                            .gateway => provider_presets.Preset{
+                                .name = "vercel-api-key",
+                                .display_name = "Vercel AI Gateway",
+                                .base_url = "https://ai-gateway.vercel.sh/v1",
+                                .protocol = .openai_chat_completions,
+                                .model_count = 0,
+                                .label = "Vercel AI Gateway",
+                            },
+                            .codex => provider_presets.find("openai").?,
+                            .grok => provider_presets.find("xai").?,
+                            .configured => unreachable,
+                        };
+                        _ = app.auth.beginAddProviderWithPreset(app.alloc, preset);
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        app.shell.render_requests.request(.footer);
                         return true;
                     }
                     // A first sign-in picks the team as part of the OAuth flow,

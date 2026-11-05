@@ -9,6 +9,7 @@ const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const configured_provider = @import("configured_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -128,9 +129,7 @@ pub const UserSettingsPatch = struct {
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
     remove: ?[]const u8 = null,
-    /// Saves or replaces one named connection under `providers`. The key
-    /// itself is never here: a local runtime reads it from the named
-    /// environment variable, and one with a keychain stores it there.
+    /// Saves a named connection and its API key under `providers`.
     provider_definition: ?ConfiguredProviderPatch = null,
     /// On Windows, the shell commands run in: pwsh, bash, or cmd. Written once
     /// from the first detection so later runs read it instead of probing.
@@ -173,16 +172,13 @@ pub const UserSettingsPatch = struct {
     }
 };
 
-/// One named connection saved under `providers`. Every field but the name is
-/// written only when set, so a patch can add a provider without disturbing a
-/// sibling it does not mention. The key is deliberately absent: it belongs to
-/// the environment or the keychain, never to settings.
+/// One named connection and key saved under `providers`.
 pub const ConfiguredProviderPatch = struct {
     name: []const u8,
+    previous_name: ?[]const u8 = null,
     protocol: []const u8,
     base_url: []const u8,
-    /// The environment variable the key is read from.
-    env: []const u8,
+    key: []const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -1958,16 +1954,33 @@ fn putConfiguredProvider(
         changed = true;
         break :blk &root.getPtr("providers").?.object;
     };
-    var body: std.json.ObjectMap = .empty;
+    const previous_name = definition.previous_name orelse definition.name;
+    const renamed = !std.mem.eql(u8, previous_name, definition.name);
+    if (renamed and providers.contains(definition.name)) return error.DuplicateProvider;
+    var body: std.json.ObjectMap = if (providers.get(previous_name)) |prior|
+        if (prior == .object) prior.object else return error.InvalidSettingsFormat
+    else
+        .empty;
     try body.put(arena, "protocol", .{ .string = definition.protocol });
     try body.put(arena, "base_url", .{ .string = definition.base_url });
-    if (definition.env.len > 0) {
-        var auth: std.json.ObjectMap = .empty;
-        try auth.put(arena, "type", .{ .string = "bearer" });
-        try auth.put(arena, "env", .{ .string = definition.env });
-        try body.put(arena, "auth", .{ .object = auth });
-    } else {
-        try body.put(arena, "auth", .{ .string = "none" });
+    var auth: std.json.ObjectMap = .empty;
+    try auth.put(arena, "type", .{ .string = "bearer" });
+    try auth.put(arena, "key", .{ .string = definition.key });
+    try body.put(arena, "auth", .{ .object = auth });
+    var candidate: std.json.ObjectMap = .empty;
+    try candidate.put(arena, definition.name, .{ .object = body });
+    var validated = try configured_provider.Registry.parse(arena, .{ .object = candidate });
+    validated.deinit(arena);
+    if (renamed) {
+        _ = providers.orderedRemove(previous_name);
+        if (root.getPtr("models")) |models| {
+            if (models.* == .object) if (models.object.fetchOrderedRemove(previous_name)) |prior| {
+                try models.object.put(arena, definition.name, prior.value);
+            };
+        }
+        if (root.getPtr("provider")) |provider| {
+            if (provider.* == .string and std.mem.eql(u8, provider.string, previous_name)) provider.string = definition.name;
+        }
     }
     const existing = providers.getPtr(definition.name);
     if (existing) |prior| {

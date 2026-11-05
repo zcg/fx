@@ -532,6 +532,9 @@ pub const ProviderAction = enum {
     refresh_models,
     /// Replace the stored key.
     set_key,
+    /// Clear the key while keeping the connection.
+    clear_key,
+    edit,
     /// Delete the connection and its stored key.
     remove,
 };
@@ -539,7 +542,7 @@ pub const ProviderAction = enum {
 /// The actions offered for a provider row, in menu order. A built-in provider
 /// offers only `use`: its key belongs to sign-in and it cannot be removed.
 pub fn providerActions(is_configured: bool) []const ProviderAction {
-    const configured = [_]ProviderAction{ .use, .refresh_models, .set_key, .remove };
+    const configured = [_]ProviderAction{ .use, .refresh_models, .set_key, .clear_key, .edit, .remove };
     const built_in = [_]ProviderAction{.use};
     return if (is_configured) &configured else &built_in;
 }
@@ -549,6 +552,8 @@ pub fn providerActionLabel(action: ProviderAction) []const u8 {
         .use => "Use this provider",
         .refresh_models => "Refresh its model list",
         .set_key => "Set or replace its API key",
+        .clear_key => "Reset its API key",
+        .edit => "Edit this provider",
         .remove => "Remove this provider",
     };
 }
@@ -581,23 +586,20 @@ pub const AddProviderField = enum {
     api_key,
 };
 
-/// The add-provider flow's gathered state. The name and URL become settings
-/// entries; the key is read from the environment slot the definition names, so
-/// it is never written to settings.
+/// Fields gathered for the connection saved in settings.json.
 pub const AddProviderDraft = struct {
     field: AddProviderField = .preset,
     /// Index into the preset list, or the custom row.
     preset_index: ?usize = null,
     name: std.ArrayList(u8) = .empty,
+    original_name: ?[]u8 = null,
     base_url: std.ArrayList(u8) = .empty,
     /// The chosen protocol's name, borrowed from a static string.
     protocol: []const u8 = "",
-    /// The environment variable the key is read from, borrowed when a preset
-    /// chose it and empty when the user types none.
-    env: []const u8 = "",
     key: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *AddProviderDraft, alloc: Allocator) void {
+        if (self.original_name) |name| alloc.free(name);
         self.name.deinit(alloc);
         self.base_url.deinit(alloc);
         // The key is a secret: it is zeroed, not just freed.
@@ -612,9 +614,9 @@ pub const AddProviderDraft = struct {
 pub const AddProviderProjection = struct {
     field: AddProviderField,
     name: []const u8,
+    original_name: ?[]const u8 = null,
     base_url: []const u8,
     protocol: []const u8,
-    env: []const u8,
     /// Index of the selected preset row, or null on the custom row.
     preset_index: ?usize,
     /// The key as typed, shown in full. A pasted key is the user's own value on
@@ -1839,7 +1841,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
-            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
+            .configured => "The configured provider has no API key. Set its key in /provider or settings.json; no other provider was selected.",
         };
     }
 
@@ -2608,9 +2610,9 @@ pub const Runtime = struct {
                 AddProviderProjection{
                     .field = draft.field,
                     .name = draft.name.items,
+                    .original_name = draft.original_name,
                     .base_url = draft.base_url.items,
                     .protocol = draft.protocol,
-                    .env = draft.env,
                     .preset_index = draft.preset_index,
                     .key = draft.key.items,
                 }
@@ -2745,7 +2747,6 @@ pub const Runtime = struct {
         draft.name.appendSlice(alloc, preset.name) catch return false;
         draft.base_url.appendSlice(alloc, preset.base_url) catch return false;
         draft.protocol = preset.protocol.wireName();
-        draft.env = preset.env;
         draft.field = .api_key;
         return true;
     }
@@ -2755,6 +2756,12 @@ pub const Runtime = struct {
     /// Everything but the key comes from the saved definition, and the save
     /// writes only the key.
     pub fn beginAddProviderKey(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) !void {
+        try self.beginEditProvider(alloc, provider);
+        self.add_provider_draft.?.field = .api_key;
+        _ = self.clearAddProviderField();
+    }
+
+    pub fn beginEditProvider(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) !void {
         const name = provider.label();
         if (!self.beginAddProvider(alloc)) return;
         errdefer self.cancelAddProvider(alloc);
@@ -2764,14 +2771,12 @@ pub const Runtime = struct {
         const definition = registry.get(name) orelse return error.UnknownProvider;
 
         const draft = &self.add_provider_draft.?;
+        draft.original_name = try alloc.dupe(u8, name);
         try draft.name.appendSlice(alloc, name);
         try draft.base_url.appendSlice(alloc, definition.base_url);
         draft.protocol = @tagName(definition.protocol);
-        draft.env = switch (definition.auth) {
-            .bearer => |env| env,
-            .none => "",
-        };
-        draft.field = .api_key;
+        if (definition.auth == .bearer) try draft.key.appendSlice(alloc, definition.auth.bearer);
+        draft.field = .name;
     }
 
     /// Cancels the add-provider flow and clears what was typed, including the
@@ -2794,9 +2799,9 @@ pub const Runtime = struct {
         return .{
             .field = draft.field,
             .name = draft.name.items,
+            .original_name = draft.original_name,
             .base_url = draft.base_url.items,
             .protocol = draft.protocol,
-            .env = draft.env,
             .preset_index = draft.preset_index,
             .key = draft.key.items,
         };
@@ -2806,7 +2811,7 @@ pub const Runtime = struct {
     /// active or the field is chosen rather than typed, so ordinary typing keeps
     /// reaching the composer.
     pub fn appendAddProviderByte(self: *Self, alloc: Allocator, byte: u8) !bool {
-        var draft = &(self.add_provider_draft orelse return false);
+        const draft = if (self.add_provider_draft) |*value| value else return false;
         if (byte < 0x20 or byte == 0x7f) return false;
         switch (draft.field) {
             .name => try draft.name.append(alloc, byte),
@@ -2825,7 +2830,7 @@ pub const Runtime = struct {
     /// clearable at once. The key is zeroed rather than just truncated: it is a
     /// secret, and a shorter length must not leave the bytes readable.
     pub fn clearAddProviderField(self: *Self) bool {
-        const draft = &(self.add_provider_draft orelse return false);
+        const draft = if (self.add_provider_draft) |*value| value else return false;
         switch (draft.field) {
             .name => draft.name.clearRetainingCapacity(),
             .base_url => draft.base_url.clearRetainingCapacity(),
@@ -2840,7 +2845,7 @@ pub const Runtime = struct {
 
     /// Deletes the last typed byte of the current field.
     pub fn deleteAddProviderByte(self: *Self) bool {
-        var draft = &(self.add_provider_draft orelse return false);
+        const draft = if (self.add_provider_draft) |*value| value else return false;
         const target = switch (draft.field) {
             .name => &draft.name,
             .base_url => &draft.base_url,
@@ -2869,7 +2874,7 @@ pub const Runtime = struct {
     /// switch subagents mid-typing, which is how a keystroke meant for a field
     /// changed the screen instead.
     pub fn moveAddProviderSelection(self: *Self, delta: i32) bool {
-        var draft = &(self.add_provider_draft orelse return false);
+        const draft = if (self.add_provider_draft) |*value| value else return false;
         // Every step owns the arrows, including the text fields where there is
         // no list to move in. While a provider is being set up the arrows belong
         // to this walk alone: letting them fall through switched subagents
@@ -2909,7 +2914,7 @@ pub const Runtime = struct {
     /// Hands the typed key to the caller and clears it from the draft, so the
     /// secret leaves the runtime exactly once. The caller zeroes it.
     pub fn takeAddProviderKey(self: *Self, alloc: Allocator) ?[]u8 {
-        var draft = &(self.add_provider_draft orelse return null);
+        const draft = if (self.add_provider_draft) |*value| value else return null;
         if (draft.key.items.len == 0) return null;
         const owned = alloc.dupe(u8, draft.key.items) catch return null;
         const allocated = draft.key.allocatedSlice();
@@ -2922,7 +2927,7 @@ pub const Runtime = struct {
     /// finished the last one, so the caller saves from the draft; null on a
     /// normal step or when a required value is still empty.
     pub fn advanceAddProvider(self: *Self, alloc: Allocator) ?AddProviderField {
-        var draft = &(self.add_provider_draft orelse return null);
+        const draft = if (self.add_provider_draft) |*value| value else return null;
         switch (draft.field) {
             .preset => {
                 // No preset chosen yet means the walk starts from a name, which
@@ -2930,7 +2935,6 @@ pub const Runtime = struct {
                 // left a fresh draft on the preset list forever.
                 const index = draft.preset_index orelse {
                     draft.protocol = add_provider_protocols[0];
-                    draft.env = "";
                     draft.field = .name;
                     return null;
                 };
@@ -2942,13 +2946,11 @@ pub const Runtime = struct {
                     draft.base_url.clearRetainingCapacity();
                     draft.base_url.appendSlice(alloc, preset.base_url) catch return null;
                     draft.protocol = preset.protocol.wireName();
-                    draft.env = preset.env;
                     // Only the key is left to enter.
                     draft.field = .api_key;
                 } else {
                     // The custom row starts empty, including the key slot.
                     draft.protocol = "";
-                    draft.env = "";
                     draft.field = .name;
                 }
                 return null;
@@ -2960,8 +2962,7 @@ pub const Runtime = struct {
             .protocol => {
                 if (draft.protocol.len == 0) return null;
             },
-            // A key may be absent: a local runtime may already have the
-            // environment variable set, so Enter on an empty key skips it.
+            // The caller validates an empty key before saving.
             .api_key => {},
         }
         const next: ?AddProviderField = switch (draft.field) {
@@ -6065,7 +6066,6 @@ test "add provider flow pre-fills from a preset and finishes on the key" {
     try std.testing.expect(view.name.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, view.base_url, "https://"));
     try std.testing.expect(view.protocol.len > 0);
-    try std.testing.expect(view.env.len > 0);
 
     // Enter on the key field completes the flow so the caller can save it.
     _ = try runtime.appendAddProviderByte(alloc, 'k');

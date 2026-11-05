@@ -660,9 +660,17 @@ fn composeApiKeyPickerRow(
     return row;
 }
 
-/// One row of the add-provider panel. The panel mirrors the walk: the preset
-/// list first, then one line per field with its value or placeholder, and the
-/// key masked rather than shown.
+pub fn addProviderInputText(draft: auth_runtime.AddProviderProjection, width: u16) ?[]const u8 {
+    const value = switch (draft.field) {
+        .name => draft.name,
+        .base_url => draft.base_url,
+        .api_key => draft.key,
+        .preset, .protocol => return null,
+    };
+    return display_width.suffixByWidth(value, width -| 6);
+}
+
+/// Text fields share one input row; the protocol step shows all three choices.
 fn composeAddProviderPickerRow(
     alloc: Allocator,
     view: auth_runtime.PickerView,
@@ -698,37 +706,38 @@ fn composeAddProviderPickerRow(
                 }
             }
         },
-        .name, .base_url, .protocol, .api_key => {
+        .protocol => {
+            if (row_index == 0) {
+                try row_text.appendClipped(alloc, &row, "   Protocol", width);
+            } else if (row_index <= auth_runtime.Runtime.add_provider_protocols.len) {
+                const protocol = auth_runtime.Runtime.add_provider_protocols[row_index - 1];
+                const selected = std.mem.eql(u8, protocol, draft.protocol);
+                try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
+                try row_text.appendClipped(alloc, &row, if (selected) "   › " else "     ", width);
+                try row_text.appendClipped(alloc, &row, protocol, width -| 5);
+            }
+        },
+        .name, .base_url, .api_key => {
             switch (row_index) {
                 0 => try row_text.appendClipped(alloc, &row, "   Add a model provider", width),
                 1 => {
-                    var field_buf: [512]u8 = undefined;
                     const label = switch (draft.field) {
-                        .name => std.mem.print(&field_buf, "   Name: {s}", .{draft.name}) catch "   Name",
-                        .base_url => std.mem.print(&field_buf, "   Base URL: {s}", .{draft.base_url}) catch "   Base URL",
-                        .protocol => std.mem.print(&field_buf, "   Protocol: {s}", .{draft.protocol}) catch "   Protocol",
+                        .name => "   Name:",
+                        .base_url => "   Base URL:",
                         .api_key => "   API key:",
-                        .preset => unreachable,
+                        .preset, .protocol => unreachable,
                     };
                     try row_text.appendClipped(alloc, &row, label, width);
                 },
                 2 => {
-                    // The key is shown as typed. It is the user's own value on
-                    // their own screen, and seeing it is how they tell whether a
-                    // paste arrived whole before it is saved.
-                    if (draft.field == .api_key) {
-                        try row_text.appendClipped(alloc, &row, "   ┃ ", width);
-                        if (draft.key.len == 0) {
-                            try row_text.appendClipped(alloc, &row, "Paste a key, or leave empty if already in the environment", width -| 5);
-                        } else {
-                            try row_text.appendClipped(alloc, &row, draft.key, width -| 5);
-                            try row.appendSlice(alloc, "▏");
-                        }
-                    } else {
-                        try row_text.appendClipped(alloc, &row, "   enter continues     esc cancels", width);
-                    }
+                    try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+                    try row.appendSlice(alloc, ui_render.reset_style);
+                    try row.appendSlice(alloc, addProviderInputText(draft, width).?);
                 },
-                3 => try row_text.appendClipped(alloc, &row, "   ctrl+u clears     enter saves the key and fetches models", width),
+                3 => try row_text.appendClipped(alloc, &row, if (draft.field == .api_key)
+                    "   ctrl+v pastes     ctrl+u clears     enter saves and fetches models"
+                else
+                    "   ctrl+v pastes     ctrl+u clears     enter continues", width),
                 else => {},
             }
         },

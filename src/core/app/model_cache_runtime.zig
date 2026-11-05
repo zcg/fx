@@ -1075,7 +1075,7 @@ pub const Runtime = struct {
         }
     }
 
-    fn cancelAndJoin(self: *Self) void {
+    pub fn cancelAndJoin(self: *Self) void {
         self.cancel_requested.store(true, .seq_cst);
         // The worker thread can join through `finishThreadIfDone`, so the
         // handle changes hands only under the mutex.
@@ -1216,6 +1216,7 @@ fn buildMenuItems(
         errdefer if (owner) |vendor| alloc.free(vendor);
         items.appendAssumeCapacity(.{
             .id = id,
+            .added = entry.added,
             .provider = connection,
             .owned_by = owner,
             .capabilities = model_capabilities.resolveCapabilities(

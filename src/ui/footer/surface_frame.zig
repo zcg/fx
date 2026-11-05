@@ -832,11 +832,11 @@ fn assembleSurfaceFooterFrame(
         paint,
     );
     errdefer composed.deinit(alloc);
-    if (paint.cursor_target) |cursor| {
+    if (paint.cursor_target != null) {
         paint.cursor_target = .{
             .row = composed.cursor.row,
             .col = composed.cursor.col,
-            .visible = cursor.visible,
+            .visible = composed.cursor_visible,
         };
     }
     try paint.validate();

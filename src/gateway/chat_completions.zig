@@ -9,6 +9,7 @@ const streams = @import("../core/agent/stream_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const catalog = @import("../core/gateway/model_catalog.zig");
 const model_listing = @import("model_listing.zig");
+const listing_cache = @import("../core/gateway/model_listing_cache.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
@@ -47,7 +48,7 @@ pub fn model_catalog_provider(definition: *const definitions.Definition) catalog
         // models. A long interval keeps the list current without asking on
         // every menu open: the catalog refreshes in the background once it is
         // older than this.
-        .refresh_interval_ms = 6 * 60 * 60 * 1000,
+        .refresh_interval_ms = null,
     };
 }
 
@@ -295,7 +296,11 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 
         return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    var result = (switch (definition.protocol) {
+        .@"openai-chat-completions" => consume(alloc, reader, request, watch.progress()),
+        .@"openai-responses" => consumeResponses(alloc, reader, request),
+        .@"anthropic-messages" => consumeAnthropic(alloc, reader, request),
+    }) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
@@ -317,22 +322,21 @@ pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelR
 pub fn consumeAnthropic(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var reducer = anthropic.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var line_buffer: std.ArrayList(u8) = .empty;
-    defer line_buffer.deinit(alloc);
-    while (true) {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        line_buffer.clearRetainingCapacity();
-        const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.StreamTooLong => return error.InvalidChunk,
-            else => return err,
-        };
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (trimmed.len == 0) continue;
-        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
-        const payload = std.mem.trimStart(u8, trimmed[5..], " ");
-        if (payload.len == 0) continue;
+    var framing = sse.Reader{ .max_event_bytes = 1024 * 1024, .max_total_bytes = 32 * 1024 * 1024 };
+    defer framing.deinit(alloc);
+    var reasoning_emitted: usize = 0;
+    while (try framing.next(alloc, reader, request.cancel_flag)) |payload| {
+        const text_before = reducer.text.items.len;
         try reducer.applyJson(alloc, payload);
+        if (reducer.text.items.len > text_before) request.events.emit(.{ .content_delta = reducer.text.items[text_before..] });
+        var reasoning_offset: usize = 0;
+        for (reducer.blocks.items) |block| {
+            const thinking = block.thinking.items;
+            const skip = reasoning_emitted -| reasoning_offset;
+            if (skip < thinking.len) request.events.emit(.{ .reasoning_delta = thinking[skip..] });
+            reasoning_offset += thinking.len;
+        }
+        reasoning_emitted = reasoning_offset;
         if (reducer.finished) break;
     }
     return reducer.finish(alloc, request.cancel_flag.load(.seq_cst));
@@ -357,7 +361,7 @@ const configured_stream_limits = responses.StreamLimits{
 pub fn consumeResponses(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var reducer = responses.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var reader_sse: sse.Reader = .{};
+    var reader_sse = sse.Reader{ .max_event_bytes = 1024 * 1024, .max_total_bytes = configured_stream_limits.aggregate_bytes };
     defer reader_sse.deinit(alloc);
 
     // `EventSink` already adapts its context to these callback shapes, which is
@@ -426,6 +430,12 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         listing = fetchListing(alloc, definition, input) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("gateway", "configured_model_listing_unavailable reason={s}", .{@errorName(err)});
+            if (definition.model_metadata.len == 0) return .{ .failure = .{ .category = switch (err) {
+                error.Cancelled => .cancellation,
+                error.AuthenticationRejected, error.MissingConfiguredProviderCredential => .authentication,
+                error.MalformedListing => .malformed_response,
+                else => .transport,
+            } } };
             break :blk null;
         };
     }
@@ -445,14 +455,11 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
     return .{ .catalog = entries };
 }
 
-/// Asks the provider which models it serves. The credential comes from the
-/// provider's own environment slot, the same one its chat requests use.
+/// Lists models using the same saved key as chat requests.
 fn fetchListing(alloc: Allocator, definition: *const definitions.Definition, input: catalog.FetchInput) !model_listing.Listing {
     const url = try definition.models_url(alloc);
     defer alloc.free(url);
-    const token = listingToken(alloc, definition) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+    const token = try listingToken(alloc, definition);
     defer if (token) |value| secret.zeroAndFree(alloc, value);
     var cancel = std.atomic.Value(bool).init(false);
     const cancel_flag = input.cancel_flag orelse &cancel;
@@ -460,20 +467,35 @@ fn fetchListing(alloc: Allocator, definition: *const definitions.Definition, inp
     return switch (result) {
         .success => |body| blk: {
             defer alloc.free(body);
-            break :blk model_listing.parse(alloc, body);
+            var listing = try model_listing.parse(alloc, body);
+            errdefer listing.deinit();
+            const previous_bytes = listing_cache.load(alloc, definition) catch null;
+            defer if (previous_bytes) |bytes| alloc.free(bytes);
+            if (previous_bytes) |bytes| {
+                var previous = model_listing.parse(alloc, bytes) catch null;
+                if (previous) |*old| {
+                    defer old.deinit();
+                    for (listing.entries) |*entry| {
+                        entry.added = for (old.entries) |prior| {
+                            if (std.mem.eql(u8, entry.id, prior.id)) break false;
+                        } else true;
+                    }
+                }
+            }
+            listing_cache.save(alloc, definition, body) catch |err| {
+                debug_trace.logf("catalog", "model listing fetched but cache write failed err={s}", .{@errorName(err)});
+            };
+            break :blk listing;
         },
-        .http_status => error.ListingRefused,
+        .http_status => |status| if (status == .unauthorized or status == .forbidden) error.AuthenticationRejected else error.ListingRefused,
     };
 }
 
 /// The token the provider's own listing accepts, or null when it needs none.
-fn listingToken(alloc: Allocator, definition: *const definitions.Definition) Allocator.Error!?[]u8 {
+fn listingToken(alloc: Allocator, definition: *const definitions.Definition) !?[]u8 {
     switch (definition.auth) {
         .none => return null,
-        .bearer => |env| {
-            const value = io.getenv(env) orelse return null;
-            return try alloc.dupe(u8, value);
-        },
+        .bearer => |key| return if (key.len == 0) error.MissingConfiguredProviderCredential else try alloc.dupe(u8, key),
     }
 }
 

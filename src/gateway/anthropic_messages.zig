@@ -522,8 +522,6 @@ pub const Reducer = struct {
             }
             calls.deinit(alloc);
         }
-        var reasoning: std.ArrayList(u8) = .empty;
-        defer reasoning.deinit(alloc);
         for (self.blocks.items) |block| {
             switch (block.kind) {
                 .tool_use => {
@@ -538,18 +536,17 @@ pub const Reducer = struct {
                         .arguments_json = arguments_json,
                     });
                 },
-                .thinking => try reasoning.appendSlice(alloc, block.thinking.items),
                 else => {},
             }
         }
         const text = try alloc.dupe(u8, self.text.items);
         errdefer alloc.free(text);
-        const reasoning_owned = if (reasoning.items.len > 0) try alloc.dupe(u8, reasoning.items) else null;
         return .{ .completed = .{
+            .ownership = .owned,
             .completion = .{
                 .content = text,
+                .finish_reason = if (calls.items.len > 0) .tool_calls else .stop,
                 .tool_calls = try calls.toOwnedSlice(alloc),
-                .reasoning = reasoning_owned,
                 .usage = self.usage,
             },
         } };

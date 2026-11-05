@@ -972,7 +972,9 @@ pub fn Runtime(comptime App: type) type {
                         return .done;
                     }
                 }
-                dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                if (!pickerOwnsInput(app, agents.screenAgentOf(app))) {
+                    dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                }
                 paste_rt.beginPaste(app, agents.screenAgentOf(app), max_input_len);
                 return .done;
             }
@@ -2055,7 +2057,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn openModelMenuForSetup(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            try openModelMenu(app);
+            try app.model_cache.openMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);

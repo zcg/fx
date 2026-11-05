@@ -213,7 +213,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   serialTest("configured provider interactive resume isolates keys and honors process selection", async () => {
     const fixture = createConfiguredProviderFixture();
     try {
-      (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      (fixture.settings.providers.local as any).auth = { type: "bearer", key: "local-only-token" };
       fixture.save();
       const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
       const created = await runFx(["ask", "--json", "remember remote"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: "remote" } });
@@ -245,7 +245,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   serialTest("configured provider interactive resume cannot borrow a key when its own is missing", async () => {
     const fixture = createConfiguredProviderFixture();
     try {
-      (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      (fixture.settings.providers.local as any).auth = { type: "bearer", key: "local-only-token" };
       fixture.save();
       const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
       const created = await runFx(["ask", "--json", "remember remote"], { cwd: fixture.workspace, env: { ...env, FX_PROVIDER: "remote" } });

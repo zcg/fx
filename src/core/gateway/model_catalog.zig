@@ -322,6 +322,7 @@ fn traceCatalogLoadOutcome(
 
 pub const ModelCatalogEntry = struct {
     id: []u8,
+    added: bool = false,
     /// The catalog's display name, trimmed; null when the catalog has none.
     name: ?[]u8 = null,
     model_type: []u8,

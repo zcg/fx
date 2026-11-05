@@ -1037,12 +1037,12 @@ pub fn composeFooterFrame(
     // no caret and every field had to be typed blind.
     if (input.ctx.auth_picker.active and input.ctx.auth_picker.stage == .add_provider) {
         if (input.ctx.auth_picker.add_provider) |draft| {
-            if (draft.field != .preset) {
+            if (picker_presentation.addProviderInputText(draft, shell.layout.cols)) |value| {
                 frame.cursor = .{
-                    .row = rows.picker_start +| 2,
+                    .row = @min(rows.picker_start +| 2, rows.bottom_divider -| 1),
                     .col = @intCast(@min(
                         shell.layout.cols,
-                        3 + draft.valueLen(),
+                        6 + display_width.visibleWidth(value),
                     )),
                 };
                 frame.cursor_visible = true;

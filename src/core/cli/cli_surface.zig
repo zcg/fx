@@ -41,7 +41,6 @@ const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
-const provider_key_store = @import("../auth/provider_key_store.zig");
 const secret_mod = @import("../auth/secret.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -1205,13 +1204,6 @@ fn removeConfiguredProviderCommand(
             }
         },
     }
-    // The stored key goes with the connection; a key left behind would be
-    // unreachable and would outlive the reason it was stored.
-    if (comptime provider_key_store.enabled) {
-        provider_key_store.clear(alloc, name) catch |err| {
-            debug_trace.logf("config", "provider key clear failed err={s}", .{@errorName(err)});
-        };
-    }
     const message = try alloc.print("Removed provider {s}.\n", .{name});
     defer alloc.free(message);
     try writeStdout(deps, message);
@@ -1231,20 +1223,11 @@ fn resolveFirstCatalogModel(
     const definition = settings.providers orelse return null;
     const entry = definition.get(bound.label()) orelse return null;
     const provider = chat_completions.model_catalog_provider(entry);
-    // The key comes from the same place the provider's requests read it: the
-    // environment variable it names, or the value stored when it was added.
-    var owned_key: ?[]u8 = null;
-    defer if (owned_key) |key| secret_mod.zeroAndFree(alloc, key);
     const access: credentials.CatalogAccess = blk: {
         if (cfg.auth_mode == .host_managed) break :blk .host_managed;
         const token: ?[]const u8 = switch (entry.auth) {
             .none => null,
-            .bearer => |env| if (io_mod.getenv(env)) |value|
-                value
-            else token: {
-                owned_key = provider_key_store.load(alloc, bound.label()) catch null;
-                break :token owned_key;
-            },
+            .bearer => |key| key,
         };
         const value = token orelse break :blk .{ .public_only = .no_credential };
         break :blk .{ .authenticated = .{
@@ -1388,7 +1371,7 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
-                .configured => "configure the provider auth environment variable first",
+                .configured => "set the provider API key in settings.json first",
             },
         );
         return false;

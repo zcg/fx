@@ -374,6 +374,14 @@ pub fn PasteEditRuntime(comptime App: type) type {
 
         pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
+            if (comptime @hasField(App, "auth")) {
+                if (app.auth.addProviderFlowActive()) {
+                    try handlePastedBytes(app, agent, app.input_runtime.paste.buffer.items, max_input_len);
+                    std.crypto.secureZero(u8, @volatileCast(app.input_runtime.paste.buffer.items));
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                }
+            }
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
@@ -460,7 +468,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 if (app.auth.addProviderFlowActive()) {
                     for (bytes) |byte| {
                         if (byte == '\r' or byte == '\n' or byte == '\t') continue;
-                        _ = app.auth.appendAddProviderByte(app.alloc, byte) catch false;
+                        _ = try app.auth.appendAddProviderByte(app.alloc, byte);
                     }
                     app.shell.render_requests.request(.footer);
                     return;

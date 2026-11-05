@@ -559,7 +559,7 @@ describe("configured providers", () => {
   test("resume uses its own key when a different bearer connection is the default", async () => {
     const f = fixture();
     try {
-      (f.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+      (f.settings.providers.local as any).auth = { type: "bearer", key: "local-only-token" };
       f.save();
       const env = { ...f.env, FX_TEST_LOCAL_TOKEN: "local-only-token" };
       const first = await runFx(["ask", "--json", "remember remote"], { cwd: f.workspace, env: { ...env, FX_PROVIDER: "remote" }, timeoutMs: 20000 });
@@ -791,6 +791,8 @@ describe("configured providers", () => {
     try {
       const unknown = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "missing" } });
       expect(unknown.code).not.toBe(0);
+      f.settings.providers.remote.auth.key = "";
+      f.save();
       const missingKey = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_TOKEN: undefined } });
       expect(missingKey.code).not.toBe(0);
       expect(f.requests).toHaveLength(0);

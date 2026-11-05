@@ -327,11 +327,12 @@ fn composeTitleRow(
     const content_width = @as(usize, width);
     const facts_start = facts_column orelse content_width;
     const show_facts = facts.items.len > 0 and facts_start >= prefix_width + 8 + 2;
-    const id_budget = if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width;
+    const badge_width: usize = if (item.added and content_width >= prefix_width + 5) 5 else 0;
+    const id_budget = (if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width) -| badge_width;
     try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
 
-    if (item.added) {
+    if (badge_width > 0) {
         // A label, not part of the model: it says this refresh is what listed
         // the model, and the next refresh drops it once the model is old news.
         try row.appendSlice(alloc, ui_render.dim_style);

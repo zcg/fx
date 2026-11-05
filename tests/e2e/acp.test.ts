@@ -961,7 +961,7 @@ test.each(["local", "remote"])("configured provider ACP loading %s stages creden
     }
     return configuredCompletion(body.model);
   });
-  (fixture.settings.providers.local as any).auth = { type: "bearer", env: "FX_TEST_LOCAL_TOKEN" };
+  (fixture.settings.providers.local as any).auth = { type: "bearer", key: "alpha-token" };
   fixture.settings.providers.remote.base_url = target.settings.providers.local.base_url;
   fixture.save();
   const env = { ...fixture.env, FX_TEST_LOCAL_TOKEN: "alpha-token" };
@@ -980,7 +980,7 @@ test.each(["local", "remote"])("configured provider ACP loading %s stages creden
     await waitForCondition("active configured stream", () => client!.rawLines.some(line => line.includes("alpha pending")), 5000);
     const definition = (fixture.settings.providers as any)[targetProvider];
     const originalAuth = definition.auth;
-    definition.auth = { type: "bearer", env: "MISSING_PROVIDER_SLOT" };
+    definition.auth = { type: "bearer", key: "" };
     fixture.save();
     const rejected = await client.request("session/load", { sessionId: targetId, cwd: fixture.workspace, mcpServers: [] }, 901) as any;
     expect(rejected.error).toBeDefined();
