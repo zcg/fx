@@ -2354,6 +2354,12 @@ const App = struct {
         self.loadModelCatalog(.activity);
     }
 
+    /// Opens the model menu at the end of adding a provider, with the composer
+    /// cleared so the next keystroke reaches the menu rather than a stale draft.
+    pub fn openModelMenuForSetup(self: *App) !void {
+        try InputAppRuntime.openModelMenuForSetup(self);
+    }
+
     /// Opening the model picker revalidates the catalog in the background;
     /// the picker lists the cached models until the refresh lands.
     pub fn revalidateModelCache(self: *App) void {

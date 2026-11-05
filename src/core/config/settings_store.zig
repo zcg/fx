@@ -1973,12 +1973,20 @@ fn putConfiguredProvider(
     if (existing) |prior| {
         // Replacing whole: the object above is already complete.
         prior.* = .{ .object = body };
-        changed = true;
-    } else {
-        try providers.put(arena, definition.name, .{ .object = body });
-        changed = true;
+        return true;
     }
-    return changed;
+    // A newly added connection goes first, and the ones added before it shift
+    // down. The picker lists them in file order, so the connection a user just
+    // set up is the one they see at the top the next time they open it,
+    // instead of somewhere below every vendor they have ever tried.
+    var reordered: std.json.ObjectMap = .empty;
+    try reordered.put(arena, definition.name, .{ .object = body });
+    var prior_entries = providers.iterator();
+    while (prior_entries.next()) |entry| {
+        try reordered.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    providers.* = reordered;
+    return true;
 }
 
 /// Removes one named connection. The `providers` object itself is left in place

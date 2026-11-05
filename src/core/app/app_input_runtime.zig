@@ -2025,6 +2025,20 @@ pub fn Runtime(comptime App: type) type {
             try app.model_cache.openMenu();
         }
 
+        /// Opens the model picker at the end of adding a provider. The catalog
+        /// for a connection that was just saved may still be arriving, so the
+        /// menu opens in its loading state and fills in when the fetch lands;
+        /// the user is choosing which of that vendor's models to run, which is
+        /// the one thing left to do after pasting the key.
+        pub fn openModelMenuForSetup(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            try openModelMenu(app);
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
+        }
+
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();

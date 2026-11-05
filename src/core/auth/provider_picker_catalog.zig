@@ -131,16 +131,26 @@ pub const add_provider_slug = "+ Add a provider";
 /// menu; leaving it out is why a working connection never appeared there.
 pub fn providerOptions(out: [][]const u8, configured: []const []const u8) usize {
     var count: usize = 0;
-    for (&provider_catalog.entries) |*entry| {
-        if (!providerVisible(entry.id)) continue;
-        if (count >= out.len) return count;
-        out[count] = entry.slug;
+    // Adding a provider comes first. Reaching it used to mean scrolling past
+    // every built-in and every preset, which is the one row a user who has not
+    // set anything up yet is looking for.
+    if (out.len > 0) {
+        out[count] = add_provider_slug;
         count += 1;
     }
+    // Then the connections the user set up, newest first, because those are
+    // the ones they are working with. The built-in providers follow, and the
+    // presets nobody has added yet come last.
     for (configured) |name| {
         if (count >= out.len) return count;
         if (name.len == 0) continue;
         out[count] = name;
+        count += 1;
+    }
+    for (&provider_catalog.entries) |*entry| {
+        if (!providerVisible(entry.id)) continue;
+        if (count >= out.len) return count;
+        out[count] = entry.slug;
         count += 1;
     }
     // The presets come last, and only when the profile has not defined them
@@ -152,10 +162,6 @@ pub fn providerOptions(out: [][]const u8, configured: []const []const u8) usize 
         if (containsName(configured, preset.name)) continue;
         if (provider_catalog.parse(preset.name) != null) continue;
         out[count] = preset.name;
-        count += 1;
-    }
-    if (count < out.len) {
-        out[count] = add_provider_slug;
         count += 1;
     }
     return count;
@@ -187,11 +193,11 @@ test "provider options expose the catalog slugs the composer accepts" {
     const count = providerOptions(&buf);
 
     try std.testing.expect(count >= 2);
-    try std.testing.expectEqualStrings("vercel", buf[0]);
     // The add-provider row is a label, not a provider name, so it is the one
-    // entry that is not a slug.
-    try std.testing.expectEqualStrings(add_provider_slug, buf[count - 1]);
-    for (buf[0 .. count - 1]) |slug| {
+    // entry that is not a slug. It leads the list.
+    try std.testing.expectEqualStrings(add_provider_slug, buf[0]);
+    try std.testing.expectEqualStrings("vercel", buf[1]);
+    for (buf[1..count]) |slug| {
         try std.testing.expect(provider_catalog.parse(slug) != null or provider_presets.find(slug) != null);
         try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null or provider_presets.find(slug) == null);
     }
@@ -246,11 +252,11 @@ test "key source slugs round trip and map to their credentials" {
 test "provider options include the profile's configured names" {
     var buf: [max_provider_options][]const u8 = undefined;
     const count = providerOptions(&buf, &.{ "magpie", "openrouter" });
-    // The built-in slugs, then the configured names in order.
-    try std.testing.expectEqualStrings("magpie", buf[provider_catalog.entries.len]);
-    try std.testing.expectEqualStrings("openrouter", buf[provider_catalog.entries.len + 1]);
-    // `openrouter` is configured, so its preset is not offered twice; the
-    // add-provider row still ends the list.
-    try std.testing.expectEqualStrings(add_provider_slug, buf[count - 1]);
-    try std.testing.expect(count > provider_catalog.entries.len + 2);
+    // The add row, then the configured names newest first, then the built-ins.
+    try std.testing.expectEqualStrings(add_provider_slug, buf[0]);
+    try std.testing.expectEqualStrings("magpie", buf[1]);
+    try std.testing.expectEqualStrings("openrouter", buf[2]);
+    try std.testing.expectEqualStrings("vercel", buf[3]);
+    // `openrouter` is configured, so its preset is not offered twice.
+    try std.testing.expect(count > provider_catalog.entries.len + 3);
 }

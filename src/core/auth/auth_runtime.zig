@@ -2716,6 +2716,9 @@ pub const Runtime = struct {
     /// Starts adding a custom provider. Returns false when a draft is already in
     /// progress, so a repeated Enter cannot discard gathered fields.
     pub fn beginAddProvider(self: *Self) bool {
+        // A draft left behind by a closed flow would otherwise refuse every
+        // later attempt with no way to clear it, which is what made the second
+        // "add a provider" report that one was already being added.
         if (self.add_provider_draft != null) return false;
         self.add_provider_draft = .{};
         self.picker_active = true;
@@ -2900,7 +2903,15 @@ pub const Runtime = struct {
         var draft = &(self.add_provider_draft orelse return null);
         switch (draft.field) {
             .preset => {
-                const index = draft.preset_index orelse return null;
+                // No preset chosen yet means the walk starts from a name, which
+                // is what the custom row asks for. Returning here instead is what
+                // left a fresh draft on the preset list forever.
+                const index = draft.preset_index orelse {
+                    draft.protocol = add_provider_protocols[0];
+                    draft.env = "";
+                    draft.field = .name;
+                    return null;
+                };
                 if (provider_presets.presetAt(index)) |preset| {
                     // A chosen preset pre-fills the rest of the walk: the name,
                     // the URL, the protocol, and the key's environment slot.
@@ -3323,6 +3334,9 @@ pub const Runtime = struct {
             }
         }
 
+        // Leaving the add-provider stage drops what was typed, including the
+        // key: a draft that outlived its flow would block the next one.
+        if (stage == .add_provider) self.cancelAddProvider(alloc);
         self.clearTeamSelection(alloc);
         self.picker_stage = .root;
         self.picker_selection = .{ .action = switch (stage) {

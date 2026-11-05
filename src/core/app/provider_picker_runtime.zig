@@ -283,6 +283,7 @@ pub fn Runtime(comptime App: type) type {
             // No matching option: let Enter fall through so the router reports
             // the unknown text instead of silently eating the key.
             const selected = selectedLabel(app, query, &column) orelse return false;
+            debug_trace.logf("auth", "provider picker enter stage={t} selected={s} count={d} index={d}", .{ query.stage, selected, column.count, currentIndex(app, query.stage) });
 
             switch (query.stage) {
                 .provider => {
@@ -294,6 +295,7 @@ pub fn Runtime(comptime App: type) type {
                         // starts on the name. Showing the preset list again
                         // would be asking the same question twice.
                         if (app.auth.beginAddProvider()) {
+                            debug_trace.logf("auth", "custom provider walk opened", .{});
                             _ = app.auth.advanceAddProvider(app.alloc);
                         } else {
                             try app.writeDomainNotice(.{
@@ -313,13 +315,17 @@ pub fn Runtime(comptime App: type) type {
                     // half-saved connection is missing. Nothing about a preset
                     // means "switch to it".
                     if (provider_presets.find(selected)) |preset| {
+                        debug_trace.logf("auth", "preset chosen name={s}", .{preset.name});
                         _ = app.auth.beginAddProviderWithPreset(app.alloc, preset);
                         app.input_runtime.picker.clearProviderPickerFlow();
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                         app.shell.render_requests.request(.footer);
                         return true;
                     }
-                    const provider = resolveProvider(app, selected) orelse return false;
+                    const provider = resolveProvider(app, selected) orelse {
+                        debug_trace.logf("auth", "provider picker row unresolved label={s}", .{selected});
+                        return false;
+                    };
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         // A configured connection has no sign-in method, so there
                         // is no second column to walk. It opens its own menu

@@ -792,6 +792,9 @@ pub fn Runtime(comptime App: type) type {
             }
             if (app.auth.addProviderFlowActive()) {
                 switch (byte) {
+                    // Escape is the documented way out. These two leave the walk
+                    // too, but only the walk: a key is easy to mistype, and a
+                    // stray ctrl+c should not end the whole run.
                     3, 4 => app.auth.cancelAddProvider(app.alloc),
                     '\r', '\n' => try submitAddProviderField(app, agent),
                     8, 127 => _ = app.auth.deleteAddProviderByte(),
@@ -815,6 +818,19 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn routeAuthPickerEscapeAction(app: *App, action: anytype) bool {
+            // Escape leaves the add-provider walk at any step, dropping what
+            // was typed. Without this a half-finished provider stayed in the
+            // runtime and every later attempt was refused.
+            if (app.auth.addProviderFlowActive()) {
+                switch (action) {
+                    .escape, .remapped_byte => {
+                        app.auth.cancelAddProvider(app.alloc);
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    },
+                    else => return false,
+                }
+            }
             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
@@ -1151,13 +1167,28 @@ pub fn Runtime(comptime App: type) type {
                 try app.alloc.print("Saved provider {s}.", .{name});
             try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
 
+            // The definition was just written, and the registry the picker
+            // resolves against was loaded at startup, so it has to be re-read
+            // before the name below means anything.
+            reloadConfiguredProviders(app);
+
             // A connection is only useful once its models are known, and the
-            // user just proved the key works by entering it, so the fetch runs
-            // now rather than waiting for the next switch. The picker lists the
-            // vendor's own models as soon as the fetch lands.
-            if (provider_key_store.enabled) {
-                if (provider_picker_runtime.Runtime(App).resolveProvider(app, name)) |target| {
-                    try startProviderSwitch(app, agent, target, false, .manual, null);
+            // user just proved the key works by entering it, so the switch and
+            // the fetch run now rather than waiting for the next time this
+            // provider is chosen.
+            // Bind straight from the registry just reloaded rather than going
+            // through the picker's resolver, so the name means the definition
+            // that was written a moment ago and nothing older.
+            {
+                var registry = config_runtime.loadConfiguredProviders(app.alloc) catch null;
+                if (registry) |*loaded| {
+                    defer loaded.deinit(app.alloc);
+                    const raw = model_provider.parse(name) orelse null;
+                    if (raw) |candidate| {
+                        if (candidate.bind(loaded.*) catch null) |target| {
+                            try startProviderSwitch(app, agent, target, false, .after_setup, null);
+                        }
+                    }
                 }
             }
         }
@@ -1738,6 +1769,19 @@ pub fn Runtime(comptime App: type) type {
                             .body = "Provider switched for this run, but the selection could not be saved.",
                         }, true);
                     },
+                }
+            }
+            // Adding a provider ends with its model list open: the next thing
+            // the user needs is a model to run, and reopening `/model` by hand
+            // is a step the flow already knows about.
+            if (intent == .after_setup) {
+                // The app owns the model menu; probing for the entry point keeps
+                // this file from importing the input runtime, which imports this
+                // one back.
+                if (comptime @hasDecl(App, "openModelMenuForSetup")) {
+                    app.openModelMenuForSetup() catch |err| {
+                        debug_trace.logf("provider", "model menu after setup failed err={s}", .{@errorName(err)});
+                    };
                 }
             }
             app.shell.render_requests.request(.footer);

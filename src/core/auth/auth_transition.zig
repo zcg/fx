@@ -11,6 +11,10 @@ pub const ProviderSwitchDecision = enum {
 pub const ProviderSwitchIntent = enum {
     manual,
     post_oauth,
+    /// A provider was just added with its key. The switch is part of setting it
+    /// up, so the model picker opens as soon as the catalog lands: the user's
+    /// next step is choosing which model to use, not reopening a menu.
+    after_setup,
 };
 
 pub const ProviderSwitchFacts = struct {
