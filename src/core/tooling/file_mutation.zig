@@ -629,6 +629,16 @@ fn applyWithTestControls(
     // The fresh descriptor binds the final entry checks and rename to the
     // revalidated parent. The platform cannot freeze its namespace after
     // these checks, so a competing move can still win the remaining window.
+    //
+    // Windows refuses to rename a file that still has an open handle, so the
+    // staged file is closed first. POSIX renames through the open descriptor and
+    // keeps it, which is why the close is gated: closing early there would only
+    // give up the handle the remaining checks rely on. The handle is marked
+    // closed so the deferred close below does not close it a second time.
+    if (comptime builtin.target.os.tag == .windows) {
+        stage.close(io_mod.getIo());
+        stage.handle = @ptrFromInt(std.math.maxInt(usize));
+    }
     commit_parent.rename(
         temp_name,
         commit_parent,

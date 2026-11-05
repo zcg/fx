@@ -499,8 +499,15 @@ fn traverseBoundedAbsoluteFileTarget(
     }
 
     const absolute = pending_scratch[0..pending_path_len];
-    path_scratch[0] = std.Io.Dir.path.sep;
-    var path_len: usize = 1;
+    // The built path mirrors the walk: on Windows it starts with the drive root
+    // and grows one component at a time beneath it.
+    const walk_root: []const u8 = if (comptime builtin_mod.target.os.tag == .windows)
+        driveRoot(absolute) orelse return error.InvalidPath
+    else
+        "/";
+    if (walk_root.len > path_scratch.len) return error.InvalidPath;
+    @memcpy(path_scratch[0..walk_root.len], walk_root);
+    var path_len: usize = walk_root.len;
     var component_count: usize = 0;
     const workspace_target = pathInside(workspace_root, absolute);
     var workspace_anchor_end: ?usize = if (workspace_target and std.mem.eql(u8, workspace_root, "/"))
@@ -509,12 +516,15 @@ fn traverseBoundedAbsoluteFileTarget(
         null;
 
     const zio = io_mod.getIo();
-    var current_dir = std.Io.Dir.openDirAbsolute(zio, "/", .{ .follow_symlinks = false }) catch |err| {
+    var current_dir = std.Io.Dir.openDirAbsolute(zio, walk_root, .{ .follow_symlinks = false }) catch |err| {
         return mapDirOpenError(err);
     };
     defer current_dir.close(zio);
 
-    var iter = PathComponentIterator.init(absolute);
+    var iter = PathComponentIterator.init(if (comptime builtin_mod.target.os.tag == .windows)
+        absolute[walk_root.len..]
+    else
+        absolute);
     if (!iter.hasNext()) {
         return .{ .complete = .{
             .path_len = path_len,
@@ -706,9 +716,44 @@ fn boundedResolution(
     };
 }
 
+/// The `C:\` or `\\server\share\` prefix of a Windows path, or null when the
+/// path has no drive. A relative path has none, and neither does one that only
+/// starts with a separator.
+fn driveRoot(path: []const u8) ?[]const u8 {
+    if (path.len < 3) return null;
+    // A drive-letter root: C:\ or C:/
+    if (std.ascii.isAlphabetic(path[0]) and path[1] == ':' and
+        (path[2] == '\\' or path[2] == '/')) return path[0..3];
+    // A UNC root: \\server\share\
+    if (path.len > 2 and path[0] == '\\' and path[1] == '\\') {
+        var index: usize = 2;
+        var separators: usize = 0;
+        while (index < path.len) : (index += 1) {
+            if (path[index] != '\\' and path[index] != '/') continue;
+            separators += 1;
+            if (separators == 2) return path[0 .. index + 1];
+        }
+    }
+    return null;
+}
+
 fn normalizeAbsolutePathInto(scratch: []u8, raw_path: []const u8) FileTargetResolveError![]const u8 {
     if (!std.Io.Dir.path.isAbsolute(raw_path)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
+
+    // Windows paths carry their root in the path itself (`C:\` or
+    // `\\server\share\`). Prefixing a separator would turn the drive into a
+    // component under the current drive, which is what made every file tool
+    // report an invalid path. The root is copied through and normalization
+    // continues after it.
+    if (comptime builtin_mod.target.os.tag == .windows) {
+        const root = driveRoot(raw_path) orelse return error.InvalidPath;
+        if (root.len > scratch.len) return error.InvalidPath;
+        @memcpy(scratch[0..root.len], root);
+        var len: usize = root.len;
+        try normalizeRelativePathPartInto(scratch, &len, raw_path[root.len..]);
+        return scratch[0..len];
+    }
 
     scratch[0] = std.Io.Dir.path.sep;
     var len: usize = 1;
@@ -723,6 +768,15 @@ fn normalizeBaseRelativePathInto(
 ) FileTargetResolveError![]const u8 {
     if (!std.Io.Dir.path.isAbsolute(base_abs)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
+
+    // The base carries its own root on Windows, so it is normalized first and
+    // the relative part is appended to it rather than to a synthetic `/`.
+    if (comptime builtin_mod.target.os.tag == .windows) {
+        const base = try normalizeAbsolutePathInto(scratch, base_abs);
+        var len: usize = base.len;
+        try normalizeRelativePathPartInto(scratch, &len, relative_path);
+        return scratch[0..len];
+    }
 
     scratch[0] = std.Io.Dir.path.sep;
     var len: usize = 1;
