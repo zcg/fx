@@ -394,7 +394,16 @@ fn buildFooterSurfaceProjection(
         .reservation => approval_active or compact_command_active,
         .measurement, .frame => approval_active or question_projection != null or compact_command_active,
     };
-    const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
+    // A picker owns the composer column while it is open. Leaving the input
+    // box drawn underneath put the terminal cursor in a field that could not
+    // receive the keystrokes, because the picker routed every byte to itself:
+    // the letters went into the provider draft while the cursor sat in the
+    // prompt, and nothing on screen said which field was live.
+    // The inline API-key column is the exception: it is drawn in the composer
+    // itself, so the composer has to stay.
+    const picker_owns_composer = !viewer_active and !modal_active and ctx.auth_picker.active and
+        !(ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline);
+    const input_visible = ctx.composer_visible and !modal_active and !viewer_active and !picker_owns_composer;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
     // The provider flow's inline API-key field is rendered in the composer column,
     // not as the legacy auth panel.

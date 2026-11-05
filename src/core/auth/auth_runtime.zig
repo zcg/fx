@@ -592,11 +592,6 @@ pub const AddProviderDraft = struct {
     base_url: std.ArrayList(u8) = .empty,
     /// The chosen protocol's name, borrowed from a static string.
     protocol: []const u8 = "",
-    /// Whether saving this draft writes the definition or only its key. The
-    /// picker's "set key" action opens a draft for a provider that already
-    /// exists, and rewriting its definition from those prefilled fields would
-    /// silently undo anything the profile changed since.
-    replace_definition: bool = true,
     /// The environment variable the key is read from, borrowed when a preset
     /// chose it and empty when the user types none.
     env: []const u8 = "",
@@ -2739,7 +2734,6 @@ pub const Runtime = struct {
         draft.protocol = preset.protocol.wireName();
         draft.env = preset.env;
         draft.field = .api_key;
-        draft.replace_definition = false;
         return true;
     }
 
@@ -2765,7 +2759,6 @@ pub const Runtime = struct {
             .none => "",
         };
         draft.field = .api_key;
-        draft.replace_definition = false;
     }
 
     /// Cancels the add-provider flow and clears what was typed, including the
