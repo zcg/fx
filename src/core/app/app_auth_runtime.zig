@@ -717,7 +717,10 @@ pub fn Runtime(comptime App: type) type {
             }
             switch (choice) {
                 .provider => |provider| try switchProvider(app, agent, provider, true, .manual),
-                .provider_action => |action| try applyProviderAction(app, agent, app.auth.pickerTargetProvider(), action),
+                .provider_action => |action| {
+                    debug_trace.logf("auth", "provider action chosen action={s} target={s}", .{ @tagName(action), app.auth.pickerTargetProvider().label() });
+                    try applyProviderAction(app, agent, app.auth.pickerTargetProvider(), action);
+                },
                 .add_provider => {
                     // The add-provider flow starts from the picker's last row.
                     if (!app.auth.beginAddProvider()) {
@@ -987,18 +990,24 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 },
                 .set_key => {
+                    debug_trace.logf("auth", "set key requested target={s} configured={} store={}", .{ target.label(), target == .configured, provider_key_store.enabled });
                     // A configured provider's key is kept under the profile, and
                     // its validity is whatever its own endpoint says the next
                     // time fx uses it. Only the built-in providers have a login
                     // service that can answer for a key up front, so only they
                     // go through the key-entry screen that checks one.
                     if (target == .configured and comptime provider_key_store.enabled) {
-                        app.auth.beginAddProviderKey(app.alloc, target) catch {
+                        app.auth.beginAddProviderKey(app.alloc, target) catch |err| {
+                            debug_trace.logf("auth", "provider key entry failed provider={s} err={s}", .{ target.label(), @errorName(err) });
                             try app.writeDomainNotice(.{
                                 .topic = "auth",
                                 .tone = .warning,
-                                .body = "The key could not be entered. Try again.",
+                                .body = try app.alloc.print(
+                                    "The key for {s} could not be entered ({s}). Its definition is missing from the profile; add the provider again.",
+                                    .{ target.label(), @errorName(err) },
+                                ),
                             }, true);
+                            app.shell.render_requests.request(.footer);
                             return;
                         };
                         app.shell.render_requests.request(.footer);
@@ -1061,17 +1070,30 @@ pub fn Runtime(comptime App: type) type {
         /// when there is one, is read from the environment slot the definition
         /// names, so it is never in settings.
         fn submitAddProviderField(app: *App, agent: *AppAgent) !void {
-            _ = agent;
             const draft = if (app.auth.addProviderDraftView()) |view| view else return;
             if (app.auth.advanceAddProvider(app.alloc)) |_| {
-                try saveAddProviderDraft(app, draft);
+                try saveAddProviderDraft(app, agent, draft);
             }
             app.shell.render_requests.request(.footer);
         }
 
         /// Writes the finished draft into settings and, when a key was typed,
         /// stores it encrypted under the profile.
-        fn saveAddProviderDraft(app: *App, draft: auth_runtime.AddProviderProjection) !void {
+        fn saveAddProviderDraft(app: *App, agent: *AppAgent, draft: auth_runtime.AddProviderProjection) !void {
+            // A connection with a name and a URL but no key is not usable, and
+            // saving it as a definition turns its preset row into "switch to
+            // this" the next time the picker opens, which hides the key step
+            // the user was in the middle of. The draft is dropped instead, and
+            // nothing reaches settings.
+            if (draft.key.len == 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = try app.alloc.print("{s} was not saved: it has no API key.", .{draft.name}),
+                }, true);
+                app.auth.cancelAddProvider(app.alloc);
+                return;
+            }
             const name = try app.alloc.dupe(u8, draft.name);
             defer app.alloc.free(name);
             const base_url = try app.alloc.dupe(u8, draft.base_url);
@@ -1124,10 +1146,20 @@ pub fn Runtime(comptime App: type) type {
             }
             app.auth.cancelAddProvider(app.alloc);
             const body = if (key_stored)
-                try app.alloc.print("Saved provider {s} with its API key. Its models are listed the next time it is selected.", .{name})
+                try app.alloc.print("Saved provider {s}. Reading its model list now.", .{name})
             else
-                try app.alloc.print("Saved provider {s}. Its models are listed the next time it is selected.", .{name});
+                try app.alloc.print("Saved provider {s}.", .{name});
             try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+
+            // A connection is only useful once its models are known, and the
+            // user just proved the key works by entering it, so the fetch runs
+            // now rather than waiting for the next switch. The picker lists the
+            // vendor's own models as soon as the fetch lands.
+            if (provider_key_store.enabled) {
+                if (provider_picker_runtime.Runtime(App).resolveProvider(app, name)) |target| {
+                    try startProviderSwitch(app, agent, target, false, .manual, null);
+                }
+            }
         }
 
         /// Polled from the event loop so a save that blocks on a locked key store

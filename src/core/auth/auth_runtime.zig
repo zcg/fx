@@ -2939,6 +2939,10 @@ pub const Runtime = struct {
             .api_key => null,
         };
         if (next) |field| {
+            // Entering the protocol step with nothing chosen would leave the
+            // user on an empty list; the common protocol is the one to start
+            // on, and it is still changeable with the arrows.
+            if (field == .protocol and draft.protocol.len == 0) draft.protocol = add_provider_protocols[0];
             draft.field = field;
             return null;
         }
@@ -6054,4 +6058,37 @@ test "add provider custom row asks for a name first" {
     _ = runtime.advanceAddProvider(alloc);
     try std.testing.expectEqual(AddProviderField.base_url, runtime.addProviderDraftView().?.field);
     runtime.cancelAddProvider(alloc);
+}
+
+test "provider actions menu hands back the highlighted action" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    runtime.provider_picker_active = .codex;
+    runtime.openProviderActions(alloc, .codex);
+    defer runtime.closePicker(alloc);
+
+    try std.testing.expectEqual(PickerStage.provider_actions, runtime.pickerView().stage);
+    try std.testing.expect(runtime.pickerView().active);
+    const view = runtime.pickerView();
+    try std.testing.expectEqual(providerActions(false).len, view.choiceCount());
+    try std.testing.expectEqualStrings("use", @tagName(view.choiceAt(0).?.provider_action));
+
+    const choice = runtime.takePickerChoice(alloc) orelse return error.NoChoice;
+    try std.testing.expectEqual(ProviderAction.use, choice.provider_action);
+}
+
+test "a configured provider's action menu offers every management action" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    runtime.provider_picker_active = .gateway;
+    runtime.openProviderActions(alloc, model_provider.parse("magpie").?);
+    defer runtime.closePicker(alloc);
+
+    const view = runtime.pickerView();
+    try std.testing.expectEqual(@as(usize, 4), view.choiceCount());
+    try std.testing.expectEqualStrings("use", @tagName(view.choiceAt(0).?.provider_action));
+    try std.testing.expectEqualStrings("refresh_models", @tagName(view.choiceAt(1).?.provider_action));
+    try std.testing.expectEqualStrings("set_key", @tagName(view.choiceAt(2).?.provider_action));
+    try std.testing.expectEqualStrings("remove", @tagName(view.choiceAt(3).?.provider_action));
+    try std.testing.expectEqualStrings("magpie", runtime.pickerTargetProvider().label());
 }

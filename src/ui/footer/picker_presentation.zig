@@ -707,7 +707,7 @@ fn composeAddProviderPickerRow(
                         .name => std.mem.print(&field_buf, "   Name: {s}", .{draft.name}) catch "   Name",
                         .base_url => std.mem.print(&field_buf, "   Base URL: {s}", .{draft.base_url}) catch "   Base URL",
                         .protocol => std.mem.print(&field_buf, "   Protocol: {s}", .{draft.protocol}) catch "   Protocol",
-                        .api_key => std.mem.print(&field_buf, "   API key ({s}): {s}", .{ draft.env, "" }) catch "   API key",
+                        .api_key => "   API key:",
                         .preset => unreachable,
                     };
                     try row_text.appendClipped(alloc, &row, label, width);
@@ -728,7 +728,7 @@ fn composeAddProviderPickerRow(
                         try row_text.appendClipped(alloc, &row, "   enter continues     esc cancels", width);
                     }
                 },
-                3 => try row_text.appendClipped(alloc, &row, "   ctrl+u clears     the key is saved to the credential store, never to settings", width),
+                3 => try row_text.appendClipped(alloc, &row, "   ctrl+u clears     enter saves the key and fetches models", width),
                 else => {},
             }
         },

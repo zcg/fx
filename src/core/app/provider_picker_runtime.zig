@@ -286,16 +286,40 @@ pub fn Runtime(comptime App: type) type {
 
             switch (query.stage) {
                 .provider => {
-                    // A preset the profile has not added yet opens the
-                    // add-provider flow with the preset's own base URL,
-                    // protocol, and key variable filled in, so the user only
-                    // pastes a key. A provider that already exists switches.
-                    const provider = resolveProvider(app, selected) orelse {
-                        const preset = provider_presets.find(selected) orelse return false;
-                        _ = app.auth.beginAddProviderWithPreset(app.alloc, preset);
+                    // The last row starts a connection from scratch: a vendor
+                    // with no preset, where every field is typed. It is checked
+                    // first because its label is not a provider name.
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.add_provider_slug)) {
+                        // The custom row means "a vendor with no preset", so it
+                        // starts on the name. Showing the preset list again
+                        // would be asking the same question twice.
+                        if (app.auth.beginAddProvider()) {
+                            _ = app.auth.advanceAddProvider(app.alloc);
+                        } else {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "A provider is already being added.",
+                            }, true);
+                        }
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
                         app.shell.render_requests.request(.footer);
                         return true;
-                    };
+                    }
+                    // A preset always opens the add-provider flow, whether or
+                    // not the profile already defines it: choosing a preset is
+                    // choosing to paste its key, and that is the step a
+                    // half-saved connection is missing. Nothing about a preset
+                    // means "switch to it".
+                    if (provider_presets.find(selected)) |preset| {
+                        _ = app.auth.beginAddProviderWithPreset(app.alloc, preset);
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    }
+                    const provider = resolveProvider(app, selected) orelse return false;
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         // A configured connection has no sign-in method, so there
                         // is no second column to walk. It opens its own menu

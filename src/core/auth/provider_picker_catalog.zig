@@ -118,6 +118,12 @@ fn providerVisible(id: model_provider.ProviderId) bool {
     return true;
 }
 
+/// The row that starts the add-provider flow. It is a label rather than a
+/// provider name, so it is never resolved as one: the last column of the
+/// `/provider` list is where a vendor nobody preset yet gets added, and without
+/// it the only way in was to already know a preset's name.
+pub const add_provider_slug = "+ Add a provider";
+
 /// Writes the visible provider slugs into `out` and returns how many landed.
 /// Fills `out` with the provider names the `/provider` picker offers: the
 /// built-in ones, then the profile's own configured connections. A configured
@@ -146,6 +152,10 @@ pub fn providerOptions(out: [][]const u8, configured: []const []const u8) usize 
         if (containsName(configured, preset.name)) continue;
         if (provider_catalog.parse(preset.name) != null) continue;
         out[count] = preset.name;
+        count += 1;
+    }
+    if (count < out.len) {
+        out[count] = add_provider_slug;
         count += 1;
     }
     return count;
@@ -178,9 +188,12 @@ test "provider options expose the catalog slugs the composer accepts" {
 
     try std.testing.expect(count >= 2);
     try std.testing.expectEqualStrings("vercel", buf[0]);
-    for (buf[0..count]) |slug| {
-        try std.testing.expect(provider_catalog.parse(slug) != null);
-        try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);
+    // The add-provider row is a label, not a provider name, so it is the one
+    // entry that is not a slug.
+    try std.testing.expectEqualStrings(add_provider_slug, buf[count - 1]);
+    for (buf[0 .. count - 1]) |slug| {
+        try std.testing.expect(provider_catalog.parse(slug) != null or provider_presets.find(slug) != null);
+        try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null or provider_presets.find(slug) == null);
     }
 }
 
@@ -233,8 +246,11 @@ test "key source slugs round trip and map to their credentials" {
 test "provider options include the profile's configured names" {
     var buf: [max_provider_options][]const u8 = undefined;
     const count = providerOptions(&buf, &.{ "magpie", "openrouter" });
-    // The three built-in slugs, then the configured names in order.
-    try std.testing.expectEqual(provider_catalog.entries.len + 2, count);
+    // The built-in slugs, then the configured names in order.
     try std.testing.expectEqualStrings("magpie", buf[provider_catalog.entries.len]);
     try std.testing.expectEqualStrings("openrouter", buf[provider_catalog.entries.len + 1]);
+    // `openrouter` is configured, so its preset is not offered twice; the
+    // add-provider row still ends the list.
+    try std.testing.expectEqualStrings(add_provider_slug, buf[count - 1]);
+    try std.testing.expect(count > provider_catalog.entries.len + 2);
 }
