@@ -2715,11 +2715,12 @@ pub const Runtime = struct {
 
     /// Starts adding a custom provider. Returns false when a draft is already in
     /// progress, so a repeated Enter cannot discard gathered fields.
-    pub fn beginAddProvider(self: *Self) bool {
-        // A draft left behind by a closed flow would otherwise refuse every
-        // later attempt with no way to clear it, which is what made the second
-        // "add a provider" report that one was already being added.
-        if (self.add_provider_draft != null) return false;
+    /// Starts adding a provider. A draft left behind by a flow the user walked
+    /// away from is discarded rather than refused: nothing in the picker could
+    /// reach an abandoned draft, so refusing turned one half-typed entry into a
+    /// permanent "a provider is already being added" with no way back.
+    pub fn beginAddProvider(self: *Self, alloc: Allocator) bool {
+        if (self.add_provider_draft) |*stale| stale.deinit(alloc);
         self.add_provider_draft = .{};
         self.picker_active = true;
         self.picker_stage = .add_provider;
@@ -2731,7 +2732,7 @@ pub const Runtime = struct {
     /// URL, protocol, and key variable already filled in. The walk lands on the
     /// key, because everything else is known.
     pub fn beginAddProviderWithPreset(self: *Self, alloc: Allocator, preset: provider_presets.Preset) bool {
-        if (!self.beginAddProvider()) return false;
+        if (!self.beginAddProvider(alloc)) return false;
         var draft = &self.add_provider_draft.?;
         draft.name.appendSlice(alloc, preset.name) catch return false;
         draft.base_url.appendSlice(alloc, preset.base_url) catch return false;
@@ -2748,7 +2749,7 @@ pub const Runtime = struct {
     /// writes only the key.
     pub fn beginAddProviderKey(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) !void {
         const name = provider.label();
-        if (!self.beginAddProvider()) return;
+        if (!self.beginAddProvider(alloc)) return;
         errdefer self.cancelAddProvider(alloc);
 
         var registry = try @import("../config/config_runtime.zig").loadConfiguredProviders(alloc);
@@ -2855,12 +2856,27 @@ pub const Runtime = struct {
 
     /// Moves the preset or protocol selection by one row, wrapping. Returns
     /// false when the current field is typed rather than chosen.
+    /// Moves the selection inside the add-provider walk, or reports that the
+    /// walk owns the key. Every step owns the arrows, including the text fields
+    /// where there is no list to move in: while a provider is being set up the
+    /// arrows belong to this flow alone, and letting them fall through would
+    /// switch subagents mid-typing, which is how a keystroke meant for a field
+    /// changed the screen instead.
     pub fn moveAddProviderSelection(self: *Self, delta: i32) bool {
         var draft = &(self.add_provider_draft orelse return false);
+        // Every step owns the arrows, including the text fields where there is
+        // no list to move in. While a provider is being set up the arrows belong
+        // to this walk alone: letting them fall through switched subagents
+        // mid-typing, which is how a keystroke meant for a field changed the
+        // screen instead.
+        switch (draft.field) {
+            .name, .base_url, .api_key => return true,
+            .preset, .protocol => {},
+        }
         const count = switch (draft.field) {
             .preset => provider_presets.option_count,
             .protocol => add_provider_protocols.len,
-            else => return false,
+            .name, .base_url, .api_key => unreachable,
         };
         if (count == 0) return false;
         const current: usize = switch (draft.field) {
@@ -6025,9 +6041,10 @@ test "add provider flow pre-fills from a preset and finishes on the key" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    try std.testing.expect(runtime.beginAddProvider());
-    // A second begin is refused so gathered fields cannot be discarded.
-    try std.testing.expect(!runtime.beginAddProvider());
+    try std.testing.expect(runtime.beginAddProvider(alloc));
+    // A second begin replaces the abandoned draft rather than refusing: nothing
+    // in the picker could reach a stale one, so refusing locked the flow out.
+    try std.testing.expect(runtime.beginAddProvider(alloc));
     try std.testing.expect(runtime.addProviderFlowActive());
 
     // The first step offers every preset plus the custom row.
@@ -6057,7 +6074,7 @@ test "add provider custom row asks for a name first" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
-    try std.testing.expect(runtime.beginAddProvider());
+    try std.testing.expect(runtime.beginAddProvider(alloc));
     // Move to the custom row, which is last.
     for (0..provider_presets.presets.len) |_| _ = runtime.moveAddProviderSelection(1);
     _ = runtime.advanceAddProvider(alloc);

@@ -555,6 +555,10 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn routeAuthPickerMove(app: *App, agent: *AppAgent, delta: i32) bool {
             if (comptime !@hasField(App, "auth")) return false;
+            // Adding a provider owns the arrows outright. A running turn used to
+            // keep them, which meant the arrows switched subagents while the
+            // user was filling in a field.
+            if (app.auth.addProviderFlowActive()) return app.auth.movePicker(delta);
             if (agent.stream.active) return false;
             return app.auth.movePicker(delta);
         }

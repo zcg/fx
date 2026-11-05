@@ -723,7 +723,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .add_provider => {
                     // The add-provider flow starts from the picker's last row.
-                    if (!app.auth.beginAddProvider()) {
+                    if (!app.auth.beginAddProvider(app.alloc)) {
                         try app.writeDomainNotice(.{
                             .topic = "auth",
                             .tone = .warning,

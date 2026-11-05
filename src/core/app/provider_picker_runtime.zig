@@ -294,7 +294,7 @@ pub fn Runtime(comptime App: type) type {
                         // The custom row means "a vendor with no preset", so it
                         // starts on the name. Showing the preset list again
                         // would be asking the same question twice.
-                        if (app.auth.beginAddProvider()) {
+                        if (app.auth.beginAddProvider(app.alloc)) {
                             debug_trace.logf("auth", "custom provider walk opened", .{});
                             _ = app.auth.advanceAddProvider(app.alloc);
                         } else {
