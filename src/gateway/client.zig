@@ -5316,6 +5316,11 @@ test "errorEventClass retries only server errors, overload, and upstream timeout
     const alloc = std.testing.allocator;
     const cases = [_]struct { event: []const u8, class: ErrorEventClass }{
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}", .class = .transient },
+        // An upstream proxy that buffers the reply can drop it mid-stream and
+        // report that as `api_error`. The request itself was fine, so the turn
+        // is resent instead of failing: this is the exact event one gateway
+        // sends, with no `type` field of its own.
+        .{ .event = "{\"error\":{\"message\":\"Trae Global: connection lost mid-reply (the plugin host sent a line longer than 33554432 bytes)\",\"type\":\"api_error\"}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"route failed\"}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"no_available_providers\",\"message\":\"none\"}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}", .class = .transient },

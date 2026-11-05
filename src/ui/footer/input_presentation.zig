@@ -472,6 +472,7 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
         .connections => &connections_variants,
         .provider, .switch_credential => &selection_variants,
         .add_provider => add_provider_variants,
+        .provider_actions => &selection_variants,
         .change_team => &team_variants,
         .sign_in => switch (view.sign_in_source) {
             .chatgpt_subscription => &codex_sign_in_variants,

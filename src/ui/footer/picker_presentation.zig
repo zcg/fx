@@ -80,7 +80,7 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
 
 fn isSetupListStage(stage: auth_runtime.PickerStage) bool {
     return switch (stage) {
-        .root, .connections, .provider, .change_team, .switch_credential => true,
+        .root, .connections, .provider, .change_team, .switch_credential, .provider_actions => true,
         .sign_in, .api_key, .add_provider => false,
     };
 }
@@ -95,7 +95,7 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .switch_credential => "Credential source",
                 .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
             },
-            .provider, .source, .team, .add_provider => "",
+            .provider, .source, .team, .add_provider, .provider_action => "",
         },
         .connections => switch (choice) {
             .action => |action| switch (action) {
@@ -105,9 +105,10 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .setup => "AI Gateway API key",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
-            .provider, .source, .team, .add_provider => "",
+            .provider, .source, .team, .add_provider, .provider_action => "",
         },
         .provider, .change_team, .switch_credential => view.choiceLabel(choice),
+        .provider_actions => view.choiceLabel(choice),
         .sign_in, .api_key, .add_provider => "",
     };
 }
@@ -125,7 +126,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     "not connected",
                 .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
             },
-            .provider, .source, .team, .add_provider => "",
+            .provider, .source, .team, .add_provider, .provider_action => "",
         },
         .connections => switch (choice) {
             .action => |action| switch (action) {
@@ -140,9 +141,10 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     "not configured",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
-            .provider, .source, .team, .add_provider => "",
+            .provider, .source, .team, .add_provider, .provider_action => "",
         },
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
+        .provider_actions => view.choiceDescription(choice),
         .sign_in, .api_key, .add_provider => "",
     };
 }
@@ -218,6 +220,7 @@ fn composeSetupHeaderRow(
             .connections => "Connections",
             .provider => "Model provider",
             .switch_credential => "Credential source",
+            .provider_actions => "Provider",
             .sign_in, .api_key, .change_team, .add_provider => unreachable,
         };
         try row_text.appendClipped(alloc, &row, heading, width);
@@ -241,7 +244,7 @@ fn composeSetupEmptyRow(
         else
             "  No matching Vercel teams",
         .switch_credential => "  No credentials available",
-        .root, .connections, .sign_in, .api_key, .add_provider => "",
+        .root, .connections, .sign_in, .api_key, .add_provider, .provider_actions => "",
     }, width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;

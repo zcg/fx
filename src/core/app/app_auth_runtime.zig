@@ -717,6 +717,7 @@ pub fn Runtime(comptime App: type) type {
             }
             switch (choice) {
                 .provider => |provider| try switchProvider(app, agent, provider, true, .manual),
+                .provider_action => |action| try applyProviderAction(app, agent, app.auth.pickerTargetProvider(), action),
                 .add_provider => {
                     // The add-provider flow starts from the picker's last row.
                     if (!app.auth.beginAddProvider()) {
@@ -956,6 +957,66 @@ pub fn Runtime(comptime App: type) type {
             };
             app.provider_selection.definitions.deinit(app.alloc);
             app.provider_selection.definitions = registry;
+        }
+
+        /// Carries out the row chosen in a provider's action menu. `use` is the
+        /// ordinary switch; the other three are what a configured connection
+        /// needs after it exists, and each used to require editing settings by
+        /// hand. `target` is the provider the menu was opened for, not whatever
+        /// provider happens to be active now.
+        fn applyProviderAction(app: *App, agent: *AppAgent, target: model_provider.ProviderId, action: auth_runtime.ProviderAction) !void {
+            switch (action) {
+                .use => try switchProvider(app, agent, target, true, .manual),
+                .refresh_models => {
+                    // Re-reading the list is what makes a newly shipped model
+                    // appear; resetting drops the cached list and the warmup
+                    // below fetches it again.
+                    app.model_cache.reset();
+                    if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .neutral,
+                        .body = try app.alloc.print("Refreshing the model list for {s}.", .{provider_catalog.label(target)}),
+                    }, true);
+                    app.shell.render_requests.request(.footer);
+                },
+                .set_key => {
+                    // The key entry screen already exists; it is the same one
+                    // `/provider` uses when a connection has no key yet.
+                    if (comptime !runtime_profile.allows(App, .native_auth)) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "API key setup is supplied by the embedding SDK.",
+                        }, true);
+                        return;
+                    }
+                    app.auth.openApiKeyPicker(app.alloc);
+                    app.shell.render_requests.request(.footer);
+                },
+                .remove => {
+                    const name = try app.alloc.dupe(u8, target.label());
+                    defer app.alloc.free(name);
+                    _ = config_runtime.setUserPreferences(app.alloc, .{ .remove_provider = name }) catch |err| {
+                        debug_trace.logf("provider", "provider remove failed err={s}", .{@errorName(err)});
+                        try app.writeDomainNotice(.{
+                            .topic = "provider",
+                            .tone = .warning,
+                            .body = "The provider could not be removed. Check ~/.fx/settings.json is writable.",
+                        }, true);
+                        return;
+                    };
+                    if (comptime provider_key_store.enabled) {
+                        provider_key_store.clear(app.alloc, name) catch {};
+                    }
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .neutral,
+                        .body = try app.alloc.print("Removed provider {s}.", .{name}),
+                    }, true);
+                    app.shell.render_requests.request(.footer);
+                },
+            }
         }
 
         fn submitApiKeyEntry(app: *App) !void {

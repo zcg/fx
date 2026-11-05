@@ -296,7 +296,15 @@ pub fn Runtime(comptime App: type) type {
                         return true;
                     };
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
-                        try commit(app, .{ .provider = provider });
+                        // A configured connection has no sign-in method, so there
+                        // is no second column to walk. It opens its own menu
+                        // instead of switching outright: that is where its model
+                        // list is refreshed, its key replaced, and the
+                        // connection removed.
+                        app.auth.openProviderActions(app.alloc, provider);
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        app.shell.render_requests.request(.footer);
                         return true;
                     }
                     // Nothing is applied yet: the provider is only a heading

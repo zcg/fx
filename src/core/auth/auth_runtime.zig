@@ -521,6 +521,38 @@ pub const AcquisitionAction = enum {
     automatic,
 };
 
+/// What choosing a provider in `/provider` opens. The picker is the place a
+/// connection is managed, not only the place it is switched to: refreshing its
+/// models and replacing its key are the two things a configured provider needs
+/// after it exists, and both used to require editing settings by hand.
+pub const ProviderAction = enum {
+    /// Make this provider the one requests use.
+    use,
+    /// Re-read its model list from the vendor.
+    refresh_models,
+    /// Replace the stored key.
+    set_key,
+    /// Delete the connection and its stored key.
+    remove,
+};
+
+/// The actions offered for a provider row, in menu order. A built-in provider
+/// offers only `use`: its key belongs to sign-in and it cannot be removed.
+pub fn providerActions(is_configured: bool) []const ProviderAction {
+    const configured = [_]ProviderAction{ .use, .refresh_models, .set_key, .remove };
+    const built_in = [_]ProviderAction{.use};
+    return if (is_configured) &configured else &built_in;
+}
+
+pub fn providerActionLabel(action: ProviderAction) []const u8 {
+    return switch (action) {
+        .use => "Use this provider",
+        .refresh_models => "Refresh its model list",
+        .set_key => "Set or replace its API key",
+        .remove => "Remove this provider",
+    };
+}
+
 pub const PickerStage = enum {
     root,
     connections,
@@ -533,6 +565,9 @@ pub const PickerStage = enum {
     /// protocol, and API key, one field at a time. Enter advances; the last
     /// step saves the provider.
     add_provider,
+    /// The menu a chosen provider opens: use it, refresh its models, replace
+    /// its key, or remove it.
+    provider_actions,
 };
 
 /// One step of the add-provider flow, in the order the user walks it. The
@@ -1443,28 +1478,34 @@ pub const Choice = union(enum) {
     team: usize,
     /// The add-provider entry in the provider picker.
     add_provider: void,
+    /// One row of the menu a chosen provider opens.
+    provider_action: ProviderAction,
 
     pub fn eql(self: Choice, other: Choice) bool {
         return switch (self) {
             .provider => |provider| switch (other) {
                 .provider => |other_provider| provider.eql(other_provider),
-                .source, .action, .team, .add_provider => false,
+                .source, .action, .team, .add_provider, .provider_action => false,
             },
             .source => |source| switch (other) {
                 .source => |other_source| source == other_source,
-                .provider, .action, .team, .add_provider => false,
+                .provider, .action, .team, .add_provider, .provider_action => false,
             },
             .action => |action| switch (other) {
-                .provider, .source, .team, .add_provider => false,
+                .provider, .source, .team, .add_provider, .provider_action => false,
                 .action => |other_action| action == other_action,
             },
             .team => |team| switch (other) {
-                .provider, .source, .action, .add_provider => false,
+                .provider, .source, .action, .add_provider, .provider_action => false,
                 .team => |other_team| team == other_team,
             },
             .add_provider => switch (other) {
                 .add_provider => true,
-                .provider, .source, .action, .team => false,
+                .provider, .source, .action, .team, .provider_action => false,
+            },
+            .provider_action => |action| switch (other) {
+                .provider_action => |other_action| action == other_action,
+                .provider, .source, .action, .team, .add_provider => false,
             },
         };
     }
@@ -1528,6 +1569,7 @@ pub const PickerView = struct {
             else
                 3 + self.configured_providers.len + 1,
             .sign_in, .api_key, .add_provider => 0,
+            .provider_actions => providerActions(self.active_provider == .configured).len,
             .change_team => teamFilter(self.teams, self.team_query).count(),
             .switch_credential => gatewaySourceCount(self.available_sources) + 1,
         };
@@ -1565,6 +1607,11 @@ pub const PickerView = struct {
                     null,
             },
             .sign_in, .api_key, .add_provider => null,
+            .provider_actions => blk: {
+                const actions = providerActions(self.active_provider == .configured);
+                if (index >= actions.len) break :blk null;
+                break :blk .{ .provider_action = actions[index] };
+            },
             .change_team => if (teamFilter(self.teams, self.team_query).at(index)) |team_index| .{ .team = team_index } else null,
             .switch_credential => if (index < gatewaySourceCount(self.available_sources))
                 .{ .source = gatewaySourceAtIndex(self.available_sources, index).? }
@@ -1606,6 +1653,7 @@ pub const PickerView = struct {
             },
             .team => |index| if (index < self.teams.len) self.teams[index].name else "",
             .add_provider => "Add a provider...",
+            .provider_action => |action| providerActionLabel(action),
         };
     }
 
@@ -1629,6 +1677,7 @@ pub const PickerView = struct {
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
             .add_provider => "",
+            .provider_action => "",
         };
     }
 
@@ -1637,7 +1686,7 @@ pub const PickerView = struct {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
                 (action != .chatgpt_login or !host_target.is_wasm) and
                 (action != .grok_login or !host_target.is_wasm),
-            .provider, .source, .team, .add_provider => true,
+            .provider, .source, .team, .add_provider, .provider_action => true,
         };
     }
 
@@ -2888,6 +2937,29 @@ pub const Runtime = struct {
             self.pickerView().choiceAt(0);
     }
 
+    /// The provider the picker's action menu is acting on.
+    pub fn pickerTargetProvider(self: *const Self) model_provider.ProviderId {
+        return self.provider_picker_active;
+    }
+
+    /// Opens the menu for a chosen provider. The row was resolved before this,
+    /// so the menu acts on exactly the provider the row named.
+    pub fn openProviderActions(
+        self: *Self,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
+        self.exitSignInStage(alloc);
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.clearTeamSelection(alloc);
+        self.picker_active = true;
+        self.picker_include_skip = false;
+        self.picker_stage = .provider_actions;
+        self.provider_picker_active = provider;
+        const actions = providerActions(provider == .configured);
+        self.picker_selection = if (actions.len > 0) .{ .provider_action = actions[0] } else null;
+    }
+
     pub fn openApiKeyPicker(self: *Self, alloc: Allocator) void {
         self.openApiKeyPickerWithParent(alloc, false);
     }
@@ -3214,6 +3286,7 @@ pub const Runtime = struct {
             .change_team => .change_team,
             .switch_credential => .switch_credential,
             .add_provider => .switch_provider,
+            .provider_actions => .switch_provider,
         } };
         return true;
     }
@@ -3235,6 +3308,13 @@ pub const Runtime = struct {
 
         switch (self.picker_stage) {
             .sign_in, .api_key, .add_provider => unreachable,
+            // The menu's row is handed to the app, which carries it out; the
+            // picker itself closes on the way, so the next frame shows the
+            // result rather than a stale list.
+            .provider_actions => switch (selected) {
+                .provider_action => self.closePicker(alloc),
+                .provider, .source, .action, .team, .add_provider => unreachable,
+            },
             .connections => switch (selected) {
                 .action => |action| switch (action) {
                     .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
@@ -3246,17 +3326,20 @@ pub const Runtime = struct {
                     .automatic,
                     => unreachable,
                 },
-                .provider, .source, .team, .add_provider => unreachable,
+                .provider, .source, .team, .add_provider, .provider_action => unreachable,
             },
             .provider => switch (selected) {
                 .provider => self.closePicker(alloc),
                 // The add-provider row opens the flow instead of closing.
                 .add_provider => {},
+                // Choosing a provider opens its action menu; the picker stays.
+                .provider_action => {},
                 .source, .action, .team => unreachable,
             },
             .root => switch (selected) {
                 .provider => unreachable,
                 .add_provider => unreachable,
+                .provider_action => unreachable,
                 .source => self.closePicker(alloc),
                 .action => |action| switch (action) {
                     .connections => {
@@ -3278,14 +3361,14 @@ pub const Runtime = struct {
             },
             .change_team => switch (selected) {
                 .team => {},
-                .provider, .source, .action, .add_provider => unreachable,
+                .provider, .source, .action, .add_provider, .provider_action => unreachable,
             },
             .switch_credential => switch (selected) {
                 .source => self.closePicker(alloc),
                 // Automatic is the only action this stage offers; the app
                 // handler clears the stored choice and closes the picker.
                 .action => |action| std.debug.assert(action == .automatic),
-                .provider, .team, .add_provider => unreachable,
+                .provider, .team, .add_provider, .provider_action => unreachable,
             },
         }
         return choice;
