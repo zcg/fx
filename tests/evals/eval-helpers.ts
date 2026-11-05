@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
+export const FX_BIN = resolve(import.meta.dirname, process.platform === "win32" ? "../../zig-out/bin/fx.exe" : "../../zig-out/bin/fx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {

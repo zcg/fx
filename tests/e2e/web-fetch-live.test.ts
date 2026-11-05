@@ -136,12 +136,16 @@ function fakeGatewayEnv(
 ) {
   return {
     HOME: root.home,
+    USERPROFILE: root.home,
+    FX_HOME: undefined,
+    FX_PROVIDER: "gateway",
     AI_GATEWAY_API_KEY: "fake-live-web-fetch-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: OUTER_MODEL,
+    FX_SOUND: "0",
   };
 }
 
@@ -151,8 +155,9 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
   for (const probe of [
     { url: LIVE_ROBOTS_URL, domain: "vercel.com", label: "robots" },
     { url: LIVE_MODELS_URL, domain: "ai-gateway.vercel.sh", label: "models" },
+    { url: LIVE_URL, domain: "example.com", label: "Windows HTTPS", windows_only: true },
   ] as const) {
-    test(
+    test.skipIf("windows_only" in probe && process.platform !== "win32")(
       `${probe.label} endpoint returns non-empty content through the fresh binary`,
       async () => {
         const root = createIsolatedRoot([probe.domain]);
@@ -213,6 +218,7 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
           expect(result.stderr).not.toContain("python");
           expect(result.stderr).not.toContain("curl");
           expect(gateway.requests).toHaveLength(2);
+          if ("windows_only" in probe) expect(gateway.requests[1].body).toContain("Example Domain");
           expect(json.output).toContain(`${probe.label} endpoint`);
 
           console.log(

@@ -518,30 +518,43 @@ fn connectWindows(alloc: Allocator, target: PinnedTarget, options: FetchOptions)
     };
     defer stream.close(zio);
 
+    return switch (target.url.scheme) {
+        .http => fetchWindowsPlain(alloc, stream, target, options),
+        .https => fetchWindowsTls(alloc, stream, target, options),
+    };
+}
+
+fn fetchWindowsPlain(alloc: Allocator, stream: std.Io.net.Stream, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    const zio = io_mod.getIo();
     var send_buffer: [4096]u8 = undefined;
     var receive_buffer: [16384]u8 = undefined;
+    var net_writer = stream.writer(zio, &send_buffer);
+    writeRequest(&net_writer.interface, target, options) catch |err| {
+        const root = unwrapWriteFailure(err, net_writer.err);
+        traceFailure(.request_write, root);
+        return root;
+    };
+    net_writer.interface.flush() catch |err| {
+        const root = unwrapWriteFailure(err, net_writer.err);
+        traceFailure(.request_write, root);
+        return root;
+    };
+    var net_reader = stream.reader(zio, &receive_buffer);
+    var failure_stage: FailureStage = .response_head;
+    return readResponse(alloc, &net_reader.interface, options.max_body_bytes, options, &failure_stage) catch |err| {
+        const root = unwrapReadFailure(err, null, net_reader.err);
+        traceFailure(failure_stage, root);
+        return root;
+    };
+}
 
-    {
-        var net_writer = stream.writer(zio, &send_buffer);
-        writeRequest(&net_writer.interface, target, options) catch |err| {
-            const root = unwrapWriteFailure(err, net_writer.err);
-            traceFailure(.request_write, root);
-            return root;
-        };
-        net_writer.interface.flush() catch |err| {
-            const root = unwrapWriteFailure(err, net_writer.err);
-            traceFailure(.request_write, root);
-            return root;
-        };
-
-        var net_reader = stream.reader(zio, &receive_buffer);
-        var failure_stage: FailureStage = .response_head;
-        return readResponse(alloc, &net_reader.interface, options.max_body_bytes, options, &failure_stage) catch |err| {
-            const root = unwrapReadFailure(err, null, net_reader.err);
-            traceFailure(failure_stage, root);
-            return root;
-        };
-    }
+fn fetchWindowsTls(alloc: Allocator, stream: std.Io.net.Stream, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    const zio = io_mod.getIo();
+    var read_buffer: [tls_transport_buffer_len]u8 = undefined;
+    var write_buffer: [tls_transport_buffer_len]u8 = undefined;
+    var encrypted_reader = stream.reader(zio, &read_buffer);
+    var encrypted_writer = stream.writer(zio, &write_buffer);
+    return fetchTlsTransport(alloc, &encrypted_reader, &encrypted_writer, target, options);
 }
 
 /// The address to connect to, chosen from the addresses the URL policy admitted.
@@ -576,6 +589,14 @@ fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: F
 }
 
 fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    var encrypted_reader: TlsDeadlineReader = undefined;
+    encrypted_reader.init(fd, options);
+    var encrypted_writer: TlsDeadlineWriter = undefined;
+    encrypted_writer.init(fd, options);
+    return fetchTlsTransport(alloc, &encrypted_reader, &encrypted_writer, target, options);
+}
+
+fn fetchTlsTransport(alloc: Allocator, encrypted_reader: anytype, encrypted_writer: anytype, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
     const zio = io_mod.getIo();
 
     var ca_bundle: std.crypto.Certificate.Bundle = .empty;
@@ -586,11 +607,6 @@ fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: Fet
         traceFailure(.tls_handshake, err);
         return err;
     };
-
-    var encrypted_reader: TlsDeadlineReader = undefined;
-    encrypted_reader.init(fd, options);
-    var encrypted_writer: TlsDeadlineWriter = undefined;
-    encrypted_writer.init(fd, options);
 
     const tls_read_buffer = try alloc.alloc(u8, std.crypto.tls.Client.min_buffer_len);
     defer alloc.free(tls_read_buffer);
