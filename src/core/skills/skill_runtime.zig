@@ -626,7 +626,22 @@ fn openContainedDir(
 ) !std.Io.Dir {
     const canonical_path = try io_mod.realpathAlloc(alloc, logical_path);
     defer alloc.free(canonical_path);
-    if (!try canonicalPathHasReadAuthority(alloc, read_authority, canonical_path)) {
+    // Authority is decided on the path the user named, not only on what it
+    // resolves to. On Windows a directory under the user's own home is routinely
+    // a junction onto another drive: Scoop keeps application data in its persist
+    // directory and links it into place, and that makes `%USERPROFILE%\.claude`
+    // resolve to `D:\...`. Rejecting the resolved path turned a normal Windows
+    // install into an unreadable skills folder, so a logical path inside the
+    // authority is enough on its own.
+    // A logical path is compared as text, so it can only be trusted when it
+    // names a place outright: a `..` in it would make the comparison skip back
+    // out of the authority it appears to sit in.
+    const logical_inside = !pathContainsDotDot(logical_path) and
+        std.Io.Dir.path.isAbsolute(logical_path) and
+        pathInsideReadAuthorities(read_authority, &.{}, logical_path);
+    if (!logical_inside and
+        !try canonicalPathHasReadAuthority(alloc, read_authority, canonical_path))
+    {
         return error.PathOutsideReadAuthority;
     }
     // The authority check above already decided this path may be read, and it did
@@ -767,6 +782,14 @@ fn containsRootPath(roots: []const SkillRoot, path: []const u8) bool {
     return false;
 }
 
+/// Opens one root the way discovery does, for a diagnostic probe. Returns the
+/// error rather than swallowing it, which is the whole point: discovery reports
+/// an unreadable root as a warning with no cause attached.
+pub fn openSkillRootForProbe(alloc: Allocator, root: SkillRoot) union(enum) { dir: std.Io.Dir, err: anyerror } {
+    const opened = openSkillRoot(alloc, root, .{ .iterate = true }) catch |err| return .{ .err = err };
+    return .{ .dir = opened };
+}
+
 fn appendSkillsFromDir(
     alloc: Allocator,
     skills: *std.ArrayList(Skill),
@@ -886,20 +909,16 @@ fn openPrimarySkillFileWithOptions(
         };
         var accepted = false;
         defer if (!accepted) file.close(io_mod.getIo());
-        const opened = io_mod.openedFilePathAlloc(alloc, file) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return .rejected;
-        };
-        defer alloc.free(opened);
-        const authority = if (read_authority) |root| root else root: {
-            const root = io_mod.dirRealpathAlloc(alloc, candidate_dir.*, ".") catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                return .rejected;
-            };
-            break :root root;
-        };
-        defer if (read_authority == null) alloc.free(authority);
-        if (!try canonicalPathHasReadAuthority(alloc, authority, opened)) return .rejected;
+        // A file inside a directory the caller already approved needs no second
+        // approval. On Windows that matters: a skill folder under the user's
+        // home is routinely a junction onto another drive, so the file's own
+        // resolved path (`D:\Scoop\persist\...`) is outside the authority
+        // while the folder the user opened (`%USERPROFILE%\.codex\skills`) is
+        // inside it. Comparing the file's path rejected every such skill.
+        //
+        // What still has to hold is that the file is the one inside that
+        // directory, which the open itself establishes: it was opened relative
+        // to the candidate directory, not from a path of its own.
         if (options.after_open) |hook| hook.run(hook.ctx);
         accepted = true;
         return .{ .opened = file };
@@ -972,12 +991,14 @@ fn appendSkillCandidate(
         const read_authority = root.read_authority orelse return;
         break :linked_candidate openContainedDir(alloc, candidate_path, read_authority, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf("skills", "linked candidate failed path={s} err={s}", .{ candidate_path, @errorName(err) });
             if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .linked_candidate_unavailable);
             return;
         };
     } else root_dir.openDir(io_mod.getIo(), entry_name, .{ .follow_symlinks = true }) catch |err| {
         if (err == error.FileNotFound) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("skills", "candidate open failed entry={s} root={s} err={s}", .{ entry_name, root.path, @errorName(err) });
         if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
         return;
     };

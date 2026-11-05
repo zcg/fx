@@ -9,9 +9,13 @@ const builtin_skills = @import("builtins/skills.zig");
 const io_mod = @import("core/shared/io.zig");
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
     const alloc = std.heap.page_allocator;
     const c_alloc = std.heap.c_allocator;
+
+    // The app installs the environment `main` received before anything reads a
+    // variable. Without it every lookup returns null, which is what made the
+    // first run of this probe report a home directory that Windows always has.
+    io_mod.setEnvironMap(init.environ_map);
 
     const home = io_mod.homeDir();
     std.debug.print("home={?s}\n", .{home});
@@ -59,6 +63,19 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Open each root the way discovery does, and report the exact error.
+    for (roots_before) |root| {
+        const opened = skill_runtime.openSkillRootForProbe(c_alloc, root);
+        switch (opened) {
+            .dir => |dir| {
+                var mutable = dir;
+                mutable.close(io_mod.getIo());
+                std.debug.print("open OK   {s}\n", .{root.path});
+            },
+            .err => |err| std.debug.print("open FAIL {s} err={s}\n", .{ root.path, @errorName(err) }),
+        }
+    }
+
     std.debug.print("--- loadVisibleSkills ---\n", .{});
     var discovery = skill_runtime.loadVisibleSkills(
         c_alloc,
@@ -74,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("skills={d} diagnostics={d}\n", .{ discovery.skills.len, discovery.diagnostics.len });
     for (discovery.diagnostics, 0..) |diagnostic, index| {
         if (index >= 10) break;
-        std.debug.print("  diag path={s}\n", .{diagnostic.path});
+        std.debug.print("  diag path={s} cause={t} scope={t}\n", .{ diagnostic.path, diagnostic.cause, diagnostic.scope });
     }
 
     std.debug.print("--- Runtime refresh ---\n", .{});
@@ -83,7 +100,7 @@ pub fn main(init: std.process.Init) !void {
     const generation = try runtime.requestRefresh(c_alloc, workspace_root, home, builtin_skills.root_policy);
     std.debug.print("generation={d}\n", .{generation});
     var guard: usize = 0;
-    while (guard < 600) : (guard += 1) {
+    while (guard < 3000) : (guard += 1) {
         const completion = runtime.pollRefresh(c_alloc, workspace_root, builtin_skills.root_policy) catch |err| {
             std.debug.print("pollRefresh FAILED err={s}\n", .{@errorName(err)});
             return;
@@ -96,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
             },
         }
         std.debug.print("status={t}\n", .{runtime.generationStatus(generation)});
-        io_mod.sleep(50 * std.time.ns_per_ms);
+        io_mod.sleep(20 * std.time.ns_per_ms);
     }
     std.debug.print("final status={t}\n", .{runtime.generationStatus(generation)});
 }
