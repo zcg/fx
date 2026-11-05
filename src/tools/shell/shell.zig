@@ -17,6 +17,7 @@ const terminal_managed_observer = @import("../../core/terminal/managed_observer.
 const terminal_operation = @import("../../core/terminal/operation.zig");
 const terminal_store = @import("../../core/terminal/store.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
+const windows_shell = @import("../../core/shared/windows_shell.zig");
 const shell_snapshot = @import("../../core/terminal/shell_snapshot.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
@@ -448,7 +449,6 @@ fn argument_problem(input: Input) ?[]const u8 {
             if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "command must contain 1-65536 bytes.";
             if (input.timeout_ms == 0) return "timeout_ms must be at least 1; choose the intended deadline.";
             if (input.profile != null and input.shell != null) return "Choose either profile or shell.";
-            if (!input.tty and input.shell != null) return "shell applies only with tty=true; remove shell for an ordinary command, or set tty=true for an interactive terminal.";
         },
         .interact => {
             if (input.chars) |chars| {
@@ -589,7 +589,7 @@ fn validateRun(
         );
     };
     if (!input.tty) {
-        _ = commandEnvironment(arena, ctx, input.profile) catch |err| {
+        _ = commandEnvironment(arena, ctx, input.profile, input.shell) catch |err| {
             return try ctx.allocator.print(
                 "shell run profile is invalid: {s}",
                 .{@errorName(err)},
@@ -642,6 +642,7 @@ fn callRun(
         request_arena,
         ctx,
         input.profile,
+        input.shell,
     ) catch |err| {
         return .{ .failure = try ctx.allocator.print(
             "shell run profile is invalid: {s}",
@@ -1969,14 +1970,56 @@ fn commandEnvironment(
     alloc: Allocator,
     ctx: tool_dispatch.DispatchContext,
     profile: ?command_environment.Profile,
+    shell: ?ShellInput,
 ) !command_environment.Environment {
     if (ctx.captured_command_host == .workspace_clean) {
-        if (profile != null) return error.InvalidWorkspaceInput;
+        if (profile != null or shell != null) return error.InvalidWorkspaceInput;
         return .workspace_clean;
     }
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    // A chosen shell wins over the profile: `profile` says how the default
+    // shell starts, and `shell` says which shell to start at all. A bare name
+    // such as `bash` or `pwsh` is resolved through detection, so the model does
+    // not have to know where a package manager installed it.
+    if (shell) |value| {
+        const resolved_path = try resolveShellPath(alloc, value.path);
+        defer if (!std.mem.eql(u8, resolved_path, value.path)) alloc.free(resolved_path);
+        return shell_resolver.environmentForShellSpec(alloc, configured, .{ .executable = .{
+            .path = resolved_path,
+            .clean_start = value.clean_start,
+        } });
+    }
     return shell_resolver.environment(alloc, configured, profile);
+}
+
+/// Turns `bash` or `pwsh` into the absolute path of the installed shell, and
+/// leaves anything else alone so an explicit path still works.
+fn resolveShellPath(alloc: Allocator, path: []const u8) ![]const u8 {
+    if (std.Io.Dir.path.isAbsolute(path)) return path;
+    if (comptime !windows_shell.supported) return path;
+    const name = std.mem.trim(u8, path, " \t");
+    const preference: []const u8 = if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "git-bash"))
+        "bash"
+    else if (std.mem.eql(u8, name, "pwsh"))
+        "pwsh"
+    else if (std.mem.eql(u8, name, "cmd"))
+        "cmd"
+    else
+        return path;
+    var found = (windows_shell.detectPreferred(alloc, preference) catch null) orelse return path;
+    // A `bash` request that fell back to pwsh means Git Bash is not installed;
+    // reporting the requested shell as unavailable is clearer than silently
+    // running a different one.
+    if (std.mem.eql(u8, preference, "bash") and found.kind != .git_bash) {
+        found.deinit(alloc);
+        return error.GitBashNotInstalled;
+    }
+    if (std.mem.eql(u8, preference, "pwsh") and found.kind != .pwsh) {
+        found.deinit(alloc);
+        return error.PwshNotInstalled;
+    }
+    return found.path;
 }
 
 pub fn isCapturedCommand(erased: tool_dispatch.ToolInput) bool {
@@ -2990,6 +3033,7 @@ test "registered shell empty observation waits through one managed execution" {
         environment_arena_state.allocator(),
         .{ .allocator = alloc, .workspace_root = "/tmp" },
         .clean,
+        null,
     );
     const command_ctx = command_admission.CommandContext{
         .command = "sleep 2; printf done",

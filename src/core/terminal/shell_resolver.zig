@@ -3,6 +3,8 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
+const windows_shell = @import("../shared/windows_shell.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -15,12 +17,22 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
-pub const ShellKind = enum { bash, zsh };
+pub const ShellKind = enum { bash, zsh, pwsh, powershell, cmd };
 
 pub fn shellKind(path: []const u8) ?ShellKind {
     const basename = std.Io.Dir.path.basename(path);
     if (std.mem.eql(u8, basename, "bash")) return .bash;
+    if (std.mem.eql(u8, basename, "bash.exe")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
+    // Windows has no POSIX shell; the ones it does have are named here so a
+    // configured shell resolves instead of falling back to a path that does
+    // not exist on the platform.
+    if (std.mem.eql(u8, basename, "pwsh")) return .pwsh;
+    if (std.mem.eql(u8, basename, "pwsh.exe")) return .pwsh;
+    if (std.mem.eql(u8, basename, "powershell")) return .powershell;
+    if (std.mem.eql(u8, basename, "powershell.exe")) return .powershell;
+    if (std.mem.eql(u8, basename, "cmd")) return .cmd;
+    if (std.mem.eql(u8, basename, "cmd.exe")) return .cmd;
     return null;
 }
 
@@ -99,12 +111,73 @@ pub fn resolve(
             }
             result.append("-i");
         },
+        // Windows shells take no login or startup-file flags of the POSIX kind.
+        // `-NoLogo` keeps the banner out of the first frame; `-NoProfile` keeps
+        // the user's profile from changing what a command does.
+        .pwsh, .powershell => {
+            result.append("-NoLogo");
+            result.append("-NoProfile");
+            result.append("-NoExit");
+        },
+        .cmd => result.append("/Q"),
     }
     return result;
 }
 
+/// Windows: the shell to use, from the `shell` setting when it names an
+/// installed one, else the detected default. The first detection is written
+/// back so later calls read a setting instead of probing the disk again.
+fn windowsLoginShellInto(buffer: []u8) ?[]const u8 {
+    const alloc = std.heap.c_allocator;
+    const preference = configuredShellSetting(alloc);
+    defer if (preference) |value| alloc.free(value);
+    var shell = (windows_shell.detectPreferred(alloc, preference) catch null) orelse return null;
+    defer shell.deinit(alloc);
+    if (preference == null) cacheShellSetting(shell.kind);
+    if (shell.path.len > buffer.len) return null;
+    @memcpy(buffer[0..shell.path.len], shell.path);
+    return buffer[0..shell.path.len];
+}
+
+/// Reads the `shell` setting without the full settings pipeline: this runs on
+/// the command path, where a merge of every settings layer would be wasted
+/// work for one string.
+fn configuredShellSetting(alloc: Allocator) ?[]u8 {
+    const home = io_mod.homeDir() orelse return null;
+    const path = std.Io.Dir.path.join(alloc, &.{ home, ".fx", "settings.json" }) catch return null;
+    defer alloc.free(path);
+    var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return null;
+    defer file.close(io_mod.getIo());
+    const bytes = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch return null;
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("shell") orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return alloc.dupe(u8, value.string) catch null;
+}
+
+/// Records the detected shell so the next run reads it instead of probing.
+/// A failure is ignored: the shell still works, it is only detected again.
+fn cacheShellSetting(kind: windows_shell.Kind) void {
+    var attempt = @import("../config/config_runtime.zig").attemptUserPreferences(
+        std.heap.c_allocator,
+        .{ .shell = windows_shell.settingName(kind) },
+    );
+    attempt.deinit(std.heap.c_allocator);
+}
+
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows) {
+        // Windows has no passwd database. The shell is the one detected on this
+        // machine, cached in the `shell` setting after the first lookup, so a
+        // command runs in PowerShell 7 when it is installed and in Git Bash
+        // otherwise. Returning null here is what made every shell command fail
+        // on this platform.
+        return windowsLoginShellInto(buffer);
+    }
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .wasi) {
         return null;
     }
     var entry: std.c.passwd = undefined;
@@ -258,6 +331,19 @@ pub fn snapshotInvocation(
             invocation.append("-O");
             invocation.append("expand_aliases");
         },
+        // A Windows shell is driven with `-NoProfile -Command`, so the command
+        // runs in a clean session rather than one shaped by the user's profile.
+        .pwsh, .powershell => {
+            invocation.append("-NoLogo");
+            invocation.append("-NoProfile");
+            invocation.append("-NonInteractive");
+        },
+        .cmd => invocation.append("/Q"),
+    }
+    if (kind == .pwsh or kind == .powershell or kind == .cmd) {
+        // Windows shells are invoked with `-Command <string>`; the command is
+        // appended by the caller, so the invocation carries only the flags.
+        return invocation;
     }
     // bash's `builtin exec` drops its redirections when it returns, and bash
     // 3.2 hangs on a `command exec`, so bash uses plain `exec`. Nothing is
@@ -266,6 +352,7 @@ pub fn snapshotInvocation(
     const park_stderr: []const u8, const restore_stderr: []const u8 = switch (kind) {
         .zsh => .{ "\\builtin exec 9>&2 2>/dev/null; ", "\\builtin exec 2>&9 9>&-; " },
         .bash => .{ "exec 9>&2 2>/dev/null; ", "\\builtin unset -f exec; exec 2>&9 9>&-; " },
+        .pwsh, .powershell, .cmd => .{ "", "" },
     };
     var bootstrap: std.ArrayList(u8) = .empty;
     errdefer bootstrap.deinit(alloc);

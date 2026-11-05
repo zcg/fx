@@ -2099,9 +2099,11 @@ fn executeRawInvocation(
     cwd: []const u8,
     invocation: *const shell_resolver.Invocation,
 ) !command_contract.RunCommandResult {
-    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
-        return error.InvalidCommandEnvironment;
-    }
+    // Windows spawns the resolved shell directly. It has no `exec` to wrap a
+    // script in, so the command is handed to the shell's own `-c`/`/C` flag and
+    // the shell's stdout and stderr are collected the same way POSIX collects
+    // them.
+    if (builtin.target.os.tag == .wasi) return error.InvalidCommandEnvironment;
     const result = try executeProcessWithScript(
         scratch,
         cfg,

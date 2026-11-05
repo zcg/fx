@@ -111,10 +111,14 @@ fn fingerprintFor(kind: shell_resolver.ShellKind, user_dirs: []const ?[]const u8
     const system_files: []const []const u8 = switch (kind) {
         .zsh => &zsh_system_files,
         .bash => &bash_system_files,
+        // A Windows shell reads no POSIX startup files, so nothing about them
+        // can change the snapshot.
+        .pwsh, .powershell, .cmd => &.{},
     };
     const user_files: []const []const u8 = switch (kind) {
         .zsh => &zsh_user_files,
         .bash => &bash_user_files,
+        .pwsh, .powershell, .cmd => &.{},
     };
     for (system_files) |path| result.add(path);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;

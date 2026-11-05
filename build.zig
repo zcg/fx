@@ -241,6 +241,30 @@ pub fn build(b: *std.Build) void {
     const http_probe_step = b.step("probe-http", "Check a background HTTP GET on Windows");
     http_probe_step.dependOn(&run_http_probe.step);
 
+    // Which shell this machine resolves, and how it would be invoked.
+    const shell_probe = b.addExecutable(.{
+        .name = "shell-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/windows/shell_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    shell_probe.root_module.addImport("windows_shell", b.createModule(.{
+        .root_source_file = b.path("src/core/shared/windows_shell.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const bash_probe = b.addExecutable(.{ .name = "bash-probe", .root_module = b.createModule(.{ .root_source_file = b.path("scripts/windows/bash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }) });
+    bash_probe.root_module.addImport("io", b.createModule(.{ .root_source_file = b.path("src/core/shared/io.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    const run_bash_probe = b.addRunArtifact(bash_probe);
+    const bash_probe_step = b.step("probe-bash", "Trace the Git Bash lookup");
+    bash_probe_step.dependOn(&run_bash_probe.step);
+    const run_shell_probe = b.addRunArtifact(shell_probe);
+    const shell_probe_step = b.step("probe-shell", "Report the shell this machine resolves");
+    shell_probe_step.dependOn(&run_shell_probe.step);
+
     const run_bench = b.addRunArtifact(file_index_bench);
     run_bench.step.dependOn(&install_bench.step);
     run_bench.addPassthruArgs();

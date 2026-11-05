@@ -72,17 +72,32 @@ comptime {
 
 const shell_base_description =
     "Run a shell command. Each call starts a new shell with the user's startup files, so cd and export do not carry over. If the command is still running after yield_time_ms, you get a session_id: call again with action=interact to wait for more output, or action=stop to end it. Never rerun it. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use `" ++ detach_command ++ "` and check it is ready in that call. In zsh, quote globs meant for another program.";
+
+/// Windows has two shells, and which one a command belongs in depends on the
+/// command. The description says so, because a model that does not know will
+/// write POSIX syntax for PowerShell or a Windows path for Bash, and either
+/// fails in a way that reads like a broken tool.
+const shell_windows_description =
+    " On Windows this runs PowerShell 7 (pwsh) by default. Pass shell={\"kind\":\"bash\"} for Git Bash: use Bash for POSIX tools (sed, awk, grep, find, xargs, make), pwsh for Windows-native work (services, registry, .NET, cmdlets). Paths differ: Bash takes /c/Users/name/project, pwsh takes C:\\Users\\name\\project. If Bash lacks a tool, retry in pwsh.";
+
+fn baseDescription(comptime with_windows: bool) []const u8 {
+    return shell_base_description ++ if (with_windows) shell_windows_description else "";
+}
 const shell_file_tools_sentence =
     " To list, find, or read files, use glob_files, grep_files, and read_file, not ls, find, grep, or cat.";
-const shell_process_description = shell_base_description ++ shell_file_tools_sentence;
-const shell_description = shell_base_description ++
+/// The file-tools sentence is left out on Windows: the Windows note already
+/// spends that budget on the two shells, which a model cannot guess and which
+/// is the difference between a working command and a broken one.
+const shell_process_description = baseDescription(builtin.target.os.tag == .windows) ++
+    (if (builtin.target.os.tag == .windows) "" else shell_file_tools_sentence);
+const shell_description = baseDescription(builtin.target.os.tag == .windows) ++
     " For an interactive program, run it with tty=true, then type into it with action=interact and chars." ++
-    shell_file_tools_sentence;
+    (if (builtin.target.os.tag == .windows) "" else shell_file_tools_sentence);
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{"executable"} } },
-        .{ .name = "path", .json_type = .string, .description = "Absolute path to Bash or zsh." },
+        .{ .name = "path", .json_type = .string, .description = "Absolute path to Bash or zsh, or on Windows the name bash or pwsh." },
         .{ .name = "clean_start", .json_type = .boolean },
     },
     .required = &.{ "kind", "path" },

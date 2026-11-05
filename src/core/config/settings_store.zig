@@ -132,6 +132,9 @@ pub const UserSettingsPatch = struct {
     /// itself is never here: a local runtime reads it from the named
     /// environment variable, and one with a keychain stores it there.
     provider_definition: ?ConfiguredProviderPatch = null,
+    /// On Windows, the shell commands run in: pwsh, bash, or cmd. Written once
+    /// from the first detection so later runs read it instead of probing.
+    shell: ?[]const u8 = null,
     /// Removes a named connection and, with it, any stored key. Distinct from a
     /// null `provider_definition`, which means "leave unchanged".
     remove_provider: ?[]const u8 = null,
@@ -165,7 +168,8 @@ pub const UserSettingsPatch = struct {
             self.context == null and
             self.remove == null and
             self.provider_definition == null and
-            self.remove_provider == null;
+            self.remove_provider == null and
+            self.shell == null;
     }
 };
 
@@ -1279,6 +1283,9 @@ fn applyUserPatchToRoot(
     }
     if (patch.remove_provider) |name| {
         application.changed = removeConfiguredProvider(&root.object, name) or application.changed;
+    }
+    if (patch.shell) |value| {
+        application.changed = try putString(arena, &root.object, "shell", value) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", value.label()) or application.changed;

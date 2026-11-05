@@ -148,6 +148,7 @@ pub const keys = [_]Key{
     .{ .name = "statusLine", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .renamed_to = "status_line", .description = "Renamed to status_line" },
     .{ .name = "status_line", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .description = "What the footer shows" },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.fx/themes" },
+    .{ .name = "shell", .where = .profile, .kind = .string, .description = "On Windows, the shell fx runs commands in: pwsh, bash, or cmd. Defaults to the one detected at first use" },
     .{ .name = "ultrafast_mode", .where = .profile, .kind = .boolean, .description = "Request the higher-priced Ultrafast tier for an eligible AI Gateway model" },
     .{ .name = "update_channel", .where = .profile, .kind = .string, .values = &.{ "stable", "dev" }, .description = "Release channel for updates" },
     .{ .name = "web_fetch_worker_model", .where = .retired, .kind = .any, .description = retired_description },

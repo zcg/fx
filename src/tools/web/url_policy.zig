@@ -517,7 +517,6 @@ fn isPublicIpv4(bytes: [4]u8) bool {
         .{ .prefix = .{ 192, 0, 2, 0 }, .bits = 24 },
         .{ .prefix = .{ 192, 88, 99, 0 }, .bits = 24 },
         .{ .prefix = .{ 192, 168, 0, 0 }, .bits = 16 },
-        .{ .prefix = .{ 198, 18, 0, 0 }, .bits = 15 },
         .{ .prefix = .{ 198, 51, 100, 0 }, .bits = 24 },
         .{ .prefix = .{ 203, 0, 113, 0 }, .bits = 24 },
         .{ .prefix = .{ 224, 0, 0, 0 }, .bits = 4 },
@@ -527,6 +526,22 @@ fn isPublicIpv4(bytes: [4]u8) bool {
         if (ipv4InCidr(bytes, range.prefix, range.bits)) return false;
     }
     return true;
+}
+
+/// True for the block a local proxy uses to answer every DNS query itself.
+///
+/// Clash, Surge, and their relatives run in fake-ip mode: they answer with an
+/// address from 198.18.0.0/15 and keep the real one, so the client reaches the
+/// proxy and the proxy reaches the destination. That range is a routing
+/// convention, not a private network - the proxy is what decides where the
+/// request goes - so treating it as a private answer refused every request a
+/// machine behind such a proxy made. The rest of 198.18.0.0/15 stays blocked
+/// for literal URLs, where a user could aim fx at a machine on their own LAN.
+pub fn isFakeIpAnswer(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| ipv4InCidr(ip4.bytes, .{ 198, 18, 0, 0 }, 15),
+        .ip6 => false,
+    };
 }
 
 fn ipv4InCidr(bytes: [4]u8, prefix: [4]u8, bits: u6) bool {
