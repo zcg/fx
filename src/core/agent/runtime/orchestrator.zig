@@ -3640,7 +3640,8 @@ fn recoveryToolEvidence(
                     else => .uncertain,
                 };
             }
-            return .uncertain;
+            for (value.tool_calls) |call| if (call.provenance != .fx_local) return .uncertain;
+            return if (stream_ctx.saw_provider_tool_start) .uncertain else .proven_unexecuted;
         }
     }
     if (stream_ctx.saw_provider_tool_start) return .uncertain;
@@ -5200,7 +5201,7 @@ fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
         .tool_started => |tool| if (ctx.required_vision)
             onRequiredVisionStreamToolStart(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json)
         else
-            runtime_assistant_stream.onStreamToolStart(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json),
+            runtime_assistant_stream.onStreamToolStartWithProvenance(ctx.stream, tool.id, tool.name, tool.label, tool.arguments_json, tool.provenance),
     }
 }
 

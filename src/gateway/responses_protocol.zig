@@ -689,6 +689,8 @@ pub const StreamLimits = struct {
     tool_identity_bytes: usize,
     tool_arguments_bytes: usize,
     provider_state_bytes: usize,
+    /// Compatible gateways may rewrite opaque reasoning; keep validated tools and text.
+    omit_conflicting_reasoning: bool = false,
 };
 
 pub const StreamCallbacks = struct {
@@ -864,6 +866,7 @@ pub const Reducer = struct {
     message_items: std.ArrayList(MessageItem) = .empty,
     reasoning_items: std.ArrayList(ReasoningItem) = .empty,
     reasoning_bytes: usize = 0,
+    reasoning_conflicted: bool = false,
     tools: std.ArrayList(ToolAccumulator) = .empty,
     finish_reason: ?types.ProviderFinishReason = null,
     usage: types.Usage = .{},
@@ -953,7 +956,7 @@ pub const Reducer = struct {
                     try self.tools.items[index].reconcileIdentity(alloc, item.object, "id", limits);
                 }
             } else if (std.mem.eql(u8, item_type, "reasoning")) {
-                try self.reconcile_reasoning(alloc, output_index, item.object, .identity, limits);
+                try self.acceptReasoning(alloc, output_index, item.object, .identity, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 _ = try self.reconcile_message(alloc, output_index, try text_identity(item.object, "id"), try assistantMessagePhase(item.object), limits);
             } else {
@@ -1017,7 +1020,7 @@ pub const Reducer = struct {
             if (std.mem.eql(u8, item_type, "function_call")) {
                 try self.reconcileToolItem(alloc, output_index, item.object, callbacks, limits);
             } else if (std.mem.eql(u8, item_type, "reasoning")) {
-                try self.reconcile_reasoning(alloc, output_index, item.object, .completed, limits);
+                try self.acceptReasoning(alloc, output_index, item.object, .completed, limits);
             } else if (std.mem.eql(u8, item_type, "message")) {
                 try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
             } else {
@@ -1045,7 +1048,7 @@ pub const Reducer = struct {
                     if (std.mem.eql(u8, item_type, "function_call")) {
                         try self.reconcileToolItem(alloc, index, item.object, callbacks, limits);
                     } else if (std.mem.eql(u8, item_type, "reasoning")) {
-                        try self.reconcile_reasoning(alloc, index, item.object, .completed, limits);
+                        try self.acceptReasoning(alloc, index, item.object, .completed, limits);
                     } else if (std.mem.eql(u8, item_type, "message")) {
                         try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
                     } else {
@@ -1090,7 +1093,22 @@ pub const Reducer = struct {
         };
     }
 
-    fn reconcile_reasoning(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, fields: std.json.ObjectMap, evidence: enum { identity, completed }, limits: StreamLimits) !void {
+    const ReasoningEvidence = enum { identity, completed };
+
+    fn acceptReasoning(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, fields: std.json.ObjectMap, evidence: ReasoningEvidence, limits: StreamLimits) !void {
+        if (self.reasoning_conflicted) return;
+        self.reconcile_reasoning(alloc, output_index, fields, evidence, limits) catch |err| {
+            if (!limits.omit_conflicting_reasoning or err != error.ResponsesReasoningConflict) return err;
+            for (self.reasoning_items.items) |*item| {
+                if (item.json) |json| alloc.free(json);
+                item.json = null;
+            }
+            self.reasoning_bytes = 0;
+            self.reasoning_conflicted = true;
+        };
+    }
+
+    fn reconcile_reasoning(self: *Reducer, alloc: std.mem.Allocator, output_index: i64, fields: std.json.ObjectMap, evidence: ReasoningEvidence, limits: StreamLimits) !void {
         try self.check_output_kind(output_index, .reasoning);
         const id_hash = try text_identity(fields, "id");
         var low: usize = 0;
@@ -1115,8 +1133,14 @@ pub const Reducer = struct {
         errdefer if (json) |bytes| alloc.free(bytes);
         if (found) if (self.reasoning_items.items[low].json) |prior| {
             if (json) |bytes| {
-                if (!try json_comparison.serializedEqual(alloc, prior, bytes)) return error.ResponsesReasoningConflict;
-                alloc.free(bytes);
+                var parsed_prior = try std.json.parseFromSlice(std.json.Value, alloc, prior, .{});
+                defer parsed_prior.deinit();
+                const prior_encrypted = parsed_prior.value.object.get("encrypted_content").?.string;
+                if (!std.mem.eql(u8, prior_encrypted, encrypted.string)) return error.ResponsesReasoningConflict;
+                const total = try checkedAccumulatedSize(self.reasoning_bytes - prior.len, bytes.len, limits.provider_state_bytes);
+                alloc.free(prior);
+                self.reasoning_items.items[low].json = bytes;
+                self.reasoning_bytes = total;
             }
             if (id_hash != null) self.reasoning_items.items[low].id_hash = id_hash;
             return;
@@ -1711,6 +1735,29 @@ test "Responses reasoning replay retains terminal enrichment without duplicates"
         defer stream.freeCompletion(completion);
         try std.testing.expectEqualStrings("[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]", completion.provider_state_json orelse "");
     }
+}
+
+test "Responses reasoning accepts final summary enrichment with unchanged ciphertext" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"summary\"}]}]}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "summary_text") != null);
+}
+
+test "compatible Responses omits conflicting opaque reasoning and preserves text" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"first\"}}");
+    var limits = ToolRecordTest.limits;
+    limits.omit_conflicting_reasoning = true;
+    _ = try stream.reducer.applyJson(stream.alloc, "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"replacement\"},{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"kept\"}]}]}}", .{ .context = &stream.context, .on_content = ToolRecordTest.ignore }, &stream.cancelled, null, limits);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("kept", completion.content.?);
+    try std.testing.expect(completion.provider_state_json == null);
 }
 
 test "Responses reasoning replay orders sparse items and ignores equivalent duplicates" {

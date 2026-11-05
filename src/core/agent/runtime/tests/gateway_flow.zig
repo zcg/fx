@@ -5955,7 +5955,7 @@ test "processQueuedPrompt empty history recovery preserves validation and source
     }
 }
 
-test "processQueuedPrompt reconciles provider error before tool execution" {
+test "processQueuedPrompt regenerates local tools after provider error before execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -5978,7 +5978,7 @@ test "processQueuedPrompt reconciles provider error before tool execution" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"auto\"}");
     try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
     try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying · attempt 2");
     try expectRecovered(&hooks, 2);

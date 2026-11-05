@@ -30,6 +30,7 @@ pub const Event = union(enum) {
     tool_started: struct {
         id: []const u8,
         name: []const u8,
+        provenance: ?types.ToolExecutionProvenance = null,
         label: ?[]const u8 = null,
         /// Complete arguments borrowed only for synchronous event delivery.
         arguments_json: ?[]const u8 = null,
@@ -68,6 +69,10 @@ pub const EventSink = struct {
         arguments_json: ?[]const u8,
     ) void {
         fromContext(context).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
+    }
+
+    pub fn onLocalToolStart(context: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
+        fromContext(context).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json, .provenance = .fx_local } });
     }
 
     fn fromContext(context: *anyopaque) *EventSink {
@@ -850,6 +855,8 @@ test "event sink callback adapters emit the matching events" {
     on_tool_start(&sink, "call_2", "glob_files", null, null);
     try std.testing.expect(capture.last.?.tool_started.label == null);
     try std.testing.expect(capture.last.?.tool_started.arguments_json == null);
+    EventSink.onLocalToolStart(&sink, "call_3", "web_search", null, null);
+    try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, capture.last.?.tool_started.provenance.?);
 }
 
 test "stream provider rejects system messages in conversation before delegation" {

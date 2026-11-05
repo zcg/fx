@@ -302,9 +302,17 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
 }
 
 pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8) void {
+    onStreamToolStartWithProvenance(ctx, tool_id, tool_name, label_value, arguments_json, null);
+}
+
+pub fn onStreamToolStartWithProvenance(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8, provenance: ?types.ToolExecutionProvenance) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     const first_tool_in_step = !stream_ctx.saw_tool_start;
-    recordStreamToolStart(ctx, tool_name);
+    if (provenance == .fx_local) {
+        stream_ctx.saw_tool_start = true;
+    } else {
+        recordStreamToolStart(ctx, tool_name);
+    }
     const preflight = runtime_tool_presentation.ProvisionalToolStatuses.preflight(stream_ctx.hooks.tool_registry, tool_name) orelse {
         publishTurnPhase(stream_ctx, .running);
         return;

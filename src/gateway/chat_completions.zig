@@ -89,9 +89,9 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
 /// endpoint reads.
 const configured_replay_limits = responses.ReplayLimits{
     .tool_calls = 128,
-    .tool_identity_bytes = 256,
-    .tool_arguments_bytes = 4096,
-    .provider_state_bytes = 4096,
+    .tool_identity_bytes = 1024,
+    .tool_arguments_bytes = 4 * 1024 * 1024,
+    .provider_state_bytes = types.ProviderReplay.max_bytes,
 };
 
 /// The request body for a configured provider that speaks the Responses
@@ -137,7 +137,7 @@ fn build_responses_request(
     try writer.writeAll(",\"input\":[");
     try responses.writeInput(
         writer,
-        std.heap.c_allocator,
+        alloc,
         projected orelse request.messages,
         request.verified_images,
         configured_replay_limits,
@@ -145,7 +145,7 @@ fn build_responses_request(
     );
     try writer.writeByte(']');
 
-    _ = try responses.writeTools(writer, alloc, request.tools);
+    if (request.tool_choice != .none) _ = try responses.writeTools(writer, alloc, request.tools);
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true");
@@ -158,6 +158,9 @@ fn build_responses_request(
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+    if (replay) |value| {
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, value.parts_json, " \t\r\n"), "[")) return responses.selectReplayParts(alloc, replay, calls, text, reasoning);
+    }
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
     if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
     return selected;
@@ -301,7 +304,21 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         .@"openai-chat-completions" => consume(alloc, reader, request, watch.progress()),
         .@"openai-responses" => consumeResponses(alloc, reader, request),
         .@"anthropic-messages" => consumeAnthropic(alloc, reader, request),
-    }) catch |err| return watch.failure(err);
+    }) catch |err| {
+        const failure = watch.failure(err);
+        return switch (failure) {
+            error.ResponsesReasoningConflict,
+            error.ResponsesTextConflict,
+            error.ResponsesToolCallConflict,
+            error.ResponsesOutputItemConflict,
+            error.InvalidEvent,
+            error.InvalidChunk,
+            error.StreamIncomplete,
+            error.IncompleteStream,
+            => .{ .failed = .{ .kind = .server_error, .detail = try alloc.dupe(u8, "The provider returned an inconsistent response stream; retrying."), .ownership = .owned } },
+            else => failure,
+        };
+    };
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
@@ -347,13 +364,41 @@ pub fn consumeAnthropic(alloc: Allocator, reader: *std.Io.Reader, request: strea
 /// match what the streaming codec already allows the other protocols, so a
 /// provider cannot make fx allocate without bound by sending a large reply.
 const configured_stream_limits = responses.StreamLimits{
-    .aggregate_bytes = 32 * 1024 * 1024,
+    .aggregate_bytes = 64 * 1024 * 1024,
     .events = 100_000,
     .tool_calls = 128,
-    .tool_identity_bytes = 256,
-    .tool_arguments_bytes = 1024 * 1024,
+    .tool_identity_bytes = configured_replay_limits.tool_identity_bytes,
+    .tool_arguments_bytes = configured_replay_limits.tool_arguments_bytes,
     .provider_state_bytes = types.ProviderReplay.max_bytes,
+    .omit_conflicting_reasoning = true,
 };
+
+test "configured Responses replays tool arguments larger than 256 KiB and omits disabled tools" {
+    const alloc = std.testing.allocator;
+    const definition = definitions.Definition{
+        .id = "local",
+        .protocol = .@"openai-responses",
+        .base_url = "http://localhost:1234/v1",
+        .auth = .none,
+    };
+    const arguments = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(arguments);
+    @memcpy(arguments[0..9], "{\"text\":\"");
+    @memset(arguments[9 .. arguments.len - 2], 'a');
+    @memcpy(arguments[arguments.len - 2 ..], "\"}");
+    const calls = [_]types.ToolCall{.{ .id = "call_large", .name = "write_file", .arguments_json = arguments }};
+    const body = try build_for(&definition, alloc, .{
+        .model = "test-model",
+        .messages = &.{.{ .role = .assistant, .tool_calls = &calls }},
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer alloc.free(body);
+    try std.testing.expect(body.len > arguments.len);
+    try std.testing.expect(std.mem.find(u8, body, "\"tools\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"none\"") != null);
+    try std.testing.expect(configured_replay_limits.tool_arguments_bytes >= configured_stream_limits.tool_arguments_bytes);
+}
 
 /// Parses a streamed Responses reply. The shape differs enough from
 /// chat-completions - typed events, an output array, tool items that arrive as
@@ -362,7 +407,7 @@ const configured_stream_limits = responses.StreamLimits{
 pub fn consumeResponses(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var reducer = responses.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var reader_sse = sse.Reader{ .max_event_bytes = 1024 * 1024, .max_total_bytes = configured_stream_limits.aggregate_bytes };
+    var reader_sse = sse.Reader{ .max_event_bytes = 32 * 1024 * 1024, .max_total_bytes = configured_stream_limits.aggregate_bytes };
     defer reader_sse.deinit(alloc);
 
     // `EventSink` already adapts its context to these callback shapes, which is
@@ -370,7 +415,7 @@ pub fn consumeResponses(alloc: Allocator, reader: *std.Io.Reader, request: strea
     const callbacks = responses.StreamCallbacks{
         .context = @ptrCast(@constCast(&request.events)),
         .on_content = streams.EventSink.onContentChunk,
-        .on_tool_start = streams.EventSink.onToolStart,
+        .on_tool_start = streams.EventSink.onLocalToolStart,
         .on_reasoning = streams.EventSink.onReasoningChunk,
         .on_tool_input = streams.EventSink.onToolInputChunk,
     };
