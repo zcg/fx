@@ -517,6 +517,9 @@ fn isPublicIpv4(bytes: [4]u8) bool {
         .{ .prefix = .{ 192, 0, 2, 0 }, .bits = 24 },
         .{ .prefix = .{ 192, 88, 99, 0 }, .bits = 24 },
         .{ .prefix = .{ 192, 168, 0, 0 }, .bits = 16 },
+        // 198.18.0.0/15 stays here so a literal URL naming it is refused. A
+        // proxy's fake-ip DNS answer is admitted separately, by isFakeIpAnswer.
+        .{ .prefix = .{ 198, 18, 0, 0 }, .bits = 15 },
         .{ .prefix = .{ 198, 51, 100, 0 }, .bits = 24 },
         .{ .prefix = .{ 203, 0, 113, 0 }, .bits = 24 },
         .{ .prefix = .{ 224, 0, 0, 0 }, .bits = 4 },

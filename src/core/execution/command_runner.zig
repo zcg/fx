@@ -3869,7 +3869,8 @@ fn signalProcess(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
         // Windows has no signal numbers to deliver. Every caller that reaches
         // here is ending a child it started, so the kernel's terminate is the
         // operation with the same effect. A negative pid addresses a POSIX
-        // process group, which Windows expresses as a job object instead.
+        // process group, which Windows has no equivalent of, so only the
+        // process itself is ended.
         if (!io_mod.pidIsValid(pid)) return;
         io_mod.killProcess(pid) catch |err| switch (err) {
             error.ProcessNotFound => {},
@@ -3890,8 +3891,9 @@ fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
     if (comptime builtin.target.os.tag == .windows) {
         // Windows has no process groups to signal, so only the process itself is
-        // ended. Its children are covered by the job object fx assigns when it
-        // starts a command.
+        // ended. fx assigns no job object to a captured command, so children that
+        // command started keep running; ending that tree needs a job object at
+        // spawn time, which is not implemented yet.
         if (io_mod.pidIsValid(pid)) {
             io_mod.killProcess(pid) catch |err| debug_trace.logf(
                 "core",
