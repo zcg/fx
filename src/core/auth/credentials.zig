@@ -387,18 +387,25 @@ pub fn resolveForProvider(
         const bound = try provider.bind(registry);
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
-            // A key pasted into fx's add-provider flow has no environment
-            // variable to live in, so it is kept encrypted under the profile and
-            // read before the environment. An exported variable still wins when
-            // it is set, because that is the more deliberate of the two.
+            // A configured provider's key has two homes. An exported
+            // environment variable is the more deliberate of the two, so it
+            // wins whenever it holds a non-empty value. A key pasted into fx's
+            // own add-provider flow has no environment variable to live in, so
+            // it is kept encrypted under the profile and read second. When
+            // neither holds a value the provider has no key, and a credential
+            // with an empty token is how the rest of fx says the connection is
+            // not usable.
             .bearer => |env| blk: {
-                if (io_mod.getenv(env)) |_| {
-                    break :blk .{ .credential = try loadEnvCredential(alloc, env, .configured) };
+                if (loadEnvCredential(alloc, env, .configured) catch null) |credential| {
+                    break :blk .{ .credential = credential };
                 }
                 if (try provider_key_store.load(alloc, bound.label())) |stored| {
-                    break :blk .{ .credential = .{ .token = stored, .source = .configured } };
+                    if (stored.len > 0) {
+                        break :blk .{ .credential = .{ .token = stored, .source = .configured } };
+                    }
+                    alloc.free(stored);
                 }
-                break :blk .{ .credential = try loadEnvCredential(alloc, env, .configured) };
+                break :blk .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } };
             },
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
         };

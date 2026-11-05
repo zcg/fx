@@ -155,10 +155,12 @@ pub inline fn composeModelMenuRow(
 fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u16) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
-    try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
+    try appendHeaderTitle(alloc, &row, projection.filteredItemCount(), projection.refreshing);
 
     const tabs = ProviderTabs.build(projection.provider_tabs);
-    if (tabs.len == 0) return cloneClippedRow(alloc, row.items, width);
+    // A single tab is the whole list already: drawing `[All]` beside nothing
+    // would suggest other tabs exist and Tab would do something.
+    if (tabs.len < 2) return cloneClippedRow(alloc, row.items, width);
     const active_position = tabs.activePosition(projection.provider_index);
     const active_index = tabs.indices[active_position];
     const title_width = display_width.visibleWidthIgnoringAnsi(row.items);
@@ -226,11 +228,17 @@ const ProviderTabs = struct {
 /// profile's connections, and the header shows a window of them anyway.
 const max_provider_tabs = 33;
 
-fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
+fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize, refreshing: bool) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
     const title = std.mem.print(&buf, "Models {d}", .{count}) catch "Models";
     try row.appendSlice(alloc, title);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    if (!refreshing) return;
+    // A refresh the user asked for has to be visible while it runs and after it
+    // lands, even when the answer is that nothing changed.
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row.appendSlice(alloc, "  · refreshing…");
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
@@ -322,6 +330,14 @@ fn composeTitleRow(
     const id_budget = if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width;
     try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
+
+    if (item.added) {
+        // A label, not part of the model: it says this refresh is what listed
+        // the model, and the next refresh drops it once the model is old news.
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row.appendSlice(alloc, "  New");
+        try row.appendSlice(alloc, ui_render.reset_style);
+    }
 
     if (show_facts) {
         try row_text.appendSpacesToColumn(alloc, &row, facts_start);
@@ -762,52 +778,59 @@ test "model menu status follows provenance and retryable failure precedence" {
     }
 }
 
-test "model menu header shows only vendor filters represented by the catalog" {
+test "model menu header shows one tab per connection in the catalog" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
-        .{ .id = @constCast("anthropic/claude"), .provider = "anthropic", .capabilities = .{} },
-        .{ .id = @constCast("openai/gpt"), .provider = "openai", .capabilities = .{} },
-        .{ .id = @constCast("deepseek/v3"), .provider = "deepseek", .capabilities = .{} },
+        .{ .id = @constCast("claude"), .provider = "anthropic", .capabilities = .{} },
+        .{ .id = @constCast("gpt"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("v3"), .provider = "deepseek", .capabilities = .{} },
+    };
+    const tabs = [_]model_cache_runtime.ProviderTab{
+        .{ .count = 3 },
+        .{ .name = @constCast("anthropic"), .count = 1 },
+        .{ .name = @constCast("openai"), .count = 1 },
+        .{ .name = @constCast("deepseek"), .count = 1 },
     };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
         .items = &items,
+        .provider_tabs = &tabs,
     };
 
-    var header = try composeModelMenuRow(alloc, projection, 0, 60, 3);
+    var header = try composeModelMenuRow(alloc, projection, 0, 80, 3);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "…") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Provider ") == null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 60);
+    try std.testing.expect(std.mem.find(u8, header.items, "anthropic") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "openai") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "deepseek") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 80);
 }
 
-test "model menu header hides redundant vendor filters for a single-vendor catalog" {
+test "model menu header draws no tabs when one connection is the whole list" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
-        .{ .id = @constCast("gpt-5.6-sol"), .provider = "", .capabilities = .{} },
-        .{ .id = @constCast("gpt-5.4-mini"), .provider = "", .capabilities = .{} },
+        .{ .id = @constCast("gpt-5.6-sol"), .provider = "gateway", .capabilities = .{} },
+        .{ .id = @constCast("gpt-5.4-mini"), .provider = "gateway", .capabilities = .{} },
+    };
+    const tabs = [_]model_cache_runtime.ProviderTab{
+        .{ .count = 2 },
+        .{ .name = @constCast("gateway"), .count = 2 },
     };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
         .items = &items,
+        .provider_tabs = &tabs,
     };
 
     var header = try composeModelMenuRow(alloc, projection, 0, 120, 3);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Models 2") != null);
+    // One connection has nothing to switch to, so no tab is drawn at all.
+    try std.testing.expect(std.mem.find(u8, header.items, "[All]") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "gateway") == null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 120);
 }
 
 test "model menu facts share a left-aligned column" {
@@ -855,7 +878,7 @@ test "model menu facts share a left-aligned column" {
 test "model menu keeps only compact facts beside the model" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{.{
-        .id = @constCast("anthropic/claude-opus-4.8"),
+        .id = @constCast("claude-opus-4.8"),
         .provider = "anthropic",
         .capabilities = .{
             .context_window = 1_000_000,
@@ -876,7 +899,7 @@ test "model menu keeps only compact facts beside the model" {
 
     var title = try composeModelMenuRow(alloc, projection, 2, 100, rows);
     defer title.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "claude-opus-4.8") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast mode") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);

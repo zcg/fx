@@ -690,7 +690,7 @@ fn composeAddProviderPickerRow(
                 const selected = option == index;
                 try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
                 if (provider_presets.presetAt(option)) |preset| {
-                    var label_buf: [160]u8 = undefined;
+                    var label_buf: [200]u8 = undefined;
                     const label = std.mem.print(&label_buf, " {s}  {s}", .{ if (selected) "›" else " ", preset.label }) catch preset.name;
                     try row_text.appendClipped(alloc, &row, label, width -| 3);
                 } else {

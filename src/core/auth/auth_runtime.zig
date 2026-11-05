@@ -592,6 +592,11 @@ pub const AddProviderDraft = struct {
     base_url: std.ArrayList(u8) = .empty,
     /// The chosen protocol's name, borrowed from a static string.
     protocol: []const u8 = "",
+    /// Whether saving this draft writes the definition or only its key. The
+    /// picker's "set key" action opens a draft for a provider that already
+    /// exists, and rewriting its definition from those prefilled fields would
+    /// silently undo anything the profile changed since.
+    replace_definition: bool = true,
     /// The environment variable the key is read from, borrowed when a preset
     /// chose it and empty when the user types none.
     env: []const u8 = "",
@@ -2727,10 +2732,36 @@ pub const Runtime = struct {
         var draft = &self.add_provider_draft.?;
         draft.name.appendSlice(alloc, preset.name) catch return false;
         draft.base_url.appendSlice(alloc, preset.base_url) catch return false;
-        draft.protocol = preset.protocol;
+        draft.protocol = preset.protocol.wireName();
         draft.env = preset.env;
         draft.field = .api_key;
+        draft.replace_definition = false;
         return true;
+    }
+
+    /// Opens the key field for a provider the profile already defines, so its
+    /// stored key can be replaced without retyping the base URL and protocol.
+    /// Everything but the key comes from the saved definition, and the save
+    /// writes only the key.
+    pub fn beginAddProviderKey(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) !void {
+        const name = provider.label();
+        if (!self.beginAddProvider()) return;
+        errdefer self.cancelAddProvider(alloc);
+
+        var registry = try @import("../config/config_runtime.zig").loadConfiguredProviders(alloc);
+        defer registry.deinit(alloc);
+        const definition = registry.get(name) orelse return error.UnknownProvider;
+
+        const draft = &self.add_provider_draft.?;
+        try draft.name.appendSlice(alloc, name);
+        try draft.base_url.appendSlice(alloc, definition.base_url);
+        draft.protocol = @tagName(definition.protocol);
+        draft.env = switch (definition.auth) {
+            .bearer => |env| env,
+            .none => "",
+        };
+        draft.field = .api_key;
+        draft.replace_definition = false;
     }
 
     /// Cancels the add-provider flow and clears what was typed, including the
@@ -2859,7 +2890,7 @@ pub const Runtime = struct {
                     draft.name.appendSlice(alloc, preset.name) catch return null;
                     draft.base_url.clearRetainingCapacity();
                     draft.base_url.appendSlice(alloc, preset.base_url) catch return null;
-                    draft.protocol = preset.protocol;
+                    draft.protocol = preset.protocol.wireName();
                     draft.env = preset.env;
                     // Only the key is left to enter.
                     draft.field = .api_key;

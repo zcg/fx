@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
+const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -178,6 +179,11 @@ pub const ModelMenuItem = struct {
     /// the menu's tab owns, so every row from one connection shares a single
     /// string instead of holding its own copy.
     provider: []const u8 = "",
+    /// True when this refresh listed the model and the one before it did not.
+    /// A model the provider stopped serving is simply absent: keeping it on
+    /// screen would spend a row and a tab count on something that cannot be
+    /// chosen.
+    added: bool = false,
 
     fn deinit(self: *ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -216,6 +222,11 @@ pub const ModelMenu = struct {
     window_start: usize = 0,
     query_buf: [256]u8 = undefined,
     query_len: usize = 0,
+    /// A refresh the user asked for is in flight. The menu keeps listing the
+    /// models it has, because throwing them away would leave the user staring
+    /// at an empty list, but the header says a refresh is running so a
+    /// completed refresh that changed nothing is still visible as an answer.
+    refreshing: bool = false,
 
     pub fn deinit(self: *ModelMenu, alloc: Allocator) void {
         self.clearSnapshot(alloc);
@@ -337,29 +348,47 @@ pub const ModelMenu = struct {
     /// connection points at it, so the menu holds one name per connection
     /// rather than one per model.
     pub fn rebuildTabs(self: *ModelMenu, alloc: Allocator, previous: ?[]const u8) void {
+        // The rows borrow their name from the tabs, so the names have to be read
+        // before the old tabs are released. Collecting them first also means a
+        // row never keeps a pointer into freed memory.
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(alloc);
+        names.ensureTotalCapacity(alloc, self.items.items.len) catch return;
+        for (self.items.items) |item| {
+            if (item.provider.len == 0) continue;
+            var seen = false;
+            for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, item.provider)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) names.appendAssumeCapacity(item.provider);
+        }
+
         self.clearTabs(alloc);
         self.provider_tabs.append(alloc, .{ .name = null, .count = self.items.items.len }) catch return;
-        for (self.items.items) |*item| {
-            const name = item.provider;
-            if (name.len == 0) continue;
-            var tab_index: ?usize = null;
-            for (self.provider_tabs.items, 0..) |tab, index| {
-                const owned = tab.name orelse continue;
-                if (!std.mem.eql(u8, owned, name)) continue;
-                tab_index = index;
-                break;
-            }
-            if (tab_index) |index| {
-                self.provider_tabs.items[index].count += 1;
-                item.provider = self.provider_tabs.items[index].name.?;
-                continue;
-            }
+        for (names.items) |name| {
             const owned = alloc.dupe(u8, name) catch return;
-            self.provider_tabs.append(alloc, .{ .name = owned, .count = 1 }) catch {
+            var count: usize = 0;
+            for (self.items.items) |item| {
+                if (std.mem.eql(u8, item.provider, name)) count += 1;
+            }
+            self.provider_tabs.append(alloc, .{ .name = owned, .count = count }) catch {
                 alloc.free(owned);
                 return;
             };
-            item.provider = owned;
+        }
+        // Point every row at the copy the tab owns, so freeing the tabs is the
+        // only thing that decides those names' lifetime.
+        for (self.items.items) |*item| {
+            if (item.provider.len == 0) continue;
+            for (self.provider_tabs.items) |tab| {
+                const owned = tab.name orelse continue;
+                if (!std.mem.eql(u8, owned, item.provider)) continue;
+                item.provider = owned;
+                break;
+            }
         }
         // Keep the tab the user was on when it still exists, else `All`.
         self.provider_index = 0;
@@ -485,10 +514,16 @@ pub const Runtime = struct {
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
-    /// The connection the catalog in `catalog` came from, borrowed from the
-    /// provider id the last load named. The menu's rows carry it so a row
-    /// knows which connection to switch to.
-    provider_name: []const u8 = "",
+    /// The connection the catalog in `catalog` came from, owned. The menu's
+    /// rows borrow it, so it has to outlive every row; a borrowed label from a
+    /// `ProviderId` passed by value would dangle as soon as the call returns.
+    provider_name: []u8 = &.{},
+    /// A refresh the user asked for has not produced its catalog yet. Survives
+    /// the menu rebuild a refresh runs, which is why it is not on the menu.
+    refresh_pending: bool = false,
+    /// The ids the menu listed before the current refresh. Owned. Kept here for
+    /// the same reason `refresh_pending` is: the refresh rebuilds the menu.
+    previous_ids: std.ArrayList([]u8) = .empty,
     menu: ModelMenu = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -503,6 +538,19 @@ pub const Runtime = struct {
         self.discardStagedLocked();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        if (self.provider_name.len > 0) self.alloc.free(self.provider_name);
+        self.provider_name = &.{};
+        clearPreviousIds(self.alloc, &self.previous_ids);
+    }
+
+    /// Records which connection the catalog being loaded belongs to. The name
+    /// is copied because a `ProviderId` is passed by value and its inline
+    /// bytes die with the call.
+    pub fn setProviderName(self: *Self, name: []const u8) void {
+        if (std.mem.eql(u8, self.provider_name, name)) return;
+        const owned = self.alloc.dupe(u8, name) catch return;
+        if (self.provider_name.len > 0) self.alloc.free(self.provider_name);
+        self.provider_name = owned;
     }
 
     pub fn startWarmup(
@@ -512,7 +560,7 @@ pub const Runtime = struct {
         trigger: LoadTrigger,
     ) void {
         self.from_profile_settings = provider.provider_id == .configured;
-        self.provider_name = provider.provider_id.label();
+        self.setProviderName(provider.provider_id.label());
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -674,11 +722,31 @@ pub const Runtime = struct {
         self.from_profile_settings = false;
     }
 
+    /// Marks a user-requested refresh. The flag lives on the Runtime, not on the
+    /// menu, because the refresh discards the menu and rebuilds it: a flag on
+    /// the menu would die with the list it was describing. The ids the menu
+    /// shows are recorded here, so the rows that replace them can be labelled
+    /// when the list grew.
+    pub fn beginMenuRefresh(self: *Self) void {
+        self.refresh_pending = true;
+        if (self.menu.active and self.menu.items.items.len > 0) rememberMenuIds(self.alloc, &self.menu, &self.previous_ids);
+    }
+
+    /// Clears the refresh indicator, whatever the refresh produced. A refresh
+    /// that changed nothing still has to stop showing that it is running.
+    pub fn finishMenuRefresh(self: *Self) void {
+        self.refresh_pending = false;
+        self.menu.refreshing = false;
+    }
+
     /// Installs a catalog that was completely fetched and validated before the
     /// caller's publication boundary. Ownership transfers without allocation.
+    /// `provider_id` names the connection the catalog came from, so the Models
+    /// menu can give it a tab of its own.
     pub fn adoptOwnedCatalog(
         self: *Self,
         access: credentials.CatalogAccess,
+        provider_id: model_provider.ProviderId,
         owned_catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
     ) void {
         self.cancelAndJoin();
@@ -693,7 +761,8 @@ pub const Runtime = struct {
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
-        self.from_profile_settings = false;
+        self.from_profile_settings = provider_id == .configured;
+        self.setProviderName(provider_id.label());
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = model_catalog.clockMs();
@@ -745,6 +814,10 @@ pub const Runtime = struct {
         if (!self.completion_pending) return false;
 
         if (self.menu.active) try self.refreshMenuLocked(&self.menu);
+        // A refresh the user asked for ends here, whatever it produced: the
+        // rows are in place, so the header must stop saying "refreshing".
+        self.refresh_pending = false;
+        self.menu.refreshing = false;
         self.completion_pending = false;
         return true;
     }
@@ -1039,9 +1112,23 @@ pub const Runtime = struct {
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.provider_name),
+            .ready => try hydrateMenuSnapshot(
+                self.alloc,
+                menu,
+                self.catalog.items,
+                self.providerLabel(),
+                self.previous_ids.items,
+            ),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
+    }
+
+    /// The connection name to put on this catalog's rows. A catalog adopted
+    /// before any load ran has no name of its own, and the menu still needs one
+    /// so the rows are not nameless: the Gateway is what an unnamed catalog
+    /// belongs to.
+    fn providerLabel(self: *const Self) []const u8 {
+        return if (self.provider_name.len > 0) self.provider_name else "gateway";
     }
 };
 
@@ -1076,6 +1163,35 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
             .retryable = failed.retryable,
         } else null,
     };
+}
+
+fn clearPreviousIds(alloc: Allocator, ids: *std.ArrayList([]u8)) void {
+    for (ids.items) |id| alloc.free(id);
+    ids.deinit(alloc);
+    ids.* = .empty;
+}
+
+/// Records the ids the menu currently lists, so the rows that replace them can
+/// be labelled. Called before the rows are replaced: the comparison needs the
+/// list the user was looking at.
+fn rememberMenuIds(alloc: Allocator, menu: *const ModelMenu, ids: *std.ArrayList([]u8)) void {
+    clearPreviousIds(alloc, ids);
+    ids.ensureTotalCapacity(alloc, menu.items.items.len) catch return;
+    for (menu.items.items) |item| {
+        const owned = alloc.dupe(u8, item.id) catch return;
+        ids.appendAssumeCapacity(owned);
+    }
+}
+
+/// Marks a row `added` when the previous list did not have it. A run with no
+/// previous list is a first load, where every row would be new and the label
+/// would mean nothing.
+fn markAdded(previous_ids: []const []const u8, item: *ModelMenuItem) void {
+    if (previous_ids.len == 0) return;
+    for (previous_ids) |id| {
+        if (std.mem.eql(u8, id, item.id)) return;
+    }
+    item.added = true;
 }
 
 /// Builds one row per catalog entry, owned by the returned list. The rows'
@@ -1148,10 +1264,18 @@ const MenuCarry = struct {
 };
 
 /// Installs `items`, rebuilds the tabs, and puts the cursor back where it was
-/// when it can. `items` is moved into the menu.
-fn adoptMenuItems(alloc: Allocator, menu: *ModelMenu, items: std.ArrayList(ModelMenuItem), carry: MenuCarry) void {
+/// when it can. `items` is moved into the menu. `previous_ids` is the list the
+/// user was looking at before this run, and it belongs to the caller.
+fn adoptMenuItems(
+    alloc: Allocator,
+    menu: *ModelMenu,
+    items: std.ArrayList(ModelMenuItem),
+    carry: MenuCarry,
+    previous_ids: []const []const u8,
+) void {
     menu.clearSnapshot(alloc);
     menu.items = items;
+    for (menu.items.items) |*item| markAdded(previous_ids, item);
     menu.query_len = carry.query_len;
     @memcpy(menu.query_buf[0..carry.query_len], carry.query_buf[0..carry.query_len]);
     menu.rebuildTabs(alloc, carry.tab);
@@ -1176,11 +1300,12 @@ fn hydrateMenuSnapshot(
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
     connection: []const u8,
+    previous_ids: []const []const u8,
 ) !void {
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
     const items = try buildMenuItems(alloc, catalog, connection);
-    adoptMenuItems(alloc, menu, items, carry);
+    adoptMenuItems(alloc, menu, items, carry, previous_ids);
 }
 
 /// Appends `catalog`, one connection's whole catalog, to the rows the menu
@@ -1192,6 +1317,7 @@ fn mergeMenuSnapshot(
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
     connection: []const u8,
+    previous_ids: []const []const u8,
 ) !void {
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
@@ -1220,17 +1346,13 @@ fn mergeMenuSnapshot(
         }
         kept.appendAssumeCapacity(item);
     }
-    // `menu.items` still owns the rows it kept, so release only its buffer.
-    menu.items.deinit(alloc);
+    // The rows the menu kept now belong to `kept`, so the menu must not still
+    // name them: clearing that list before the append that can fail is what
+    // keeps a failed append from freeing them twice.
+    menu.items = .empty;
     try kept.appendSlice(alloc, items.items);
     items = .empty;
-    adoptMenuItems(alloc, menu, kept, carry);
-}
-
-fn modelProvider(model: []const u8) []const u8 {
-    const slash = std.mem.findScalar(u8, model, '/') orelse return "";
-    if (slash == 0) return "";
-    return model[0..slash];
+    adoptMenuItems(alloc, menu, kept, carry, previous_ids);
 }
 
 fn findCatalogModel(catalog: []const model_catalog.ModelCatalogEntry, model: []const u8) ?*const model_catalog.ModelCatalogEntry {
@@ -1683,7 +1805,7 @@ test "open model menu keeps its provider tab and selection when a revalidated ca
     const access = model_catalog.AccessMetadata.init(.{ .public_only = .no_credential });
     var runtime = Runtime.init(alloc, "/v1/models");
     defer runtime.deinit();
-    runtime.provider_name = "openai";
+    runtime.setProviderName("openai");
     runtime.catalog = try testCatalogIds(alloc, &.{ "openai/a", "openai/b", "openai/c" });
     runtime.outcome = .{ .loaded = .{ .access = access } };
     runtime.state = .ready;
@@ -2099,7 +2221,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "openai");
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "openai", &.{});
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -2144,7 +2266,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai");
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai", &.{});
     menu.active = true;
 
     menu.setQuery("gpt5");
@@ -2162,7 +2284,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     const revalidated = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
     } ++ entries;
-    try hydrateMenuSnapshot(alloc, &menu, &revalidated, "openai");
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, "openai", &.{});
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 }
@@ -2177,7 +2299,7 @@ test "a model's own name ranks it above longer ids that contain it" {
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai");
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai", &.{});
     menu.active = true;
 
     menu.setQuery("GPT-4o");
@@ -2239,8 +2361,8 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &openai_entries, "openai");
-    try mergeMenuSnapshot(alloc, &mixed, &xai_entries, "xai");
+    try hydrateMenuSnapshot(alloc, &mixed, &openai_entries, "openai", &.{});
+    try mergeMenuSnapshot(alloc, &mixed, &xai_entries, "xai", &.{});
     mixed.active = true;
 
     try std.testing.expectEqual(@as(usize, 3), mixed.provider_tabs.items.len);
@@ -2259,7 +2381,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     // A menu with a single connection has nowhere to go.
     var single: ModelMenu = .{};
     defer single.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &single, &openai_entries, "openai");
+    try hydrateMenuSnapshot(alloc, &single, &openai_entries, "openai", &.{});
     single.active = true;
     try std.testing.expect(!single.moveProvider(1));
     try std.testing.expect(single.providerFilter() == null);
@@ -2274,14 +2396,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, "openai");
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, "openai", &.{});
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, "openai")) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, "openai", &.{})) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

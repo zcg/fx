@@ -969,8 +969,11 @@ pub fn Runtime(comptime App: type) type {
                 .use => try switchProvider(app, agent, target, true, .manual),
                 .refresh_models => {
                     // Re-reading the list is what makes a newly shipped model
-                    // appear; resetting drops the cached list and the warmup
-                    // below fetches it again.
+                    // appear. The models the cache already holds stay on screen
+                    // while the fetch runs, and the header says a refresh is
+                    // running so a refresh that changes nothing is still
+                    // visible as an answer.
+                    app.model_cache.beginMenuRefresh();
                     app.model_cache.reset();
                     if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
                     try app.writeDomainNotice(.{
@@ -981,6 +984,23 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 },
                 .set_key => {
+                    // A configured provider's key is kept under the profile, and
+                    // its validity is whatever its own endpoint says the next
+                    // time fx uses it. Only the built-in providers have a login
+                    // service that can answer for a key up front, so only they
+                    // go through the key-entry screen that checks one.
+                    if (target == .configured and comptime provider_key_store.enabled) {
+                        app.auth.beginAddProviderKey(app.alloc, target) catch {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "The key could not be entered. Try again.",
+                            }, true);
+                            return;
+                        };
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
                     // The key entry screen already exists; it is the same one
                     // `/provider` uses when a connection has no key yet.
                     if (comptime !runtime_profile.allows(App, .native_auth)) {
@@ -1622,7 +1642,7 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
 
-            app.model_cache.adoptOwnedCatalog(access, &catalog);
+            app.model_cache.adoptOwnedCatalog(access, target, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
             // The definitions registry was loaded at startup. A provider added
             // or removed since then lives only in settings, so it is re-read

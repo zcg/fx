@@ -2225,7 +2225,11 @@ pub fn Runtime(comptime App: type) type {
         /// to bring its connection with it; otherwise the model would be sent
         /// to a provider that has never heard of it.
         fn switchToSelectedConnection(app: *App, agent: *AppAgent) !void {
-            const connection = app.model_cache.menu.selectedConnection() orelse return;
+            // The name is borrowed from the menu, and switching providers can
+            // rebuild the menu, so it is copied before the call that may do so.
+            const borrowed = app.model_cache.menu.selectedConnection() orelse return;
+            const connection = try app.alloc.dupe(u8, borrowed);
+            defer app.alloc.free(connection);
             const target = provider_picker_runtime.Runtime(App).resolveProvider(app, connection) orelse return;
             if (provider_runtime.providerOf(app, agent).eql(target)) return;
             try app_auth_runtime.Runtime(App).switchProvider(app, agent, target, false, .manual);

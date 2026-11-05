@@ -89,6 +89,9 @@ pub const ModelMenuProjection = struct {
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+    /// A user-requested refresh is running. The rows stay on screen, and the
+    /// header says the list is being re-read.
+    refreshing: bool = false,
 
     /// The connection the menu is filtered to, or null for `All`.
     pub fn providerFilter(self: ModelMenuProjection) ?[]const u8 {
@@ -381,6 +384,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,
         .query = cache.menu.query(),
+        .refreshing = cache.refresh_pending or cache.menu.refreshing,
     };
 }
 
