@@ -1363,7 +1363,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn switchProvider(
+        pub fn switchProvider(
             app: *App,
             agent: *AppAgent,
             target: model_provider.ProviderId,

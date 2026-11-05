@@ -83,13 +83,25 @@ pub const ModelMenuProjection = struct {
     load_state: model_cache_runtime.ModelMenuLoadState = .loading,
     catalog_state: model_cache_runtime.ModelMenuCatalogState = .{},
     items: []const model_cache_runtime.ModelMenuItem = &.{},
+    /// The tabs the menu offers, borrowed from the menu's own list.
+    provider_tabs: []const model_cache_runtime.ProviderTab = &.{},
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
 
-    pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
-        return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
+    /// The connection the menu is filtered to, or null for `All`.
+    pub fn providerFilter(self: ModelMenuProjection) ?[]const u8 {
+        if (self.provider_tabs.len == 0) return null;
+        const index = @min(self.provider_index, self.provider_tabs.len - 1);
+        return self.provider_tabs[index].name;
+    }
+
+    /// The label of the tab the menu is showing.
+    pub fn providerFilterLabel(self: ModelMenuProjection) []const u8 {
+        if (self.provider_tabs.len == 0) return "All";
+        const index = @min(self.provider_index, self.provider_tabs.len - 1);
+        return self.provider_tabs[index].label();
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
@@ -364,6 +376,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .load_state = cache.menu.load_state,
         .catalog_state = cache.menu.catalog_state,
         .items = cache.menu.items.items,
+        .provider_tabs = cache.menu.provider_tabs.items,
         .provider_index = cache.menu.provider_index,
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,

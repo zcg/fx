@@ -165,29 +165,40 @@ pub const ModelMenuCatalogState = struct {
     };
 };
 
-pub const ModelProviderFilter = enum {
-    all,
-    anthropic,
-    openai,
-    xai,
-    zai,
-    others,
-};
-
-pub const model_provider_filter_count = @typeInfo(ModelProviderFilter).@"enum".field_names.len;
-
 pub const ModelMenuItem = struct {
     id: []u8,
-    provider: []const u8,
     capabilities: model_capabilities.Capabilities,
     /// The vendor the endpoint says serves the model, when it says so. A
     /// gateway that fronts several vendors reports each model's own upstream,
     /// which is what tells two similarly named models apart in the menu.
     owned_by: ?[]u8 = null,
+    /// The connection this model came from, as the profile names it. Two
+    /// connections can serve the same model id, and choosing a row has to
+    /// switch to the connection it came from. Borrowed: it points at the name
+    /// the menu's tab owns, so every row from one connection shares a single
+    /// string instead of holding its own copy.
+    provider: []const u8 = "",
 
-    fn deinit(self: ModelMenuItem, alloc: Allocator) void {
+    fn deinit(self: *ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.owned_by) |owner| alloc.free(owner);
+    }
+};
+
+/// One tab of the Models menu: a connection name, or the `All` tab that lists
+/// every connection's models together.
+pub const ProviderTab = struct {
+    /// Owned name; null only on the `All` tab.
+    name: ?[]u8 = null,
+    /// How many rows this tab currently has.
+    count: usize = 0,
+
+    pub fn isAll(self: ProviderTab) bool {
+        return self.name == null;
+    }
+
+    pub fn label(self: ProviderTab) []const u8 {
+        return if (self.name) |value| value else "All";
     }
 };
 
@@ -196,6 +207,10 @@ pub const ModelMenu = struct {
     load_state: ModelMenuLoadState = .loading,
     catalog_state: ModelMenuCatalogState = .{},
     items: std.ArrayList(ModelMenuItem) = .empty,
+    /// The tabs the menu offers: `All` first, then one per connection that has
+    /// models. Rebuilt whenever the items change.
+    provider_tabs: std.ArrayList(ProviderTab) = .empty,
+    /// Index into `provider_tabs`.
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
@@ -219,8 +234,19 @@ pub const ModelMenu = struct {
         self.window_start = 0;
     }
 
-    pub fn providerFilter(self: *const ModelMenu) ModelProviderFilter {
-        return @fromBackingInt(@intCast(@min(self.provider_index, model_provider_filter_count - 1)));
+    /// The tab the menu is showing, or null for `All`. The name is borrowed
+    /// from `provider_tabs`, which the menu owns.
+    pub fn providerFilter(self: *const ModelMenu) ?[]const u8 {
+        if (self.provider_tabs.items.len == 0) return null;
+        const index = @min(self.provider_index, self.provider_tabs.items.len - 1);
+        return self.provider_tabs.items[index].name;
+    }
+
+    /// The label of the tab the menu is showing, for the header.
+    pub fn providerFilterLabel(self: *const ModelMenu) []const u8 {
+        if (self.provider_tabs.items.len == 0) return "All";
+        const index = @min(self.provider_index, self.provider_tabs.items.len - 1);
+        return self.provider_tabs.items[index].label();
     }
 
     pub fn filteredItemCount(self: *const ModelMenu) usize {
@@ -249,20 +275,22 @@ pub const ModelMenu = struct {
         return true;
     }
 
+    /// Moves to the next tab that has rows, wrapping. `All` is always a tab,
+    /// so a menu with nothing else stays there.
     pub fn moveProvider(self: *ModelMenu, delta: i32) bool {
         if (!self.active or self.load_state != .ready or delta == 0) return false;
-        const filter_count = model_provider_filter_count;
-        if (filter_count <= 1) return false;
+        const tab_count = self.provider_tabs.items.len;
+        if (tab_count <= 1) return false;
 
-        const current = @min(self.provider_index, filter_count - 1);
+        const current = @min(self.provider_index, tab_count - 1);
         const direction: i32 = if (delta < 0) -1 else 1;
         var next: i32 = @intCast(current);
-        for (0..filter_count) |_| {
+        for (0..tab_count) |_| {
             next += direction;
-            if (next < 0) next = @as(i32, @intCast(filter_count)) - 1;
-            if (next >= @as(i32, @intCast(filter_count))) next = 0;
-            const filter: ModelProviderFilter = @fromBackingInt(@intCast(next));
-            if (!modelProviderFilterAvailable(self.items.items, filter)) continue;
+            if (next < 0) next = @as(i32, @intCast(tab_count)) - 1;
+            if (next >= @as(i32, @intCast(tab_count))) next = 0;
+            const tab = self.provider_tabs.items[@intCast(next)];
+            if (tab.count == 0) continue;
             if (next == current) return false;
             self.provider_index = @intCast(next);
             self.selected_index = 0;
@@ -278,19 +306,77 @@ pub const ModelMenu = struct {
         return try alloc.dupe(u8, item.id);
     }
 
+    /// The connection the row under the cursor came from, borrowed from the
+    /// menu's tab. Null when no row is selected or the menu is closed.
+    pub fn selectedConnection(self: *const ModelMenu) ?[]const u8 {
+        if (!self.active or self.load_state != .ready) return null;
+        const item = self.itemAt(self.selected_index) orelse return null;
+        if (item.provider.len == 0) return null;
+        return item.provider;
+    }
+
     fn clearSnapshot(self: *ModelMenu, alloc: Allocator) void {
-        for (self.items.items) |item| item.deinit(alloc);
+        for (self.items.items) |*item| item.deinit(alloc);
         self.items.deinit(alloc);
         self.items = .empty;
+        self.clearTabs(alloc);
         self.provider_index = 0;
         self.selected_index = 0;
         self.window_start = 0;
+    }
+
+    fn clearTabs(self: *ModelMenu, alloc: Allocator) void {
+        for (self.provider_tabs.items) |tab| if (tab.name) |name| alloc.free(name);
+        self.provider_tabs.deinit(alloc);
+        self.provider_tabs = .empty;
+    }
+
+    /// Rebuilds the tabs from the rows: `All` first, then one per connection
+    /// that has at least one model, in the order the rows first name them. The
+    /// string for each name is owned here, once, and every row from that
+    /// connection points at it, so the menu holds one name per connection
+    /// rather than one per model.
+    pub fn rebuildTabs(self: *ModelMenu, alloc: Allocator, previous: ?[]const u8) void {
+        self.clearTabs(alloc);
+        self.provider_tabs.append(alloc, .{ .name = null, .count = self.items.items.len }) catch return;
+        for (self.items.items) |*item| {
+            const name = item.provider;
+            if (name.len == 0) continue;
+            var tab_index: ?usize = null;
+            for (self.provider_tabs.items, 0..) |tab, index| {
+                const owned = tab.name orelse continue;
+                if (!std.mem.eql(u8, owned, name)) continue;
+                tab_index = index;
+                break;
+            }
+            if (tab_index) |index| {
+                self.provider_tabs.items[index].count += 1;
+                item.provider = self.provider_tabs.items[index].name.?;
+                continue;
+            }
+            const owned = alloc.dupe(u8, name) catch return;
+            self.provider_tabs.append(alloc, .{ .name = owned, .count = 1 }) catch {
+                alloc.free(owned);
+                return;
+            };
+            item.provider = owned;
+        }
+        // Keep the tab the user was on when it still exists, else `All`.
+        self.provider_index = 0;
+        if (previous) |name| {
+            for (self.provider_tabs.items, 0..) |tab, index| {
+                const candidate = tab.name orelse continue;
+                if (!std.mem.eql(u8, candidate, name)) continue;
+                self.provider_index = index;
+                break;
+            }
+        }
     }
 };
 
 pub fn modelMenuFilteredItemCount(
     items: []const ModelMenuItem,
-    provider_filter: ModelProviderFilter,
+    provider_filter: ?[]const u8,
     query: []const u8,
 ) usize {
     return modelMenuRanking(items, provider_filter, query).count();
@@ -300,7 +386,7 @@ pub fn modelMenuFilteredItemCount(
 /// that match equally well keep catalog order.
 pub fn modelMenuItemAt(
     items: []const ModelMenuItem,
-    provider_filter: ModelProviderFilter,
+    provider_filter: ?[]const u8,
     query: []const u8,
     display_index: usize,
 ) ?*const ModelMenuItem {
@@ -311,7 +397,7 @@ pub fn modelMenuItemAt(
 /// The inverse of `modelMenuItemAt` for the first item with `id`.
 fn modelMenuDisplayIndex(
     items: []const ModelMenuItem,
-    provider_filter: ModelProviderFilter,
+    provider_filter: ?[]const u8,
     query: []const u8,
     id: []const u8,
 ) ?usize {
@@ -334,19 +420,19 @@ pub fn modelIdMatch(query: []const u8, id: []const u8) ?fuzzy_match.Match {
 /// tab.
 const ModelMenuMatches = struct {
     items: []const ModelMenuItem,
-    provider_filter: ModelProviderFilter,
+    provider_filter: ?[]const u8,
     query: []const u8,
 
     pub fn matchAt(self: ModelMenuMatches, position: usize) ?fuzzy_match.Match {
         const item = self.items[position];
-        if (!providerMatchesFilter(item.provider, self.provider_filter)) return null;
+        if (!providerMatchesFilter(item, self.provider_filter)) return null;
         return modelIdMatch(self.query, item.id);
     }
 };
 
 fn modelMenuRanking(
     items: []const ModelMenuItem,
-    provider_filter: ModelProviderFilter,
+    provider_filter: ?[]const u8,
     query: []const u8,
 ) fuzzy_match.Ranking(ModelMenuMatches) {
     return .{
@@ -365,31 +451,11 @@ const CatalogIdMatches = struct {
     }
 };
 
-fn providerFilter(provider: []const u8) ModelProviderFilter {
-    return if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
-        .anthropic
-    else if (std.ascii.eqlIgnoreCase(provider, "openai"))
-        .openai
-    else if (std.ascii.eqlIgnoreCase(provider, "xai"))
-        .xai
-    else if (std.ascii.eqlIgnoreCase(provider, "zai"))
-        .zai
-    else
-        .others;
-}
-
-pub fn modelProviderFilterAvailable(items: []const ModelMenuItem, filter: ModelProviderFilter) bool {
-    if (filter == .all) return true;
-    var seen: [model_provider_filter_count]bool = @splat(false);
-    for (items) |item| seen[@backingInt(providerFilter(item.provider))] = true;
-
-    var specific_count: usize = 0;
-    for (seen[1..]) |available| specific_count += @intFromBool(available);
-    return specific_count > 1 and seen[@backingInt(filter)];
-}
-
-fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
-    return filter == .all or providerFilter(provider) == filter;
+/// True when `item` belongs on a tab. A null filter is the `All` tab, which
+/// takes every row; otherwise the row's connection must be the tab's.
+fn providerMatchesFilter(item: ModelMenuItem, filter: ?[]const u8) bool {
+    const name = filter orelse return true;
+    return std.mem.eql(u8, item.provider, name);
 }
 
 pub const Runtime = struct {
@@ -419,6 +485,10 @@ pub const Runtime = struct {
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
+    /// The connection the catalog in `catalog` came from, borrowed from the
+    /// provider id the last load named. The menu's rows carry it so a row
+    /// knows which connection to switch to.
+    provider_name: []const u8 = "",
     menu: ModelMenu = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -442,6 +512,7 @@ pub const Runtime = struct {
         trigger: LoadTrigger,
     ) void {
         self.from_profile_settings = provider.provider_id == .configured;
+        self.provider_name = provider.provider_id.label();
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -968,7 +1039,7 @@ pub const Runtime = struct {
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.provider_name),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -1007,65 +1078,153 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
     };
 }
 
-fn hydrateMenuSnapshot(
+/// Builds one row per catalog entry, owned by the returned list. The rows'
+/// `provider` borrows `connection`, which the caller must keep alive for as
+/// long as the rows live; `rebuildTabs` later repoints it at the tab's copy.
+fn buildMenuItems(
     alloc: Allocator,
-    menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
-) !void {
+    connection: []const u8,
+) Allocator.Error!std.ArrayList(ModelMenuItem) {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
-        for (items.items) |item| item.deinit(alloc);
+        for (items.items) |*item| item.deinit(alloc);
         items.deinit(alloc);
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
 
     for (catalog) |entry| {
-        const item = item: {
-            const id = try alloc.dupe(u8, entry.id);
-            errdefer alloc.free(id);
-            const owner = if (entry.owned_by) |vendor| try alloc.dupe(u8, vendor) else null;
-            errdefer if (owner) |vendor| alloc.free(vendor);
-            break :item ModelMenuItem{
-                .id = id,
-                .provider = modelProvider(id),
-                .owned_by = owner,
-                .capabilities = model_capabilities.resolveCapabilities(
-                    id,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                ),
-            };
+        const id = try alloc.dupe(u8, entry.id);
+        errdefer alloc.free(id);
+        const owner = if (entry.owned_by) |vendor| try alloc.dupe(u8, vendor) else null;
+        errdefer if (owner) |vendor| alloc.free(vendor);
+        items.appendAssumeCapacity(.{
+            .id = id,
+            .provider = connection,
+            .owned_by = owner,
+            .capabilities = model_capabilities.resolveCapabilities(
+                id,
+                model_catalog_metadata.fromCatalogEntry(entry),
+            ),
+        });
+    }
+    return items;
+}
+
+/// Everything a rebuild has to preserve: the tab, the row under the cursor,
+/// the scroll window, and the query.
+const MenuCarry = struct {
+    ready: bool,
+    tab: ?[]u8,
+    selected_id: ?[]u8,
+    window: usize,
+    selected: usize,
+    query_len: usize,
+    query_buf: [256]u8,
+
+    fn take(alloc: Allocator, menu: *const ModelMenu) !MenuCarry {
+        const ready = menu.load_state == .ready;
+        var carry: MenuCarry = .{
+            .ready = ready,
+            .tab = null,
+            .selected_id = null,
+            .window = menu.window_start,
+            .selected = menu.selected_index,
+            .query_len = menu.query_len,
+            .query_buf = undefined,
         };
-        items.append(alloc, item) catch |err| {
-            item.deinit(alloc);
-            return err;
-        };
+        @memcpy(carry.query_buf[0..menu.query_len], menu.query());
+        errdefer carry.deinit(alloc);
+        if (!ready) return carry;
+        if (menu.providerFilter()) |name| carry.tab = try alloc.dupe(u8, name);
+        if (menu.itemAt(menu.selected_index)) |previous| carry.selected_id = try alloc.dupe(u8, previous.id);
+        return carry;
     }
 
-    // A revalidated catalog replaces rows under an open menu; keep the
-    // provider tab and the selected model so the cursor does not jump.
-    const previous_ready = menu.load_state == .ready;
-    const filter = if (previous_ready and modelProviderFilterAvailable(items.items, menu.providerFilter()))
-        menu.providerFilter()
-    else
-        .all;
-    const selected_index = if (!previous_ready) 0 else selected: {
-        const previous = menu.itemAt(menu.selected_index) orelse break :selected 0;
-        if (modelMenuDisplayIndex(items.items, filter, menu.query(), previous.id)) |index| break :selected index;
-        const match_count = modelMenuFilteredItemCount(items.items, filter, menu.query());
-        break :selected @min(menu.selected_index, match_count -| 1);
-    };
-    // Shift the window with the selection so its row stays put on screen.
-    const window_start = if (previous_ready)
-        (menu.window_start + selected_index) -| menu.selected_index
-    else
-        0;
+    fn deinit(self: *MenuCarry, alloc: Allocator) void {
+        if (self.tab) |name| alloc.free(name);
+        if (self.selected_id) |id| alloc.free(id);
+    }
+};
 
+/// Installs `items`, rebuilds the tabs, and puts the cursor back where it was
+/// when it can. `items` is moved into the menu.
+fn adoptMenuItems(alloc: Allocator, menu: *ModelMenu, items: std.ArrayList(ModelMenuItem), carry: MenuCarry) void {
     menu.clearSnapshot(alloc);
     menu.items = items;
+    menu.query_len = carry.query_len;
+    @memcpy(menu.query_buf[0..carry.query_len], carry.query_buf[0..carry.query_len]);
+    menu.rebuildTabs(alloc, carry.tab);
     menu.load_state = .ready;
-    menu.provider_index = @backingInt(filter);
+    const filter = menu.providerFilter();
+    const selected_index = if (!carry.ready) 0 else selected: {
+        const id = carry.selected_id orelse break :selected 0;
+        if (modelMenuDisplayIndex(menu.items.items, filter, menu.query(), id)) |index| break :selected index;
+        const match_count = modelMenuFilteredItemCount(menu.items.items, filter, menu.query());
+        break :selected @min(carry.selected, match_count -| 1);
+    };
+    // Shift the window with the selection so its row stays put on screen.
+    const window_start = if (carry.ready) (carry.window + selected_index) -| carry.selected else 0;
+
     menu.selected_index = selected_index;
     menu.window_start = window_start;
+}
+
+/// Replaces the menu's rows with `catalog`, the whole catalog of `connection`.
+fn hydrateMenuSnapshot(
+    alloc: Allocator,
+    menu: *ModelMenu,
+    catalog: []const model_catalog.ModelCatalogEntry,
+    connection: []const u8,
+) !void {
+    var carry = try MenuCarry.take(alloc, menu);
+    defer carry.deinit(alloc);
+    const items = try buildMenuItems(alloc, catalog, connection);
+    adoptMenuItems(alloc, menu, items, carry);
+}
+
+/// Appends `catalog`, one connection's whole catalog, to the rows the menu
+/// already holds, so the menu can show several connections at once. A
+/// connection already in the menu replaces its own rows rather than appearing
+/// twice.
+fn mergeMenuSnapshot(
+    alloc: Allocator,
+    menu: *ModelMenu,
+    catalog: []const model_catalog.ModelCatalogEntry,
+    connection: []const u8,
+) !void {
+    var carry = try MenuCarry.take(alloc, menu);
+    defer carry.deinit(alloc);
+    const incoming = try buildMenuItems(alloc, catalog, connection);
+    var items = incoming;
+    errdefer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    // Drop the rows this connection already contributed, so a refresh of one
+    // connection's catalog does not leave the old rows behind. The rows borrow
+    // their name from a tab, so compare against the incoming name, which is
+    // still `connection` because the tabs have not been rebuilt yet.
+    var kept: std.ArrayList(ModelMenuItem) = .empty;
+    errdefer {
+        for (kept.items) |*item| item.deinit(alloc);
+        kept.deinit(alloc);
+    }
+    try kept.ensureTotalCapacity(alloc, menu.items.items.len + items.items.len);
+    for (menu.items.items) |item| {
+        if (std.mem.eql(u8, item.provider, connection)) {
+            var discarded = item;
+            discarded.deinit(alloc);
+            continue;
+        }
+        kept.appendAssumeCapacity(item);
+    }
+    // `menu.items` still owns the rows it kept, so release only its buffer.
+    menu.items.deinit(alloc);
+    try kept.appendSlice(alloc, items.items);
+    items = .empty;
+    adoptMenuItems(alloc, menu, kept, carry);
 }
 
 fn modelProvider(model: []const u8) []const u8 {
@@ -1524,33 +1683,33 @@ test "open model menu keeps its provider tab and selection when a revalidated ca
     const access = model_catalog.AccessMetadata.init(.{ .public_only = .no_credential });
     var runtime = Runtime.init(alloc, "/v1/models");
     defer runtime.deinit();
-    runtime.catalog = try testCatalogIds(alloc, &.{ "openai/a", "openai/b", "anthropic/c" });
+    runtime.provider_name = "openai";
+    runtime.catalog = try testCatalogIds(alloc, &.{ "openai/a", "openai/b", "openai/c" });
     runtime.outcome = .{ .loaded = .{ .access = access } };
     runtime.state = .ready;
     try runtime.openMenu();
-    runtime.menu.provider_index = @backingInt(ModelProviderFilter.openai);
     runtime.menu.selected_index = 1;
     try std.testing.expectEqualStrings("openai/b", runtime.menu.itemAt(runtime.menu.selected_index).?.id);
 
     runtime.staged = .{ .loaded = .{
-        .catalog = try testCatalogIds(alloc, &.{ "xai/new", "openai/new", "openai/a", "openai/b", "anthropic/c" }),
+        .catalog = try testCatalogIds(alloc, &.{ "openai/new", "openai/a", "openai/b", "openai/c" }),
         .provenance = .{ .access = access },
     } };
     runtime.completion_pending = true;
     try std.testing.expect(try runtime.pollLoadTransition());
-    try std.testing.expectEqual(ModelProviderFilter.openai, runtime.menu.providerFilter());
+    try std.testing.expectEqualStrings("openai", runtime.menu.providerFilter().?);
     try std.testing.expectEqual(@as(usize, 2), runtime.menu.selected_index);
     try std.testing.expectEqualStrings("openai/b", runtime.menu.itemAt(runtime.menu.selected_index).?.id);
     try std.testing.expectEqual(@as(usize, 1), runtime.menu.window_start);
 
-    // A removed selection and provider fall back to the same position in All.
+    // A removed selection falls back to the same position in All.
     runtime.staged = .{ .loaded = .{
         .catalog = try testCatalogIds(alloc, &.{ "xai/new", "anthropic/c" }),
         .provenance = .{ .access = access },
     } };
     runtime.completion_pending = true;
     try std.testing.expect(try runtime.pollLoadTransition());
-    try std.testing.expectEqual(ModelProviderFilter.all, runtime.menu.providerFilter());
+    try std.testing.expectEqualStrings("openai", runtime.menu.providerFilter().?);
     try std.testing.expectEqualStrings("anthropic/c", runtime.menu.itemAt(runtime.menu.selected_index).?.id);
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.window_start);
 }
@@ -1940,7 +2099,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "openai");
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1960,17 +2119,12 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("private/blue-hornbill", runtime.menu.itemAt(0).?.id);
 
     runtime.menu.setQuery("");
-    try std.testing.expect(runtime.menu.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.anthropic, runtime.menu.providerFilter());
-    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
-    try std.testing.expect(runtime.menu.moveProvider(-1));
-    try std.testing.expectEqual(ModelProviderFilter.all, runtime.menu.providerFilter());
+    try std.testing.expect(!runtime.menu.moveProvider(1));
+    try std.testing.expectEqualStrings("openai", runtime.menu.providerFilter().?);
+    try std.testing.expectEqual(@as(usize, 4), runtime.menu.filteredItemCount());
 
-    runtime.menu.provider_index = @backingInt(ModelProviderFilter.others);
-    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
-    try std.testing.expectEqualStrings("private/blue-hornbill", runtime.menu.itemAt(0).?.id);
-    try std.testing.expectEqualStrings("standalone", runtime.menu.itemAt(1).?.id);
-    runtime.menu.provider_index = @backingInt(ModelProviderFilter.all);
+    runtime.menu.provider_index = 0;
+    try std.testing.expectEqual(@as(usize, 4), runtime.menu.filteredItemCount());
 
     try std.testing.expect(runtime.menu.moveVisibleItems(-1, 2));
     try std.testing.expectEqual(@as(usize, 3), runtime.menu.selected_index);
@@ -1990,7 +2144,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai");
     menu.active = true;
 
     menu.setQuery("gpt5");
@@ -2000,12 +2154,6 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     try std.testing.expectEqualStrings("openai/gpt-4.5-preview", menu.itemAt(2).?.id);
     try std.testing.expect(menu.itemAt(3) == null);
 
-    menu.provider_index = @backingInt(ModelProviderFilter.openai);
-    try std.testing.expectEqual(@as(usize, 2), menu.filteredItemCount());
-    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(0).?.id);
-    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", menu.itemAt(1).?.id);
-    menu.provider_index = @backingInt(ModelProviderFilter.all);
-
     try std.testing.expect(menu.moveVisibleItems(1, 3));
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 
@@ -2014,7 +2162,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     const revalidated = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
     } ++ entries;
-    try hydrateMenuSnapshot(alloc, &menu, &revalidated);
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, "openai");
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 }
@@ -2029,7 +2177,7 @@ test "a model's own name ranks it above longer ids that contain it" {
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai");
     menu.active = true;
 
     menu.setQuery("GPT-4o");
@@ -2080,33 +2228,41 @@ test "model completions rank fuzzy matches below verbatim ones" {
 
 test "model menu provider navigation skips absent and redundant filters" {
     const alloc = std.testing.allocator;
-    const mixed_entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
-        .{ .id = @constCast("xai/grok-4"), .model_type = @constCast("language") },
+    // Two connections, each with its own catalog, merged into one menu: `All`
+    // first, then one tab per connection in the order the rows first name
+    // them.
+    const openai_entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("gpt-5"), .model_type = @constCast("language") },
+    };
+    const xai_entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("grok-4"), .model_type = @constCast("language") },
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    try hydrateMenuSnapshot(alloc, &mixed, &openai_entries, "openai");
+    try mergeMenuSnapshot(alloc, &mixed, &xai_entries, "xai");
     mixed.active = true;
 
-    try std.testing.expect(mixed.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.openai, mixed.providerFilter());
-    try std.testing.expect(mixed.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.xai, mixed.providerFilter());
-    try std.testing.expect(mixed.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.all, mixed.providerFilter());
+    try std.testing.expectEqual(@as(usize, 3), mixed.provider_tabs.items.len);
+    try std.testing.expectEqualStrings("All", mixed.provider_tabs.items[0].label());
+    try std.testing.expectEqualStrings("openai", mixed.provider_tabs.items[1].label());
+    try std.testing.expectEqualStrings("xai", mixed.provider_tabs.items[2].label());
 
-    const codex_entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("gpt-5.6-sol"), .model_type = @constCast("language") },
-        .{ .id = @constCast("gpt-5.4-mini"), .model_type = @constCast("language") },
-    };
-    var codex: ModelMenu = .{};
-    defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
-    codex.active = true;
+    try std.testing.expect(mixed.moveProvider(1));
+    try std.testing.expectEqualStrings("openai", mixed.providerFilter().?);
+    try std.testing.expectEqual(@as(usize, 1), mixed.filteredItemCount());
+    try std.testing.expect(mixed.moveProvider(1));
+    try std.testing.expectEqualStrings("xai", mixed.providerFilter().?);
+    try std.testing.expect(mixed.moveProvider(1));
+    try std.testing.expect(mixed.providerFilter() == null);
 
-    try std.testing.expect(!codex.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.all, codex.providerFilter());
+    // A menu with a single connection has nowhere to go.
+    var single: ModelMenu = .{};
+    defer single.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &single, &openai_entries, "openai");
+    single.active = true;
+    try std.testing.expect(!single.moveProvider(1));
+    try std.testing.expect(single.providerFilter() == null);
 }
 
 test "model menu snapshot construction cleans every allocation failure" {
@@ -2118,14 +2274,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, "openai");
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, "openai")) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

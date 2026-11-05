@@ -69,6 +69,7 @@ const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
@@ -2205,6 +2206,7 @@ pub fn Runtime(comptime App: type) type {
         fn applyInlineSettingsModelSelection(app: *App, agent: *AppAgent) !void {
             const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
             defer app.alloc.free(selected);
+            try switchToSelectedConnection(app, agent);
             try session_commands.Commands(App).selectModelFromPicker(
                 app,
                 agent,
@@ -2215,6 +2217,18 @@ pub fn Runtime(comptime App: type) type {
             );
             app.model_cache.closeMenu();
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Switches the profile to the connection the menu's highlighted row
+        /// came from, when that differs from the active one. The Models menu
+        /// lists several connections' catalogs together, so choosing a row has
+        /// to bring its connection with it; otherwise the model would be sent
+        /// to a provider that has never heard of it.
+        fn switchToSelectedConnection(app: *App, agent: *AppAgent) !void {
+            const connection = app.model_cache.menu.selectedConnection() orelse return;
+            const target = provider_picker_runtime.Runtime(App).resolveProvider(app, connection) orelse return;
+            if (provider_runtime.providerOf(app, agent).eql(target)) return;
+            try app_auth_runtime.Runtime(App).switchProvider(app, agent, target, false, .manual);
         }
 
         fn submitSettingsMenuSelection(app: *App, agent: *AppAgent) !bool {
@@ -2462,9 +2476,19 @@ pub fn Runtime(comptime App: type) type {
             // borrow the composer; settleModelPickerDraft hands it back once
             // the flow ends, and a failure here hands it back immediately.
             errdefer restoreModelPickerDraft(app);
+            const connection = app.model_cache.menu.selectedConnection();
+            const connection_owned = if (connection) |name| try app.alloc.dupe(u8, name) else null;
+            defer if (connection_owned) |name| app.alloc.free(name);
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            if (connection_owned) |name| {
+                if (provider_picker_runtime.Runtime(App).resolveProvider(app, name)) |target| {
+                    if (!provider_runtime.providerOf(app, agent).eql(target)) {
+                        try app_auth_runtime.Runtime(App).switchProvider(app, agent, target, false, .manual);
+                    }
+                }
+            }
             try completion_rt.beginExactModelSelection(app, agent, selected);
             return true;
         }
@@ -5926,7 +5950,7 @@ test "app_input_runtime model catalog owns search navigation and provider tabs" 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 102);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.menu.provider_index);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.menu.selected_index);
-    try std.testing.expectEqual(model_cache_runtime.ModelProviderFilter.anthropic, app.model_cache.menu.providerFilter());
+    try std.testing.expectEqualStrings("anthropic", app.model_cache.menu.providerFilter().?);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.menu.filteredItemCount());
 }
 
@@ -8567,6 +8591,9 @@ fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !vo
         });
         item_owns_id = true;
     }
+    // The rows borrow `provider` from the ids they were split out of, so the
+    // tabs need their own copy before the menu is used.
+    menu.rebuildTabs(app.alloc, null);
 }
 
 fn openRoutingAuthPicker(app: *RoutingFakeApp) !void {

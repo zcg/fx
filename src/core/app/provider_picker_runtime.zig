@@ -256,10 +256,11 @@ pub fn Runtime(comptime App: type) type {
 
         /// Enter: open the next column, or hand the completed choice to the
         /// auth runtime.
-        /// Resolves a picker row to a provider: a built-in slug or a name the
-        /// profile defines. A preset the profile has not added yet returns null,
-        /// because choosing it starts the add-provider flow instead of a switch.
-        fn resolveProvider(app: *App, label: []const u8) ?model_provider.ProviderId {
+        /// Resolves a name to a provider: a built-in slug or a name the
+        /// profile defines. A preset the profile has not added yet returns
+        /// null, because choosing it starts the add-provider flow instead of a
+        /// switch.
+        pub fn resolveProvider(app: *App, label: []const u8) ?model_provider.ProviderId {
             if (provider_catalog.parse(label)) |built_in| return built_in;
             const configured = model_provider.parse(label) orelse return null;
             if (configured != .configured) return configured;

@@ -157,13 +157,14 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     defer row.deinit(alloc);
     try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
 
-    const tabs = ProviderTabs.build(projection.items);
+    const tabs = ProviderTabs.build(projection.provider_tabs);
+    if (tabs.len == 0) return cloneClippedRow(alloc, row.items, width);
     const active_position = tabs.activePosition(projection.provider_index);
     const active_index = tabs.indices[active_position];
     const title_width = display_width.visibleWidthIgnoringAnsi(row.items);
-    if (title_width + 2 + providerTabWidth(active_index, active_index) > width) {
+    if (title_width + 2 + providerTabWidth(projection.provider_tabs, active_index, active_index) > width) {
         try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, active_index, active_index);
+        try appendProviderTabAt(alloc, &row, projection.provider_tabs, active_index, active_index);
         return cloneClippedRow(alloc, row.items, width);
     }
 
@@ -171,11 +172,11 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     var end = active_position + 1;
     while (true) {
         var expanded = false;
-        if (end < tabs.len and title_width + 2 + providerRangeWidth(tabs, start, end + 1, active_index) <= width) {
+        if (end < tabs.len and title_width + 2 + providerRangeWidth(projection.provider_tabs, tabs, start, end + 1, active_index) <= width) {
             end += 1;
             expanded = true;
         }
-        if (start > 0 and title_width + 2 + providerRangeWidth(tabs, start - 1, end, active_index) <= width) {
+        if (start > 0 and title_width + 2 + providerRangeWidth(projection.provider_tabs, tabs, start - 1, end, active_index) <= width) {
             start -= 1;
             expanded = true;
         }
@@ -189,7 +190,7 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     }
     for (start..end) |position| {
         if (position > start) try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, tabs.indices[position], active_index);
+        try appendProviderTabAt(alloc, &row, projection.provider_tabs, tabs.indices[position], active_index);
     }
     if (end < tabs.len) {
         try row.appendSlice(alloc, "  ");
@@ -199,18 +200,18 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
 }
 
 const ProviderTabs = struct {
-    indices: [model_cache_runtime.model_provider_filter_count]usize = undefined,
+    indices: [max_provider_tabs]usize = undefined,
     len: usize = 0,
 
-    fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
-        var tabs: ProviderTabs = .{};
-        for (0..model_cache_runtime.model_provider_filter_count) |index| {
-            const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
-            if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
-            tabs.indices[tabs.len] = index;
-            tabs.len += 1;
+    fn build(tabs: []const model_cache_runtime.ProviderTab) ProviderTabs {
+        var result: ProviderTabs = .{};
+        for (tabs, 0..) |tab, index| {
+            if (result.len >= result.indices.len) break;
+            if (tab.count == 0) continue;
+            result.indices[result.len] = index;
+            result.len += 1;
         }
-        return tabs;
+        return result;
     }
 
     fn activePosition(self: ProviderTabs, active_index: usize) usize {
@@ -220,6 +221,10 @@ const ProviderTabs = struct {
         return 0;
     }
 };
+
+/// The most tabs the header draws at once. A menu never has more than the
+/// profile's connections, and the header shows a window of them anyway.
+const max_provider_tabs = 33;
 
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
@@ -240,10 +245,11 @@ fn appendProviderTab(alloc: Allocator, row: *std.ArrayList(u8), label: []const u
 fn appendProviderTabAt(
     alloc: Allocator,
     row: *std.ArrayList(u8),
+    tabs: []const model_cache_runtime.ProviderTab,
     index: usize,
     active_index: usize,
 ) !void {
-    try appendProviderTab(alloc, row, providerTabLabel(index), index == active_index);
+    try appendProviderTab(alloc, row, tabs[index].label(), index == active_index);
 }
 
 fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void {
@@ -252,25 +258,14 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
-fn providerTabLabel(index: usize) []const u8 {
-    const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
-    return switch (filter) {
-        .all => "All",
-        .anthropic => "Anthropic",
-        .openai => "OpenAI",
-        .xai => "xAI",
-        .zai => "Z.AI",
-        .others => "Others",
-    };
-}
-
-fn providerTabWidth(index: usize, active_index: usize) usize {
+fn providerTabWidth(tabs: []const model_cache_runtime.ProviderTab, index: usize, active_index: usize) usize {
     const active_padding: usize = if (index == active_index) 2 else 0;
-    return display_width.visibleWidth(providerTabLabel(index)) + active_padding;
+    return display_width.visibleWidth(tabs[index].label()) + active_padding;
 }
 
 fn providerRangeWidth(
-    tabs: ProviderTabs,
+    tabs: []const model_cache_runtime.ProviderTab,
+    visible: ProviderTabs,
     start: usize,
     end: usize,
     active_index: usize,
@@ -278,9 +273,9 @@ fn providerRangeWidth(
     var width: usize = if (start > 0) 3 else 0;
     for (start..end) |position| {
         if (position > start) width += 2;
-        width += providerTabWidth(tabs.indices[position], active_index);
+        width += providerTabWidth(tabs, visible.indices[position], active_index);
     }
-    if (end < tabs.len) width += 3;
+    if (end < visible.len) width += 3;
     return width;
 }
 
@@ -479,7 +474,7 @@ test "model menu renders provider tabs and compact model facts" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
-            .id = @constCast("anthropic/claude-opus-4.8"),
+            .id = @constCast("claude-opus-4.8"),
             .provider = "anthropic",
             .capabilities = .{
                 .supports_reasoning = true,
@@ -494,15 +489,21 @@ test "model menu renders provider tabs and compact model facts" {
             },
         },
         .{
-            .id = @constCast("openai/gpt-5"),
+            .id = @constCast("gpt-5"),
             .provider = "openai",
             .capabilities = .{},
         },
+    };
+    const tabs = [_]model_cache_runtime.ProviderTab{
+        .{ .count = 2 },
+        .{ .name = @constCast("anthropic"), .count = 1 },
+        .{ .name = @constCast("openai"), .count = 1 },
     };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
         .items = &items,
+        .provider_tabs = &tabs,
     };
     const rows = menuRowCount(projection, 120, 20);
     try std.testing.expectEqual(@as(u16, 4), rows);
@@ -511,15 +512,14 @@ test "model menu renders provider tabs and compact model facts" {
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "Models 2") != null);
     try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "anthropic") != null);
 
     var title = try composeModelMenuRow(alloc, projection, 2, 120, rows);
     defer title.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "claude-opus-4.8") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast mode · Ultra mode") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
@@ -532,24 +532,31 @@ test "model menu keeps active provider visible and omits unknown metadata" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
-            .id = @constCast("private-team-provider/model-with-a-very-long-name"),
+            .id = @constCast("model-with-a-very-long-name"),
             .provider = "private-team-provider",
             .capabilities = .{},
         },
-        .{ .id = @constCast("openai/gpt"), .provider = "openai", .capabilities = .{} },
-        .{ .id = @constCast("xai/grok"), .provider = "xai", .capabilities = .{} },
+        .{ .id = @constCast("gpt"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("grok"), .provider = "xai", .capabilities = .{} },
+    };
+    const tabs = [_]model_cache_runtime.ProviderTab{
+        .{ .count = 3 },
+        .{ .name = @constCast("private-team-provider"), .count = 1 },
+        .{ .name = @constCast("openai"), .count = 1 },
+        .{ .name = @constCast("xai"), .count = 1 },
     };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
         .items = &items,
-        .provider_index = 5,
+        .provider_tabs = &tabs,
+        .provider_index = 1,
     };
 
     const rows = menuRowCount(projection, 42, 5);
     var header = try composeModelMenuRow(alloc, projection, 0, 42, rows);
     defer header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, header.items, "[Others]") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "[private-team-provider]") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 42);
 
     var title = try composeModelMenuRow(alloc, projection, 2, 24, rows);
@@ -604,9 +611,9 @@ test "model menu states and navigation budget stay bounded" {
     try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; fx retries automatically.") != null);
 
     const items = [_]model_cache_runtime.ModelMenuItem{
-        .{ .id = @constCast("a/one"), .provider = "a", .capabilities = .{} },
-        .{ .id = @constCast("a/two"), .provider = "a", .capabilities = .{} },
-        .{ .id = @constCast("a/three"), .provider = "a", .capabilities = .{} },
+        .{ .id = @constCast("one"), .provider = "a", .capabilities = .{} },
+        .{ .id = @constCast("two"), .provider = "a", .capabilities = .{} },
+        .{ .id = @constCast("three"), .provider = "a", .capabilities = .{} },
     };
     const ready: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items };
     try std.testing.expectEqual(@as(u16, 3), visibleNavigationItemsForBudget(ready, 7));
@@ -644,12 +651,12 @@ test "model menu caps inline browse at twenty and prioritizes tiny selection" {
     var items: [25]model_cache_runtime.ModelMenuItem = undefined;
     for (&items) |*item| {
         item.* = .{
-            .id = @constCast("provider/model"),
+            .id = @constCast("model"),
             .provider = "provider",
             .capabilities = .{},
         };
     }
-    items[items.len - 1].id = @constCast("provider/selected-model");
+    items[items.len - 1].id = @constCast("selected-model");
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
@@ -669,8 +676,8 @@ test "model menu caps inline browse at twenty and prioritizes tiny selection" {
 test "model menu places catalog note after an item gap and preserves the heading gap" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
-        .{ .id = @constCast("provider/one"), .provider = "provider", .capabilities = .{} },
-        .{ .id = @constCast("provider/two"), .provider = "provider", .capabilities = .{} },
+        .{ .id = @constCast("one"), .provider = "provider", .capabilities = .{} },
+        .{ .id = @constCast("two"), .provider = "provider", .capabilities = .{} },
     };
     const projection: ModelMenuProjection = .{
         .active = true,
@@ -690,7 +697,7 @@ test "model menu places catalog note after an item gap and preserves the heading
 
     var first = try composeModelMenuRow(alloc, projection, 2, 120, rows);
     defer first.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, first.items, "provider/one") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "one") != null);
 
     var status_gap = try composeModelMenuRow(alloc, projection, 4, 120, rows);
     defer status_gap.deinit(alloc);
