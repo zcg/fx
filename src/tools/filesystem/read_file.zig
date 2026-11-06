@@ -274,7 +274,33 @@ const ReadScan = struct {
     total_lines: usize,
     content_hash: read_tracker.ContentHash,
     display_truncated: bool,
+    /// The file's own line endings and whether its last line ends with one, so
+    /// an edit can reproduce them. Without this, a model that copied a line
+    /// from a CRLF file matched nothing, and an edit could turn a CRLF file
+    /// into LF (docs/audit/2026-11-06-full-review.md section 3.4).
+    line_endings: LineEndings = .lf,
+    final_newline: bool = true,
 };
+
+pub const LineEndings = enum {
+    lf,
+    crlf,
+    /// Mix of both, which fx reports as such rather than claiming one.
+    mixed,
+};
+
+fn detectLineEndings(content: []const u8) LineEndings {
+    var saw_lf = false;
+    var saw_crlf = false;
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, content, index, '\n')) |end| {
+        if (end > 0 and content[end - 1] == '\r') saw_crlf = true else saw_lf = true;
+        index = end + 1;
+        if (saw_lf and saw_crlf) return .mixed;
+    }
+    if (saw_crlf) return .crlf;
+    return .lf;
+}
 
 const DisplayBudget = struct {
     width: usize = 1,
@@ -360,6 +386,8 @@ fn selectLinesFromContent(
         .total_lines = total_lines,
         .content_hash = hasher.finalResult(),
         .display_truncated = selection.display_truncated,
+        .line_endings = detectLineEndings(content),
+        .final_newline = content.len > 0 and content[content.len - 1] == '\n',
     };
 }
 
@@ -405,6 +433,15 @@ fn formatReadOutput(
     const include_sentinel = !modelViewCoversFullFile(input, scan, records.len) or !snapshot_covers_full_file;
     if (include_sentinel and (records.len > 0 or scan.display_truncated)) {
         writeTruncationSentinel(&out.writer, records.len, scan.total_lines, snapshot_covers_full_file) catch return error.OutOfMemory;
+    }
+    // A file read in full states its own line endings and whether its last
+    // line ends with one, so an edit can match a CRLF file exactly
+    // (docs/audit/2026-11-06-full-review.md section 3.4).
+    if (!include_sentinel) {
+        out.writer.print(
+            "line_endings: {s}\nfinal_newline: {}\n",
+            .{ @tagName(scan.line_endings), scan.final_newline },
+        ) catch return error.OutOfMemory;
     }
     out.writer.writeAll("</content>") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
