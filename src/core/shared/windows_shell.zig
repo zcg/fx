@@ -103,7 +103,9 @@ pub fn settingName(kind: Kind) []const u8 {
 /// PowerShell 7 installs under Program Files; a store or scoop install puts it
 /// on the path. Both are checked, absolute path first.
 fn findPwsh(alloc: Allocator) !?[]u8 {
+    // `envVar` returns owned memory, so every caller here frees what it reads.
     const program_files = envVar(alloc, "ProgramFiles");
+    defer if (program_files) |root| alloc.free(root);
     const candidates = [_][]const u8{
         "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
         "C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe",
@@ -132,6 +134,7 @@ fn findGitBash(alloc: Allocator) !?[]u8 {
         if (try existingFile(alloc, candidate)) |path| return path;
     }
     if (envVar(alloc, "LOCALAPPDATA")) |local| {
+        defer alloc.free(local);
         const joined = try std.Io.Dir.path.join(alloc, &.{ local, "Programs", "Git", "bin", "bash.exe" });
         defer alloc.free(joined);
         if (try existingFile(alloc, joined)) |path| return path;
@@ -139,11 +142,13 @@ fn findGitBash(alloc: Allocator) !?[]u8 {
     // A package manager keeps its packages in a tree of its own, and the bash
     // it ships is not on PATH. These are the trees Scoop and Chocolatey use.
     if (homeDir(alloc)) |home| {
+        defer alloc.free(home);
         const scoop = try std.Io.Dir.path.join(alloc, &.{ home, "scoop", "apps", "git", "current", "bin", "bash.exe" });
         defer alloc.free(scoop);
         if (try existingFile(alloc, scoop)) |path| return path;
     }
     if (envVar(alloc, "SCOOP")) |scoop_root| {
+        defer alloc.free(scoop_root);
         const scoop = try std.Io.Dir.path.join(alloc, &.{ scoop_root, "apps", "git", "current", "bin", "bash.exe" });
         defer alloc.free(scoop);
         if (try existingFile(alloc, scoop)) |path| return path;
@@ -343,6 +348,7 @@ fn bashFromShim(alloc: Allocator, git_path: []const u8) !?[]u8 {
 
 fn findCmd(alloc: Allocator) !?[]u8 {
     if (envVar(alloc, "SystemRoot")) |root| {
+        defer alloc.free(root);
         const joined = try std.Io.Dir.path.join(alloc, &.{ root, "System32", "cmd.exe" });
         defer alloc.free(joined);
         if (try existingFile(alloc, joined)) |path| return path;
@@ -360,6 +366,7 @@ fn existingFile(alloc: Allocator, path: []const u8) !?[]u8 {
 /// Looks a bare executable name up on PATH, honoring PATHEXT.
 fn searchPath(alloc: Allocator, name: []const u8) !?[]u8 {
     const path = envVar(alloc, "PATH") orelse return null;
+    defer alloc.free(path);
     var it = std.mem.splitScalar(u8, path, ';');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;

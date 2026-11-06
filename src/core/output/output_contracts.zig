@@ -1306,9 +1306,10 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown], 0..) |id, index| {
             if (self.provider != .gateway) {
-                // A gateway reports each model's own upstream vendor, so that is
-                // what identifies the model; the connection name would only
-                // repeat itself on every row.
+                // A configured provider reports each model's own upstream
+                // vendor, so that is what tells two similarly named models
+                // apart; the connection name would repeat itself on every row.
+                // The Gateway itself lists no such vendor, so its rows are bare.
                 const upstream = if (index < self.details.len) self.details[index].owned_by else null;
                 if (upstream) |vendor| {
                     try out.writer.print(" - {s} · {s}\n", .{ id, vendor });
