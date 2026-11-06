@@ -1361,18 +1361,18 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
   位置：`settings_keys.zig`、`config_runtime.zig`、`settings_store.zig`、`env_settings.zig`、`agent_steps.zig`、`app_lifecycle.zig`、`cli_config.zig`
   验证：`cli_config.zig` 的强制归类测试已覆盖新 key（`resolved_keys`）；配置优先级经 `applyEnvSettingOverrides` 与 settings 合并路径统一
   落地：`settings_keys` 声明 `.profile`/`integer`/1–16；`config_runtime.Settings` 与 `parseProjectSafeFields` 解析；`settings_store` 写入与校验；`env_settings` 映射 `FX_SUBAGENT_MAX_CHILDREN`；`agent_steps` 提供解析与 clamp；`app_lifecycle` 两处生效；`cli_config` 的 `Writable`/`resolved_keys`/`effectiveValue` 接线。`tool_host.max_children` 由交互应用、ACP、`fx ask` 三处注入。
-- [ ] **3. `Owner.start` 加 permit；`parallel_execution.zig` 加 `max_parallel_subagent_calls`**（参照同文件 `max_parallel_host_calls = 16`）
+- [x] **3. `Owner.start` 加 permit；`parallel_execution.zig` 加 `max_parallel_subagent_calls`**（参照同文件 `max_parallel_host_calls = 16`）
   位置：`managed_owner.zig:264-275`、`parallel_execution.zig:48-52`
   验证：permit 耗尽返回可操作错误；分组被截断
-- [ ] **4. 消除 1ms 忙轮询**：把 1ms 限制在真正等待的短窗口，`poll=0` 分支加最小间隔
+- [x] **4. 消除 1ms 忙轮询**：把 1ms 限制在真正等待的短窗口，`poll=0` 分支加最小间隔
   位置：`src/main.zig:216-225`、`src/ui/event_loop.zig:91-95`
-  验证：活跃期 CPU 采样对比；不得改变状态机语义
-- [ ] **5. `default_max_agent_steps` 改为有限值**；nudge/continuation 加独立预算
+  验证：活跃期 CPU 采样对比；`focused_ui_worker_poll_timeout_ms` 1→4，`poll=0` 分支改为 2ms 最小间隔
+- [x] **5. `default_max_agent_steps` 改为有限值**；nudge/continuation 加独立预算
   位置：`src/core/config/agent_steps.zig:3,23-25`
   验证：空回复连续场景不再无限消耗 API
-- [ ] **6. Release 等 CI gate**；marker 校验前移；artifacts 完整性断言
+- [x] **6. Release 等 CI gate**；marker 校验前移；artifacts 完整性断言
   位置：`.github/workflows/release.yml:3-5,309-351,362-381`
-  验证：actionlint + dry-run
+  验证：actionlint + dry-run；发布前必须四个必备 check 在同一 commit 上 success/skipped
 
 ### 18.2 第二批：安全与正确性（P1）
 
