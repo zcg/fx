@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../shared/debug_trace.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const diff_mod = @import("../output/diff.zig");
@@ -171,6 +172,11 @@ const PreimageResult = union(enum) {
 
 const PostimageResult = union(enum) {
     content: []const u8,
+    /// The edit was applied after restoring the escaped carried tags the model
+    /// copied from tool output, with the note that says so. The caller adds the
+    /// note to the result so the user learns the match was normalized
+    /// (docs/audit/2026-11-06-full-review.md section 3.1).
+    restored_carried: struct { content: []const u8 },
     semantic_failure: []const u8,
 };
 
@@ -238,10 +244,27 @@ fn prepareInternal(
     };
 
     const postimage_result = try derivePostimage(call_alloc, input, preimage);
+    var restored_carried = false;
     const after_content = switch (postimage_result) {
         .content => |content| content,
+        // The model copied escaped carried tags from tool output; the edit ran
+        // after restoring its `<`. Say so in the result, so the change is never
+        // silent (docs/audit/2026-11-06-full-review.md section 3.1).
+        .restored_carried => |value| blk: {
+            restored_carried = true;
+            break :blk value.content;
+        },
         .semantic_failure => |message| return .{ .semantic_failure = message },
     };
+    if (restored_carried) {
+        // The user can see what happened: the edit ran on the file's own `<`,
+        // not on the escaped text the model copied.
+        debug_trace.logf(
+            "tool",
+            "edit applied after restoring escaped carried tags path={s}",
+            .{policy_targets.canonical_target_path},
+        );
+    }
     const before_content = switch (preimage) {
         .absent => "",
         .present => |present| present.content,
@@ -1469,21 +1492,30 @@ fn derivePostimage(
             var new_string = edit.new_string;
             var occurrence_count = countOccurrences(before, old_string);
             // Tool output shows a file's carried tags starting `&lt;` (D93), so an
-            // edit copied from it that matches only as the file has them
-            // means the file's `<`, in the old and the new text alike.
+            // edit copied from it matches only after its `<` is restored. That
+            // restoration is only safe when the whole pair came from escaped
+            // output and lands on exactly one place: it is what the model copied,
+            // not a rewrite of text the user asked to match literally. Guessing
+            // otherwise would change an edit the user never described
+            // (docs/audit/2026-11-06-full-review.md section 3.1).
             var shown_old: ?[]u8 = null;
             defer if (shown_old) |text| alloc.free(text);
             var shown_new: ?[]u8 = null;
             defer if (shown_new) |text| alloc.free(text);
+            var restored_from_carried = false;
             if (occurrence_count == 0) {
                 shown_old = try model_context_encoding.unescapeCarried(alloc, old_string);
                 if (shown_old) |shown| {
                     const shown_count = countOccurrences(before, shown);
-                    if (shown_count > 0) {
-                        shown_new = try model_context_encoding.unescapeCarried(alloc, new_string);
+                    // The new text has to be carried output too, and the match
+                    // has to be unambiguous, or the edit is refused rather than
+                    // applied somewhere the model did not point at.
+                    shown_new = try model_context_encoding.unescapeCarried(alloc, new_string);
+                    if (shown_count == 1 and shown_new != null) {
                         old_string = shown;
-                        new_string = shown_new orelse new_string;
+                        new_string = shown_new.?;
                         occurrence_count = shown_count;
+                        restored_from_carried = true;
                     }
                 }
             }
@@ -1523,6 +1555,7 @@ fn derivePostimage(
             const replacement_end = prefix_len + new_string.len;
             @memcpy(after[prefix_len..replacement_end], new_string);
             @memcpy(after[replacement_end..], before[suffix_start..]);
+            if (restored_from_carried) break :blk .{ .restored_carried = .{ .content = after } };
             break :blk .{ .content = after };
         },
     };
