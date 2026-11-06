@@ -298,11 +298,14 @@ pub fn permissionTargetsForCallInScope(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) !PermissionCallTargets {
-    if (target_kind != .command_cwd) {
-        return permissionTargetsForCall(alloc, scope.primary_directory, call, target_kind);
-    }
+    // A path target is resolved against the whole scope, not just the primary
+    // directory, so an added directory is a real target and a path outside the
+    // scope stays outside it. Resolving against `primary_directory` alone
+    // dropped the additions and let an external tool's absolute path be
+    // approved as an external intent instead of being refused
+    // (docs/audit/2026-11-06-full-review.md section 3.2).
     const target = try permissionTargetForCallInScope(alloc, scope, call, target_kind);
-    defer alloc.free(@constCast(target));
+    defer if (target_kind != .none) alloc.free(@constCast(target));
     return ownedPermissionCallTargets(alloc, &.{.{ .role = "target", .path = target }});
 }
 
@@ -312,13 +315,51 @@ pub fn permissionTargetForCallInScope(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) ![]const u8 {
-    if (target_kind != .command_cwd) {
-        return permissionTargetForCall(arena, scope.primary_directory, call, target_kind);
+    if (target_kind == .command_cwd) {
+        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+        const command = try tool_args.requiredStringArg(args, "command");
+        const cwd = try resolveCommandCwdFromArgsInScope(arena, scope, args);
+        return arena.print("{s}::{s}", .{ cwd, command });
     }
+    return permissionTargetForCallInScopeKind(arena, scope, call, target_kind);
+}
+
+/// A path target resolved against `scope`, so a file in an added directory is
+/// a target there and a path outside every root is refused rather than
+/// approved as external.
+fn permissionTargetForCallInScopeKind(
+    arena: std.mem.Allocator,
+    scope: workspace_access.AccessScope,
+    call: types.ToolCall,
+    target_kind: PermissionTargetKind,
+) ![]const u8 {
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-    const command = try tool_args.requiredStringArg(args, "command");
-    const cwd = try resolveCommandCwdFromArgsInScope(arena, scope, args);
-    return arena.print("{s}::{s}", .{ cwd, command });
+    return switch (target_kind) {
+        .command_cwd => unreachable,
+        .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
+        .path_optional_existing => blk: {
+            const path_arg = tool_args.optionalStringArg(args, "path") orelse ".";
+            break :blk if (path_arg.len == 0 or std.mem.eql(u8, path_arg, "."))
+                arena.dupe(u8, scope.primary_directory)
+            else
+                try resolveFileToolPathInScope(arena, scope, call.name, path_arg, .existing);
+        },
+        .path_create_parent => blk: {
+            const path_arg = try tool_args.requiredStringArg(args, "path");
+            const target_path = try resolveFileToolPathInScope(arena, scope, call.name, path_arg, .create);
+            break :blk std.Io.Dir.path.dirname(target_path) orelse target_path;
+        },
+        .path_existing_parent => blk: {
+            const path_arg = try tool_args.requiredStringArg(args, "path");
+            const target_path = try resolveFileToolPathInScope(arena, scope, call.name, path_arg, .existing);
+            break :blk std.Io.Dir.path.dirname(target_path) orelse target_path;
+        },
+        .path_existing => blk: {
+            const path_arg = try tool_args.requiredStringArg(args, "path");
+            break :blk try resolveFileToolPathInScope(arena, scope, call.name, path_arg, .existing);
+        },
+        .none => try arena.dupe(u8, call.name),
+    };
 }
 
 /// Resolves the canonical requested path without requiring it to exist.
@@ -1057,6 +1098,25 @@ pub fn resolveFileToolPath(
         .existing => pathing.resolveWorkspaceOrExternalPath(arena, workspace_root, path_arg),
         .create => pathing.resolveWorkspaceOrExternalCreatePath(arena, workspace_root, path_arg),
     };
+}
+
+/// A file path resolved against `scope`. A path whose root is neither the
+/// primary directory nor one of the added ones is an error, not an external
+/// target, so a tool cannot reach a directory the user never added
+/// (docs/audit/2026-11-06-full-review.md section 3.2).
+fn resolveFileToolPathInScope(
+    arena: std.mem.Allocator,
+    scope: workspace_access.AccessScope,
+    tool_name: []const u8,
+    path_arg: []const u8,
+    mode: types.ResolveMode,
+) ![]const u8 {
+    const resolved = try resolveFileToolPath(arena, scope.primary_directory, tool_name, path_arg, mode);
+    if (scope.contains(resolved)) return resolved;
+    // An added directory is inside the scope even though it is outside the
+    // workspace, so it is allowed exactly as the workspace is.
+    if (allowsExternalPath(tool_name) and scope.additionalRootForPath(resolved) != null) return resolved;
+    return error.PathOutsideAccessScope;
 }
 
 const external_path_tools = [_][]const u8{
