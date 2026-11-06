@@ -461,7 +461,18 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
-    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    var capabilities = model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    // A configured provider's model names its own thinking levels, in its own
+    // order: one vendor offers low..high, another minimal..max. Taking them
+    // from the declaration is what lets the picker offer them
+    // (docs/audit/2026-11-06-full-review.md section 18.6).
+    if (metadata.reasoning_efforts.len > 0) {
+        capabilities.supports_reasoning = true;
+        capabilities.reasoning_efforts = .fromSlice(metadata.reasoning_efforts);
+    } else if (metadata.supports_reasoning) |declared| {
+        capabilities.supports_reasoning = declared;
+    }
+    return capabilities;
 }
 
 fn fetch_cached_catalog(raw: ?*anyopaque, alloc: Allocator) Allocator.Error!?std.ArrayList(catalog.ModelCatalogEntry) {

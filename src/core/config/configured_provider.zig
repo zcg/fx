@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -93,6 +94,16 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// The thinking levels this model offers, as the provider names them.
+    /// A provider's levels are its own: one offers low/medium/high, another
+    /// minimal..max, another none. A model that declares none offers no
+    /// choice, which is different from declaring an empty list.
+    ///
+    /// Without this a provider's models only ever offered the default level,
+    /// because the profile had no way to say a model offers more
+    /// (docs/audit/2026-11-06-full-review.md section 18.6).
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
+    supports_reasoning: ?bool = null,
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -152,10 +163,14 @@ pub const Definition = struct {
             },
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| {
+            alloc.free(metadata.id);
+            if (metadata.reasoning_efforts.len > 0) alloc.free(@constCast(metadata.reasoning_efforts));
+        }
         alloc.free(self.model_metadata);
     }
 };
+
 
 pub const Registry = struct {
     definitions: []const Definition = &.{},
@@ -298,22 +313,43 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts", "supports_reasoning" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const reasoning = try optional_bool(metadata.object.get("supports_reasoning"));
+        const efforts = try parseReasoningEfforts(alloc, metadata.object.get("reasoning_efforts"));
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .reasoning_efforts = efforts,
+            .supports_reasoning = reasoning,
         };
         initialized += 1;
     }
     return models;
+}
+
+/// A model's thinking levels, in the provider's own names, checked against the
+/// levels fx knows. The order is the profile's, so a provider that offers the
+/// same levels in a different ranking keeps its own.
+fn parseReasoningEfforts(alloc: Allocator, value: ?std.json.Value) ParseError![]const types.ReasoningEffort {
+    const present = value orelse return &.{};
+    if (present != .array) return error.InvalidModelMetadata;
+    if (present.array.items.len > types.ReasoningEffort.max_options) return error.InvalidModelMetadata;
+    if (present.array.items.len == 0) return &.{};
+    const efforts = try alloc.alloc(types.ReasoningEffort, present.array.items.len);
+    errdefer alloc.free(efforts);
+    for (present.array.items, 0..) |item, index| {
+        if (item != .string) return error.InvalidModelMetadata;
+        efforts[index] = types.ReasoningEffort.parse(item.string) orelse return error.InvalidModelMetadata;
+    }
+    return efforts;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
