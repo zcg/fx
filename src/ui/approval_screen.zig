@@ -690,42 +690,25 @@ fn paintCompactFileApproval(
     // A terminal this short still has to answer two questions: which file this
     // is, and which keys decide it. Only the choices fit before, so the user
     // approved a file they could not identify
-    // (docs/audit/2026-11-06-full-review.md section 11.3). Keep the identity
-    // line and the key hint, then as many choices as are left.
+    // (docs/audit/2026-11-06-full-review.md section 11.3). The order is by what
+    // the user cannot do without: first which file, then which keys, then the
+    // choices themselves. The selected choice is what Enter takes, so losing
+    // its row costs less than losing the keys that are the only way to answer.
     var row: u16 = 1;
-    if (rows >= 1) {
-        _ = try writeFileChromeRow(
-            writer,
-            alloc,
-            request,
-            approval.choice_index,
-            width,
-            row,
-            .header,
-            false,
-            false,
-            approval,
-        );
-        row += 1;
-    }
-    const hint_is_affordable = rows >= 3;
-    const choice_rows = if (hint_is_affordable) @min(@as(u16, 3), rows - 2) else @min(@as(u16, 3), rows - 1);
-    for (0..choice_rows) |index| {
-        _ = try writeFileChromeRow(
-            writer,
-            alloc,
-            request,
-            approval.choice_index,
-            width,
-            row,
-            .{ .choice = @intCast(index) },
-            false,
-            false,
-            approval,
-        );
-        row += 1;
-    }
-    if (hint_is_affordable) {
+    _ = try writeFileChromeRow(
+        writer,
+        alloc,
+        request,
+        approval.choice_index,
+        width,
+        row,
+        .header,
+        false,
+        false,
+        approval,
+    );
+    row += 1;
+    if (rows >= 2) {
         _ = try writeFileChromeRow(
             writer,
             alloc,
@@ -734,6 +717,24 @@ fn paintCompactFileApproval(
             width,
             row,
             .hint,
+            false,
+            false,
+            approval,
+        );
+        row += 1;
+    }
+    // Whatever rows are left go to the choices, in order.
+    const used: u16 = row - 1;
+    const choice_rows = @min(@as(u16, 3), rows - used);
+    for (0..choice_rows) |index| {
+        _ = try writeFileChromeRow(
+            writer,
+            alloc,
+            request,
+            approval.choice_index,
+            width,
+            @intCast(used + 1 + index),
+            .{ .choice = @intCast(index) },
             false,
             false,
             approval,
