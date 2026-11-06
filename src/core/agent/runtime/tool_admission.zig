@@ -209,13 +209,25 @@ pub const TerminalValidationRetryState = struct {
         model_output: []const u8,
     ) Allocator.Error!void {
         if (!std.mem.eql(u8, call.name, "shell")) return;
-        if (try tool_result_errors.inspectTerminalActionFieldCorrection(
+        const correction = try tool_result_errors.inspectTerminalActionFieldCorrection(
             alloc,
             model_output,
-        ) == null) return;
+        ) orelse return;
+        defer if (correction.fields.len > 0) alloc.free(correction.fields);
 
-        var digest: TerminalValidationDigest = undefined;
-        std.crypto.hash.sha2.Sha256.hash(model_output, &digest, .{});
+        // Hash what the refusal is about, not how it was worded. Each reply
+        // carries a different explanation and byte count, so a digest of the
+        // whole reply never repeated and the guard below never fired. The
+        // call and the fields it named are the stable part
+        // (docs/audit/2026-11-06-full-review.md section 7.5).
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(call.arguments_json);
+        for (correction.fields) |field| {
+            hasher.update(&.{0});
+            hasher.update(field);
+        }
+        const digest: TerminalValidationDigest = hasher.finalResult();
+
         const decision = terminalValidationDigestDecision(
             self.previous.items,
             self.current.items,

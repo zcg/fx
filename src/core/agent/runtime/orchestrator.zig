@@ -158,7 +158,10 @@ const assistant_prefill_recovery_prompt =
 pub const assistant_tail_continuation_prompt =
     "Continue from the conversation above.";
 const repeated_terminal_validation_notice =
-    "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect.";
+    "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect. " ++
+    "Read the refusal each call returned: it names the field that was wrong. A refusal of `invalid_shell_request` means the shell field needs " ++
+    "{\"kind\":\"executable\",\"path\":\"bash\"} rather than a bare kind, and one of `invalid_action_fields` means a field belongs to a " ++
+    "different action. Correct that field, or run the command without the shell field, then continue with a follow-up prompt.";
 const repeated_shell_execution_failure_notice =
     "Repeated identical shell failures stopped the tool loop. The failed action was not retried again; inspect the environment or change the action before continuing.";
 const repeated_malformed_arguments_notice =

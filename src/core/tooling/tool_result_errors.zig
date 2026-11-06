@@ -37,6 +37,11 @@ pub const TerminalActionFieldCorrection = struct {
 
 pub const TerminalActionFieldCorrectionView = struct {
     invalid_field_count: usize,
+    /// The fields the refusal named, in the order it named them. Two refusals
+    /// of the same call differ only in their wording, so the retry state hashes
+    /// these instead of the whole reply (docs/audit/2026-11-06-full-review.md
+    /// section 7.5).
+    fields: []const []const u8 = &.{},
 };
 
 const terminal_action_field_error_code = "invalid_action_fields";
@@ -135,10 +140,18 @@ pub fn inspectTerminalActionFieldCorrection(
         if (executed != .bool or executed.bool) return null;
         const problems = error_value.get("problems") orelse return null;
         if (problems != .array or problems.array.items.len == 0) return null;
+        var fields = try alloc.alloc([]const u8, problems.array.items.len);
+        errdefer alloc.free(fields);
+        var filled: usize = 0;
         for (problems.array.items) |problem| {
-            if (problem != .string) return null;
+            if (problem != .string) {
+                alloc.free(fields[0..filled]);
+                return null;
+            }
+            fields[filled] = problem.string;
+            filled += 1;
         }
-        return .{ .invalid_field_count = problems.array.items.len };
+        return .{ .invalid_field_count = problems.array.items.len, .fields = fields };
     }
     if (!std.mem.eql(u8, code, terminal_action_field_error_code)) return null;
     const action = error_value.get("action") orelse return null;
@@ -149,6 +162,20 @@ pub fn inspectTerminalActionFieldCorrection(
     };
     return .{
         .invalid_field_count = invalid_fields.items.len,
+        .fields = blk: {
+            var fields = try alloc.alloc([]const u8, invalid_fields.items.len);
+            errdefer alloc.free(fields);
+            var filled: usize = 0;
+            for (invalid_fields.items) |field| {
+                if (field != .string) {
+                    alloc.free(fields[0..filled]);
+                    return null;
+                }
+                fields[filled] = field.string;
+                filled += 1;
+            }
+            break :blk fields;
+        },
     };
 }
 
