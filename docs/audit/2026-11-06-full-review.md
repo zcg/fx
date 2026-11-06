@@ -1357,9 +1357,10 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
   位置：`src/core/app/app_agent_runtime.zig:1211-1215`、`src/core/subagent/agent_adapter.zig:436-437`、`authority.zig:693-699`
   验证：深度 0/1 边界单测；`index.jsonl` 不再出现 depth ≥ 2
   落地：`authority.keepTool` 一律拒绝 `subagent`，并新增 `max_subagent_depth = 1` 常量；`tool_host.executeManaged` 对非 root 调用返回 `subagent_nested_forbidden`；`agent_adapter.startsSubagents(role)` 让 ACP 与 `fx ask` 的子代理 schema 也拿掉该工具；`system_prompt.md` 与 `subagent_role` 段分别向主代理和子代理声明身份与禁止嵌套。
-- [ ] **2. `subagent_max_children` 设置项（1–16，默认 4）**，按 §10.10 的 7 处接线；`subagent_max_depth` 固定为 1 不暴露
+- [x] **2. `subagent_max_children` 设置项（1–16，默认 4）**，按 §10.10 的 7 处接线；`subagent_max_depth` 固定为 1 不暴露
   位置：`settings_keys.zig`、`config_runtime.zig`、`settings_store.zig`、`env_settings.zig`、`agent_steps.zig`、`app_lifecycle.zig`、`cli_config.zig`
-  验证：`cli_config.zig:990` 强制归类测试 + 配置优先级测试
+  验证：`cli_config.zig` 的强制归类测试已覆盖新 key（`resolved_keys`）；配置优先级经 `applyEnvSettingOverrides` 与 settings 合并路径统一
+  落地：`settings_keys` 声明 `.profile`/`integer`/1–16；`config_runtime.Settings` 与 `parseProjectSafeFields` 解析；`settings_store` 写入与校验；`env_settings` 映射 `FX_SUBAGENT_MAX_CHILDREN`；`agent_steps` 提供解析与 clamp；`app_lifecycle` 两处生效；`cli_config` 的 `Writable`/`resolved_keys`/`effectiveValue` 接线。`tool_host.max_children` 由交互应用、ACP、`fx ask` 三处注入。
 - [ ] **3. `Owner.start` 加 permit；`parallel_execution.zig` 加 `max_parallel_subagent_calls`**（参照同文件 `max_parallel_host_calls = 16`）
   位置：`managed_owner.zig:264-275`、`parallel_execution.zig:48-52`
   验证：permit 耗尽返回可操作错误；分组被截断
