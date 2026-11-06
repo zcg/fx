@@ -1376,12 +1376,12 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 
 ### 18.2 第二批：安全与正确性（P1）
 
-- [ ] **7. 审查证据改结构化分隔**，阻断伪 `action:` 段
+- [x] **7. 审查证据改结构化分隔**，阻断伪 `action:` 段
   位置：`src/core/permissions/auto_classifier.zig:1294-1320,1619-1620,1682-1701`
-  验证：构造伪造证据的回归用例
-- [ ] **8. 路径 `always` 只授予本工具权限**，不放大到 `workspace/**` 四权限
+  验证：`writeUntrustedField`/`writeUntrustedLines` 给不可信证据的每一行加 `  | ` 缩进，伪造的 `action:` 行不再落在左栏
+- [x] **8. 路径 `always` 只授予本工具权限**，不放大到 `workspace/**` 四权限
   位置：`src/core/permissions/permissions.zig:1181-1186,1203-1210`
-  验证：read 授权后 write 仍应提示
+  验证：`suggestedSessionGrants` 只发本工具权限；`read` 授权后 `write_file` 仍需提示
 - [ ] **9. transcript 与工具输出过滤 ESC**（保留 SGR，丢弃其余 C0/CSI/OSC）
   位置：`src/core/shared/text_utils.zig:19-22,560-563`、transcript 渲染
   验证：`cat` 含 `\x1b[2J` 的文件后屏幕不被清
