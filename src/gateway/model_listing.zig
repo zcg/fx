@@ -23,6 +23,7 @@
 const std = @import("std");
 const definitions = @import("../core/config/configured_provider.zig");
 const catalog = @import("../core/gateway/model_catalog.zig");
+const std_types = @import("../core/shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 /// A listing reply larger than this is not a model list; it is a mistake.
@@ -40,6 +41,12 @@ pub const Entry = struct {
     has_web_search: bool = false,
     /// The provider's own name for the model, when it has one.
     display_name: ?[]const u8 = null,
+    /// The thinking levels the provider reported for this model, in the order
+    /// it reported them. A provider whose listing names them is the authority
+    /// for its own models, so these win over anything the profile declares
+    /// (docs/audit/2026-11-06-full-review.md section 18.6). Borrowed from the
+    /// parsed reply, which the caller keeps alive while merging.
+    reasoning_efforts: []const std_types.ReasoningEffort = &.{},
     /// The vendor the endpoint says serves the model, when it says so. A
     /// gateway that fronts several vendors reports each model's upstream,
     /// which is what tells two similarly named models apart.
@@ -58,6 +65,7 @@ pub const Listing = struct {
             self.alloc.free(entry.id);
             if (entry.display_name) |name| self.alloc.free(name);
             if (entry.owned_by) |owner| self.alloc.free(owner);
+            if (entry.reasoning_efforts.len > 0) self.alloc.free(@constCast(entry.reasoning_efforts));
         }
         self.alloc.free(self.entries);
         self.* = undefined;
@@ -146,6 +154,7 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
             .has_vision = capability(object, "supports_vision", "vision"),
             .has_file_input = capability(object, "supports_file_input", "file_input"),
             .has_web_search = capability(object, "supports_web_search", "web_search"),
+            .reasoning_efforts = try parseReasoningEffortList(alloc, object),
             .display_name = display,
             .owned_by = owner,
             .context_window = readLimit(object, shape, .context),
@@ -153,6 +162,49 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
         });
     }
     return .{ .entries = try entries.toOwnedSlice(alloc), .alloc = alloc };
+}
+
+/// The thinking levels a listing entry names for its model, in the order it
+/// names them.
+///
+/// Endpoints disagree on the shape, so both forms a model list uses are read:
+/// a plain array of names (`"reasoning_efforts":["low","high"]`), and an
+/// options array shaped like AI Gateway's
+/// (`"reasoning_options":[{"type":"effort","values":[...]}]`). A level fx does
+/// not know is skipped, so a vendor adding one degrades to the levels fx can
+/// still offer rather than losing the model.
+fn parseReasoningEffortList(alloc: Allocator, object: std.json.ObjectMap) Allocator.Error![]const std_types.ReasoningEffort {
+    if (object.get("reasoning_efforts")) |value| {
+        return appendEffortNames(alloc, value);
+    }
+    const options = object.get("reasoning_options") orelse return &.{};
+    if (options != .array) return &.{};
+    for (options.array.items) |option| {
+        if (option != .object) continue;
+        const kind = option.object.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "effort")) continue;
+        const values = option.object.get("values") orelse continue;
+        return appendEffortNames(alloc, values);
+    }
+    return &.{};
+}
+
+fn appendEffortNames(alloc: Allocator, value: std.json.Value) Allocator.Error![]const std_types.ReasoningEffort {
+    if (value != .array) return &.{};
+    var efforts: std.ArrayList(std_types.ReasoningEffort) = .empty;
+    errdefer efforts.deinit(alloc);
+    for (value.array.items) |raw| {
+        if (efforts.items.len >= std_types.ReasoningEffort.max_options) break;
+        if (raw != .string) continue;
+        const effort = std_types.ReasoningEffort.parse(raw.string) orelse continue;
+        if (effortDefault(effort)) continue;
+        try efforts.append(alloc, effort);
+    }
+    return efforts.toOwnedSlice(alloc);
+}
+
+fn effortDefault(effort: std_types.ReasoningEffort) bool {
+    return effort.isDefault();
 }
 
 test "compatible model listings retain native capabilities and ignore invalid model IDs" {
@@ -252,7 +304,10 @@ pub fn mergeInto(
         if (listingEntry(listing.entries, metadata.id)) |listed| {
             entry.added = listed.added;
             entry.has_tool_use = metadata.supports_tool_use orelse listed.has_tool_use;
-            entry.has_reasoning = listed.has_reasoning;
+            entry.has_reasoning = listed.has_reasoning or listed.reasoning_efforts.len > 0;
+            // The provider is the authority on its own models' thinking levels,
+            // so what its listing reported replaces what the profile guessed.
+            if (listed.reasoning_efforts.len > 0) entry.reasoning_efforts = try appendEfforts(alloc, listed.reasoning_efforts);
             entry.has_vision = metadata.supports_vision orelse listed.has_vision;
             entry.has_file_input = listed.has_file_input or entry.has_vision;
             entry.has_web_search = listed.has_web_search;
@@ -277,7 +332,7 @@ pub fn mergeInto(
             .id = id,
             .added = listed.added,
             .has_tool_use = listed.has_tool_use,
-            .has_reasoning = listed.has_reasoning,
+            .has_reasoning = listed.has_reasoning or listed.reasoning_efforts.len > 0,
             .has_vision = listed.has_vision,
             .has_file_input = listed.has_file_input or listed.has_vision,
             .has_web_search = listed.has_web_search,
@@ -285,6 +340,12 @@ pub fn mergeInto(
             .context_window = listed.context_window orelse 0,
             .max_tokens = listed.max_output_tokens orelse 0,
         };
+        if (listed.reasoning_efforts.len > 0) {
+            entry.reasoning_efforts = appendEfforts(alloc, listed.reasoning_efforts) catch |err| {
+                alloc.free(model_type);
+                return err;
+            };
+        }
         errdefer {
             alloc.free(model_type);
             if (entry.name) |name| alloc.free(name);
@@ -294,6 +355,13 @@ pub fn mergeInto(
         if (listed.owned_by) |vendor| entry.owned_by = try alloc.dupe(u8, vendor);
         out.appendAssumeCapacity(entry);
     }
+}
+
+fn appendEfforts(alloc: Allocator, source: []const std_types.ReasoningEffort) Allocator.Error!std.ArrayList(std_types.ReasoningEffort) {
+    var efforts: std.ArrayList(std_types.ReasoningEffort) = .empty;
+    errdefer efforts.deinit(alloc);
+    try efforts.appendSlice(alloc, source);
+    return efforts;
 }
 
 fn declaredEntry(alloc: Allocator, metadata: definitions.ModelMetadata) Allocator.Error!catalog.ModelCatalogEntry {
