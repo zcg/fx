@@ -3848,6 +3848,13 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         return;
     }
     if (cli_args.len > 0 and isTopLevelHelp(cli_args)) {
+        // Help answers the request, not a mistake: `fx --help extra` would
+        // otherwise print help and exit 0 while silently ignoring `extra`
+        // (docs/audit/2026-11-06-full-review.md section 2.1).
+        if (cli_args.len > 1) {
+            try writeStderrFast("fx: help takes no further arguments\n");
+            exitFast(2);
+        }
         try writeTopLevelHelpFast(raw_env);
         exitFast(0);
     }

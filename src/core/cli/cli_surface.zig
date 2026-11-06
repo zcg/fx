@@ -1037,7 +1037,9 @@ fn launchWordSuggestion(command_catalog: CommandCatalog, word: []const u8) ?[]co
 
 /// Detects `fx <subcommand> --help` / `-h` and returns the subcommand kind so the
 /// caller can render command-specific help. Top-level `fx --help`/`fx help` are
-/// handled separately and intentionally excluded here.
+/// handled separately and intentionally excluded here. A `--help` after `--`
+/// is part of the prompt, not a request for help, so the scan stops there
+/// (docs/audit/2026-11-06-full-review.md section 2.2).
 fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const u8) ?TopLevelKind {
     if (args.len < 2) return null;
     const kind = command_specs.topLevelKindFromToken(command_catalog, args[0]) orelse return null;
@@ -1045,6 +1047,7 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
     // `fx resume` was removed, so its help request gets the removal hint.
     if (kind == .@"resume" and std.mem.eql(u8, args[0], "resume")) return null;
     for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return kind;
     }
     return null;
