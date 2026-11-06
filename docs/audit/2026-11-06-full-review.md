@@ -1382,10 +1382,10 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **8. 路径 `always` 只授予本工具权限**，不放大到 `workspace/**` 四权限
   位置：`src/core/permissions/permissions.zig:1181-1186,1203-1210`
   验证：`suggestedSessionGrants` 只发本工具权限；`read` 授权后 `write_file` 仍需提示
-- [ ] **9. transcript 与工具输出过滤 ESC**（保留 SGR，丢弃其余 C0/CSI/OSC）
+- [x] **9. transcript 与工具输出过滤 ESC**（保留 SGR，丢弃其余 C0/CSI/OSC）
   位置：`src/core/shared/text_utils.zig:19-22,560-563`、transcript 渲染
   验证：`cat` 含 `\x1b[2J` 的文件后屏幕不被清
-- [ ] **10. Anthropic 路径补 JSON 深度检查**
+- [x] **10. Anthropic 路径补 JSON 深度检查**
   位置：`src/gateway/anthropic_messages.zig:416-424,604-608`
   验证：深 300 层 input 返回可恢复错误而非 abort
 - [ ] **11. 退出超时后不销毁 MCP sink**，改 retired + 引用计数
