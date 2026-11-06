@@ -454,7 +454,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         return;
     };
     var child_running = true;
-    errdefer if (child_running) child.kill(io_mod.getIo());
+    errdefer if (child_running) killAndReap(&child);
     const child_pid = child.id orelse return error.ChildIdentityMissing;
     if (tcsetpgrp(io_mod.stdoutHandle(), child_pid) != 0) {
         return error.ForegroundProcessGroupFailed;
@@ -480,7 +480,7 @@ pub fn runLauncher(alloc: Allocator) !void {
         .{&watchdog},
     ) catch |err| {
         control.done.store(true, .release);
-        child.kill(io_mod.getIo());
+        killAndReap(&child);
         child_running = false;
         control_thread.join();
         return err;
@@ -488,7 +488,7 @@ pub fn runLauncher(alloc: Allocator) !void {
     const term = waitLauncherChild(&child) catch |err| {
         watchdog.done.store(true, .release);
         control.done.store(true, .release);
-        child.kill(io_mod.getIo());
+        killAndReap(&child);
         child_running = false;
         watchdog_thread.join();
         control_thread.join();
@@ -574,6 +574,15 @@ test "launcher wait status classifies terminal results before stops" {
         std.process.Child.Term{ .stopped = .TTIN },
         launcherStatusToTerm((@as(u32, @backingInt(std.c.SIG.TTIN)) << 8) | 0x7f),
     );
+}
+
+/// Ends `child` and collects it. A kill alone leaves the process a zombie on
+/// a Unix target until something waits for it, which this shell never would
+/// for a terminal it failed to start
+/// (docs/audit/2026-11-06-full-review.md section 16.2).
+fn killAndReap(child: *std.process.Child) void {
+    child.kill(io_mod.getIo());
+    _ = child.wait(io_mod.getIo()) catch null;
 }
 
 fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
@@ -1813,7 +1822,7 @@ const Session = struct {
             if (self.control_file) |file| file.close(io_mod.getIo());
             if (self.liveness_file) |file| file.close(io_mod.getIo());
             if (self.launcher) |*child| {
-                if (child.id != null) child.kill(io_mod.getIo());
+                if (child.id != null) killAndReap(child);
             }
         }
         self.markNotLive();
