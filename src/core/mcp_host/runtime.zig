@@ -57,6 +57,9 @@ pub fn signalServersForExit() void {
 var retiring: std.atomic.Value(u32) = .init(0);
 /// How often a held runtime looks again.
 const retiring_wait_ms: u32 = 50;
+/// How long a runtime's teardown waits for its in-flight requests to finish
+/// before it frees anyway.
+const deinit_wait_ms: u64 = 5000;
 
 fn retireStarted() void {
     _ = retiring.fetchAdd(1, .acq_rel);
@@ -529,8 +532,19 @@ pub const Runtime = struct {
         r.mutex.unlock(r.io);
         r.engine.wake();
         if (r.thread) |t| t.join();
-        // The owner ended every request; let their callers leave first.
-        while (r.active.load(.acquire) != 0) std.Io.sleep(r.io, .fromMilliseconds(1), .awake) catch {};
+        // The owner ended every request; let their callers leave first. A
+        // caller that never returns would otherwise keep `deinit` spinning
+        // forever, so it gives up after `deinit_wait_ms` and frees anyway
+        // (docs/audit/2026-11-06-full-review.md section 16.7).
+        var waited_ms: u64 = 0;
+        while (r.active.load(.acquire) != 0) {
+            if (waited_ms >= deinit_wait_ms) {
+                debug_trace.logf("mcp", "requests still active at deinit count={d} waited_ms={d}", .{ r.active.load(.acquire), waited_ms });
+                break;
+            }
+            std.Io.sleep(r.io, .fromMilliseconds(1), .awake) catch {};
+            waited_ms += 1;
+        }
         r.queue.deinit(r.gpa);
         r.calls.deinit(r.gpa);
         r.tool_waiters.deinit(r.gpa);

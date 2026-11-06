@@ -311,6 +311,10 @@ pub const Owner = struct {
     ) AcquireError!Acquired {
         const io = io_mod.getIo();
         while (true) {
+            // A capture that already ended is joined out here, before the lock:
+            // its thread finishes by taking this lock, so joining under it would
+            // wait forever (docs/audit/2026-11-06-full-review.md 16.6).
+            self.joinFinishedCapture();
             self.mutex.lockUncancelable(io);
             const decision = self.decideLocked(shell_path, cwd);
             self.mutex.unlock(io);
@@ -480,6 +484,18 @@ pub const Owner = struct {
         }
     }
 
+    /// Joins the previous capture's thread once it has finished, without the
+    /// owner's lock.
+    fn joinFinishedCapture(self: *Owner) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        const done = self.state != .capturing;
+        const thread = self.capture_thread;
+        if (done) self.capture_thread = null;
+        self.mutex.unlock(io);
+        if (done) if (thread) |value| value.join();
+    }
+
     fn decideLocked(self: *Owner, shell_path: []const u8, cwd: []const u8) Decision {
         self.noteChangesLocked(shell_path);
         switch (self.state) {
@@ -534,11 +550,11 @@ pub const Owner = struct {
     }
 
     fn startCaptureLocked(self: *Owner, shell_path: []const u8, cwd: []const u8) !void {
-        if (self.capture_thread) |thread| {
-            // The previous capture already finished; only its thread remains.
-            thread.join();
-            self.capture_thread = null;
-        }
+        // The previous capture's thread is joined before the lock is taken
+        // (`joinFinishedCapture`). Joining here would wait for a thread that
+        // finishes by taking this same lock, which is a deadlock
+        // (docs/audit/2026-11-06-full-review.md section 16.6).
+        if (self.capture_thread != null) return error.CaptureThreadNotJoined;
         const pending = try std.heap.page_allocator.create(PendingCapture);
         errdefer std.heap.page_allocator.destroy(pending);
         const owned_shell = try std.heap.page_allocator.dupe(u8, shell_path);
