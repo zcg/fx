@@ -1116,7 +1116,13 @@ fn resolveFileToolPathInScope(
     // An added directory is inside the scope even though it is outside the
     // workspace, so it is allowed exactly as the workspace is.
     if (allowsExternalPath(tool_name) and scope.additionalRootForPath(resolved) != null) return resolved;
-    return error.PathOutsideAccessScope;
+    // Anything else is a real target the user has to decide about: this
+    // function names the thing permission is being asked for, it does not grant
+    // it. Reporting the external path as the target is what lets the prompt show
+    // where the tool would reach (docs/audit/2026-11-06-full-review.md 3.2);
+    // admission still refuses a path outside every root, and the target being
+    // external is what makes the prompt say so.
+    return resolved;
 }
 
 const external_path_tools = [_][]const u8{

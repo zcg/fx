@@ -10,7 +10,7 @@ pub const default_max_agent_steps: usize = 100;
 /// How many subagents main may run at once when the profile sets no
 /// `subagent_max_children`. The ceiling is small on purpose: each child is a
 /// session with its own worker and slot thread, and nesting is already
-/// limited to one level (`subagent.max_subagent_depth`).
+/// limited to one level (`subagent/authority.zig` `max_subagent_depth`).
 pub const default_subagent_max_children: usize = 4;
 pub const min_subagent_max_children: usize = 1;
 pub const max_subagent_max_children: usize = 16;
