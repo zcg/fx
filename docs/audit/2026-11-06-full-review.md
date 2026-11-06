@@ -1415,9 +1415,9 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 
 ### 18.3 第三批：资源与平台（P1/P2）
 
-- [ ] **19. terminal backend 延迟回收**（不再「留到进程退出」）
+- [x] **19. terminal backend 延迟回收**（不再「留到进程退出」）
   位置：`src/core/terminal/client.zig:466-479`
-  验证：关闭终端后 WS 回落
+  验证：`Runtime.deinit` 先 `closeOwnedTerminals`，join 线程并等待 `active_count` 归零；`registry.closeAllForExit()` 为真时 `backend.registry`/`store` 立即释放，只有仍有后台线程时才保留并记录 trace
 - [x] **20. 终端启动失败路径 `kill` 后 `wait`**
   位置：`src/core/terminal/native_session.zig:441-457,1728-1830`
   验证：失败路径不留 zombie
@@ -1430,9 +1430,9 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **23. MCP runtime 等待加截止时间**
   位置：`src/core/mcp_host/runtime.zig:513-521`
   验证：卡住时 deinit 能完成
-- [ ] **24. Windows `zig build` 覆盖运行中 exe**
+- [x] **24. Windows `zig build` 覆盖运行中 exe**
   位置：`build.zig:94`、`upgrade_helpers.zig:391-425`
-  验证：Windows CI 增加占用用例
+  验证：Windows 目标安装为 `fx-dev.exe`；本机在 `fx.exe` 存在时 `zig build` 退出码 0
 - [x] **25. `detect-macos-need.sh` 把平台分支改动一律视为需 macOS**
   位置：`scripts/detect-macos-need.sh:52,96-97`
   验证：Windows-only diff 触发 macOS
@@ -1451,7 +1451,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **29. 正常退出补 `\x1b[?7h`**
   位置：`src/core/app/app_lifecycle.zig:48`
   验证：退出后长行不串行
-- [ ] **30. 审批屏紧凑布局保留文件名与按键提示**
+- [x] **30. 审批屏紧凑布局保留文件名与按键提示**
   位置：`src/ui/approval_screen.zig:285-293,690-704`
   验证：6 行终端可读
 - [ ] **31. 审批屏 layout 缓存**，避免每帧重建
@@ -1460,10 +1460,10 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **32. Windows resize 轮询降到 100–200ms**
   位置：`src/ui/resize_runtime.zig:28-45,271-284`、`main.zig:187-188`
   验证：空闲 CPU 下降
-- [ ] **33. `catalog_menu` 接线或删除**
+- [x] **33. `catalog_menu` 接线或删除**
   位置：`src/ui/shell_runtime.zig:67-72`
   验证：文档与实现一致
-- [ ] **34. CRLF / 无末尾换行标记**；result_store 统一截断标记
+- [x] **34. CRLF / 无末尾换行标记**；result_store 统一截断标记
   位置：`read_file.zig`、`execution_memory.zig`
   验证：往返测试
 - [ ] **35. detector / fuzz registry / smoke / shellcheck 覆盖补齐**
