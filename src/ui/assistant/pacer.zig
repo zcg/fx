@@ -156,6 +156,11 @@ pub const SgrState = struct {
 
 pub const AssistantPacer = struct {
     pending: std.ArrayList(u8) = .empty,
+    /// How many bytes of `pending` were already emitted. Consumers read from
+    /// here instead of shifting the buffer, so a long reply costs one copy
+    /// when it is drained rather than one per tick
+    /// (docs/audit/2026-11-06-full-review.md section 12.2).
+    consumed: usize = 0,
     deferred_turn: ?FinishedPrompt = null,
     deferred_started_ns: ?i128 = null,
     /// Tracks which SGR attributes the terminal should have active at the
@@ -166,6 +171,7 @@ pub const AssistantPacer = struct {
 
     pub fn deinit(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.deinit(alloc);
+        self.consumed = 0;
         if (self.deferred_turn) |finished| {
             types.freeFinishedPrompt(alloc, finished);
             self.deferred_turn = null;
@@ -174,7 +180,27 @@ pub const AssistantPacer = struct {
     }
 
     pub fn hasPending(self: *const AssistantPacer) bool {
-        return self.pending.items.len > 0 or self.deferred_turn != null;
+        return self.remaining().len > 0 or self.deferred_turn != null;
+    }
+
+    /// The bytes not yet emitted.
+    fn remaining(self: *const AssistantPacer) []const u8 {
+        return self.pending.items[@min(self.consumed, self.pending.items.len)..];
+    }
+
+    /// Drops the emitted prefix. Called when nothing is left, so the buffer is
+    /// emptied once instead of on every tick.
+    fn compact(self: *AssistantPacer) void {
+        if (self.consumed == 0) return;
+        if (self.consumed >= self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+            self.consumed = 0;
+            return;
+        }
+        const rest = self.pending.items.len - self.consumed;
+        @memmove(self.pending.items[0..rest], self.pending.items[self.consumed..]);
+        self.pending.items.len = rest;
+        self.consumed = 0;
     }
 
     pub fn hasCompletedAssistantPresentationTail(self: *const AssistantPacer) bool {
@@ -192,6 +218,9 @@ pub const AssistantPacer = struct {
 
     pub fn enqueue(self: *AssistantPacer, alloc: Allocator, text: []const u8) !void {
         if (text.len == 0) return;
+        // Everything before `consumed` is spent, so it is dropped once here
+        // rather than on every tick.
+        self.compact();
         try self.pending.appendSlice(alloc, text);
     }
 
@@ -218,7 +247,7 @@ pub const AssistantPacer = struct {
     }
 
     pub fn deferFinish(self: *AssistantPacer, alloc: Allocator, finished: FinishedPrompt) !bool {
-        if (self.pending.items.len == 0) return false;
+        if (self.remaining().len == 0) return false;
         if (self.deferred_turn) |old| {
             types.freeFinishedPrompt(alloc, old);
             self.deferred_turn = null;
@@ -232,11 +261,13 @@ pub const AssistantPacer = struct {
     /// A deferred finish stays.
     pub fn discardPendingText(self: *AssistantPacer) void {
         self.pending.clearRetainingCapacity();
+        self.consumed = 0;
         self.sgr = .{};
     }
 
     pub fn clear(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.clearRetainingCapacity();
+        self.consumed = 0;
         if (self.deferred_turn) |finished| {
             types.freeFinishedPrompt(alloc, finished);
             self.deferred_turn = null;
@@ -262,7 +293,7 @@ pub const AssistantPacer = struct {
     }
 
     pub fn tick(self: *AssistantPacer, alloc: Allocator, now_ns: i128, cb: TickCallbacks) !void {
-        if (self.pending.items.len == 0) {
+        if (self.remaining().len == 0) {
             try self.fireDeferredFinish(alloc, now_ns, cb);
             return;
         }
@@ -272,7 +303,7 @@ pub const AssistantPacer = struct {
         }
 
         if (try self.emitPendingBlock(cb) == .drained or self.deferred_turn != null) {
-            if (self.pending.items.len > 0) try self.neutralizeIncompleteTail(cb);
+            if (self.remaining().len > 0) try self.neutralizeIncompleteTail(cb);
             try self.fireDeferredFinish(alloc, now_ns, cb);
         }
     }
@@ -283,7 +314,7 @@ pub const AssistantPacer = struct {
         now_ns: i128,
         cb: TickCallbacks,
     ) !void {
-        if (self.pending.items.len > 0) {
+        if (self.remaining().len > 0) {
             switch (try self.emitPendingBlock(cb)) {
                 .drained => {},
                 .blocked => try self.neutralizeIncompleteTail(cb),
@@ -294,14 +325,14 @@ pub const AssistantPacer = struct {
 
     fn emitPendingBlock(self: *AssistantPacer, cb: TickCallbacks) !FlushResult {
         try self.emitCompletePrefix(cb);
-        if (self.pending.items.len == 0) {
+        if (self.remaining().len == 0) {
             return .drained;
         }
         return .blocked;
     }
 
     fn neutralizeIncompleteTail(self: *AssistantPacer, cb: TickCallbacks) !void {
-        const tail = self.pending.items;
+        const tail = self.remaining();
         std.debug.assert(tail.len > 0);
         if (tail[0] == 0x1b) {
             const kind: []const u8 = if (tail.len == 1)
@@ -364,27 +395,27 @@ pub const AssistantPacer = struct {
             const opens_len = self.sgr.writeOpens(prefix_buf[reset.len..]);
             try cb.emit_fn(cb.emit_ctx, prefix_buf[0 .. reset.len + opens_len]);
         }
-
-        try cb.emit_fn(cb.emit_ctx, self.pending.items[0..i]);
-        self.updateSgrFromEmitted(self.pending.items[0..i]);
+        const payload = self.remaining()[0..i];
+        try cb.emit_fn(cb.emit_ctx, payload);
+        self.updateSgrFromEmitted(payload);
         self.consume(i);
     }
 
     fn emittablePrefixLen(self: *const AssistantPacer) usize {
         var i: usize = 0;
-        while (i < self.pending.items.len) {
-            const first = self.pending.items[i];
+        while (i < self.remaining().len) {
+            const first = self.remaining()[i];
             if (first == 0x1b) {
                 // Keep ANSI sequences atomic and hold incomplete tails for a later tick.
-                const end = display_width.ansiSequenceEnd(self.pending.items, i);
+                const end = display_width.ansiSequenceEnd(self.remaining(), i);
                 if (end > i) {
-                    if (!ansiSequenceComplete(self.pending.items, i, end)) break;
+                    if (!ansiSequenceComplete(self.remaining(), i, end)) break;
                     i = end;
                     continue;
                 }
             }
             const len = std.unicode.utf8ByteSequenceLength(first) catch 1;
-            if (i + len > self.pending.items.len) break;
+            if (i + len > self.remaining().len) break;
             i += len;
         }
         return i;
@@ -423,11 +454,10 @@ pub const AssistantPacer = struct {
     }
 
     fn consume(self: *AssistantPacer, byte_count: usize) void {
-        const remaining = self.pending.items.len - byte_count;
-        if (remaining > 0) {
-            @memmove(self.pending.items[0..remaining], self.pending.items[byte_count..]);
-        }
-        self.pending.items.len = remaining;
+        // The emitted bytes stay where they are and the next read starts past
+        // them. Within one tick the emitted prefix is reserved, so this costs
+        // nothing; the buffer is compacted once no more will arrive.
+        self.consumed +|= byte_count;
     }
 };
 
