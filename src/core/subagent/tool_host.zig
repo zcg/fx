@@ -448,7 +448,16 @@ pub const Runtime = struct {
             .message => {},
         }
         if (request.toParent()) return self.messageParent(alloc, request.message.message, options, from_root);
-        if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+        // A subagent does its own work: its host exists so it can reach its
+        // parent and receive `wait`, not so it can start children. The
+        // depth check is here as well as in `authority.keepTool`, because a
+        // call can still arrive from a model that cached the tool schema, and
+        // it must fail with something the model can act on.
+        if (!from_root) return self.encodeManaged(alloc, .{
+            .ok = false,
+            .error_code = "subagent_nested_forbidden",
+            .result = "Subagents cannot start their own subagents. Do this work yourself with your own tools.",
+        });
 
         // A new child's profile sets its model and effort unless the
         // request names them. Loading it here refuses an unknown profile, or

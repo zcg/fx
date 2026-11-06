@@ -609,8 +609,9 @@ fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     return out;
 }
 
-/// The host's tools a child may use: all of them, `subagent` included, or with
-/// a profile only those it allows.
+/// The host's tools a child may use: all of them, or with a profile only
+/// those it allows, and never `subagent`: a subagent does its own work
+/// instead of starting another (see `keepTool`).
 fn cloneKeptTools(
     alloc: Allocator,
     values: []const []const u8,
@@ -690,10 +691,19 @@ fn cloneIntegrations(
     return cloneStrings(alloc, kept.items);
 }
 
+/// How deep a subagent may nest: a subagent never starts one of its own, so
+/// a session runs main and its children, and nothing below them. Fixed here
+/// rather than configured, because unlimited nesting is what let one session
+/// reach hundreds of children and levels (docs/audit/2026-11-06-full-review.md
+/// section 20).
+pub const max_subagent_depth: usize = 1;
+
 /// A tool the child keeps from the set it starts from, unless its profile
-/// leaves it out. `subagent` is kept like any other, so a child starts its
-/// own.
+/// leaves it out. `subagent` is never kept: `max_subagent_depth` allows no
+/// child of a child, and a tool the model is never shown is one it cannot
+/// call by mistake.
 fn keepTool(profile: ?*const profiles.Profile, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "subagent")) return false;
     const value = profile orelse return true;
     return profiles.allowsTool(value, name);
 }
@@ -890,10 +900,10 @@ test "authority capture permits registry access and rejects changed work" {
                     if (change == .permission) types.PermissionMode.auto else types.PermissionMode.ask,
                     snapshot.permission_mode,
                 );
-                // A child keeps `subagent` like any tool its parent holds.
-                try std.testing.expectEqual(@as(usize, 2), snapshot.tools.len);
+                // A child never keeps `subagent`: it does its own work
+                // (authority.max_subagent_depth).
+                try std.testing.expectEqual(@as(usize, 1), snapshot.tools.len);
                 try std.testing.expectEqualStrings("read_file", snapshot.tools[0]);
-                try std.testing.expectEqualStrings("subagent", snapshot.tools[1]);
                 var current = try store.load(alloc);
                 defer current.deinit(alloc);
                 var host = try HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{});
@@ -986,7 +996,9 @@ test "a subagent's profile narrows its tools, integrations, MCP view, and mode, 
 
     var plain = try resolver.resolve(alloc, "plain-child");
     defer plain.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), plain.tools.len);
+    // The host offers three tools; a child keeps two, since a subagent never
+    // keeps `subagent`.
+    try std.testing.expectEqual(@as(usize, 2), plain.tools.len);
     try std.testing.expectEqual(types.PermissionMode.ask, plain.permission_mode);
     try std.testing.expectEqual(@as(usize, 2), plain.mcp_view.?.servers.len);
     try std.testing.expectEqual(@as(usize, 2), plain.mcp_view.?.tools.len);
@@ -1145,10 +1157,14 @@ test "a turn no work started is limited by the child's profile and the user's mo
     try std.testing.expectEqualStrings("read_file", profiled.tools[0]);
     try std.testing.expectEqual(types.PermissionMode.auto, profiled.permission_mode);
 
-    // Without a profile the user's mode decides, and nesting stays out.
+    // Without a profile the user's mode decides, and nesting stays out: the
+    // host offers `read_file`, `write_file`, and `subagent`, and a child
+    // never keeps the last one.
     var plain = try resolver.resolveForUser(alloc, "plain-child", .ask);
     defer plain.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), plain.tools.len);
+    try std.testing.expectEqual(@as(usize, 2), plain.tools.len);
+    try std.testing.expectEqualStrings("read_file", plain.tools[0]);
+    try std.testing.expectEqualStrings("write_file", plain.tools[1]);
     try std.testing.expectEqual(types.PermissionMode.ask, plain.permission_mode);
 
     try std.testing.expectError(error.ChildNotAttached, resolver.resolveForUser(alloc, "missing-child", .ask));

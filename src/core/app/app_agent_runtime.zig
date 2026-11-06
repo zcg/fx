@@ -1209,9 +1209,12 @@ pub fn Runtime(comptime App: type) type {
             var child_tools = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer child_tools.deinit();
             if (childRun(agent)) |run| {
+                // Only main starts subagents (authority.max_subagent_depth), so
+                // a child's schema leaves the tool out even though it has a
+                // host of its own to reach its parent and wait on.
                 const shown: subagent_agent_adapter.Shown = .{ .admitted = .{
                     .tools = run.admission.tool_names,
-                    .starts_subagents = app_session_runtime.Runtime(App).ownSubagentHost(agent) != null,
+                    .starts_subagents = subagent_agent_adapter.startsSubagents(agent.role),
                 } };
                 config.advertised_tool_names = try subagent_agent_adapter.childToolNames(
                     child_tools.allocator(),

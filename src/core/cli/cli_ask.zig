@@ -282,7 +282,9 @@ fn runAskChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .subagent_available = true,
+            // A subagent runs no child of its own, so the schema it is shown
+            // leaves the tool out (authority.max_subagent_depth).
+            .subagent_available = false,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);

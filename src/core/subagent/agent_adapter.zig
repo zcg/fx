@@ -386,6 +386,16 @@ pub fn childProfile(resolver: ?*authority_mod.Resolver, child_id: ?[]const u8) ?
 /// the agent that started it, `main` unless that is another subagent.
 pub const Role = struct { name: []const u8, parent: []const u8 };
 
+/// What a session may start, for the prompt that tells it so: main starts
+/// its children (`max_children` of them) and a child starts none, which is
+/// the same rule `tool_host.executeManaged` enforces on every call.
+pub const Scope = struct {
+    /// Null for main, which may start children; a name for a subagent.
+    role: ?Role = null,
+    /// How many subagents main may run at once, from `subagent_max_children`.
+    max_children: usize = 0,
+};
+
 /// A child's system prompt: `base`, or its profile's prompt in its place or
 /// added to it, then what it is and who started it, whatever its profile,
 /// then the run's `<subagent_instructions>` overlay.
@@ -401,13 +411,30 @@ pub fn childSystemPrompt(
         "{s}\n\n<subagent_role>\nYou are the subagent \"{s}\", started by \"{s}\". When work it gives you " ++
             "ends, your output reaches it on its own as your report. To message it sooner, for example when the " ++
             "user asks you to tell {s} something, call the subagent tool with action \"message\" and agent " ++
-            "\"parent\", if you have that tool.\n</subagent_role>",
-        .{ base_prompt, role.name, role.parent, role.parent },
+            "\"parent\", if you have that tool.\nYou cannot start subagents of your own. Do the whole piece of " ++
+            "work {s} gave you yourself, with your own tools: a subagent that tries to start one is refused.\n</subagent_role>",
+        .{ base_prompt, role.name, role.parent, role.parent, role.parent },
     );
     if (overlay.len == 0) return with_role;
     return alloc.print(
         "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
         .{ with_role, overlay },
+    );
+}
+
+/// What main's prompt says about the subagents it may start, or nothing when
+/// it can start none. It states the same limit the tool enforces, so main
+/// plans within it instead of being refused.
+pub fn mainSubagentGuidance(alloc: Allocator, scope: Scope) Allocator.Error![]const u8 {
+    if (scope.role != null) return "";
+    if (scope.max_children == 0) return
+        "You cannot start subagents in this session. Do the work yourself with your own tools.";
+    return alloc.print(
+        "You are the only agent that starts subagents, and you may run at most {d} of them at once " ++
+            "(subagent_max_children); a call past that is refused, so plan for {d} or fewer. " ++
+            "A subagent does its own work with its own tools and cannot start subagents, so give each " ++
+            "one a whole piece of work instead of a plan that needs further splitting.",
+        .{ scope.max_children, scope.max_children },
     );
 }
 
@@ -419,10 +446,17 @@ pub const Shown = union(enum) {
     profile: ?*const profiles.Profile,
     /// The interactive app's: the ones its run was admitted with, its
     /// parent's narrowed by its profile, so it is never shown a tool its
-    /// parent lacks. `subagent` is among them
-    /// only once it has its own host to start subagents on.
+    /// parent lacks. `subagent` is among them only for main, which is the one
+    /// level `authority.max_subagent_depth` allows (see `startsSubagents`).
     admitted: struct { tools: []const []const u8, starts_subagents: bool },
 };
+
+/// Whether an agent may start subagents at all: only main does. A child's own
+/// host exists so it can reach its parent and wait for reports, never so it
+/// can start children.
+pub fn startsSubagents(role: agents.Role) bool {
+    return role == .instance;
+}
 
 fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) bool {
     const subagent = std.mem.eql(u8, name, "subagent");
@@ -1111,7 +1145,9 @@ test "a child's system prompt names it and who started it, then wraps the run's 
     const expected_role = "<subagent_role>\nYou are the subagent \"reviewer\", started by \"main\". When work it " ++
         "gives you ends, your output reaches it on its own as your report. To message it sooner, for example when " ++
         "the user asks you to tell main something, call the subagent tool with action \"message\" and agent " ++
-        "\"parent\", if you have that tool.\n</subagent_role>";
+        "\"parent\", if you have that tool.\nYou cannot start subagents of your own. Do the whole piece of " ++
+        "work main gave you yourself, with your own tools: a subagent that tries to start one is refused.\n" ++
+        "</subagent_role>";
     try std.testing.expectEqualStrings(
         "base prompt\n\n" ++ expected_role,
         try childSystemPrompt(arena.allocator(), null, "base prompt", role, ""),

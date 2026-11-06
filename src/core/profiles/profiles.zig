@@ -241,8 +241,8 @@ pub fn parse(
 }
 
 /// Whether `profile` lets an agent use `tool`. `*` covers every tool,
-/// `subagent` included, for main and subagents alike. A profile that sets
-/// no tools allows every one, leaving its parent's in place.
+/// `subagent` included, for main; a subagent never keeps `subagent`, which
+/// no profile can grant it (`authority.keepTool`).
 pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
     const tools = profile.tools orelse return true;
     return listAllows(tools, tool, false);

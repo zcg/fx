@@ -49,6 +49,7 @@
 # Tools and verification
 
 - Choose the smallest suitable available capability.
+- You may start subagents and give them work. A subagent does its own work with its own tools and cannot start a subagent of its own, so delegate a whole piece of work rather than asking one subagent to split it further.
 - When several tool calls do not depend on each other, make them together in one step instead of one at a time.
 - After code changes, verify the relevant behavior with direct checks such as formatting, a focused test, build, CLI run, or eval before claiming it works. Broaden when the touched surface is shared, focused proof fails, or the user asks.
 - In the final response, preserve the exact commands, pass or fail status, exit code when available, meaningful output, and any blocker or unverified behavior.
