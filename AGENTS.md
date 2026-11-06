@@ -1,5 +1,11 @@
 # AGENTS.md
 
+当前开发环境为Windows原生开发环境，使用powershell来执行命令，然后路径风格为Windows原生路径风格，各种工具链齐全，Zig版本为0.17.0。
+
+Token是不限量的，往死里用，追求最好的效果。
+
+要以工程师思维来干活，修东西更是，要是以工程师的思维来干活。然后在Windows的部分要用Windows的思维来进行干活，在Linux和Mac那个方面，要以Unix思维方式来干活。编程语言方面使用Zig作为编程语言，所以要使用Zig的哲学、编程思维来进行干活。在这个这个软件上，这个Agent的软件上，要以性能、节省内存、优秀的使用体验、人体工程学，还有界面的好看、美观、方便易用等等为第一要求。
+
 Instructions for AI coding agents working with this codebase.
 
 ## Never Discard Uncommitted Work

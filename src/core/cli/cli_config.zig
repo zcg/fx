@@ -6,6 +6,7 @@ const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const agent_steps = @import("../config/agent_steps.zig");
 const env_settings = @import("../config/env_settings.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");

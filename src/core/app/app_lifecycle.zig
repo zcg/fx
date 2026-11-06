@@ -413,6 +413,9 @@ pub const StartupStatus = struct {
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
     agent_step_limit: usize,
+    /// How many subagents a session may run at once; a subagent never starts
+    /// one of its own.
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
     update_channel: update_target.Channel = .stable,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
 

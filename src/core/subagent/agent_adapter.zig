@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");

@@ -1201,12 +1201,14 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
     }
 
     if (isPathBasedTool(target_kind) and workspace_root.len > 0 and pathing.pathInside(workspace_root, target_path)) {
+        // Only the tool's own permission, over the directory tree the user saw.
+        // Granting every path permission here turned one "always" on a read into
+        // edit rights across the whole workspace, which is more than the user
+        // agreed to (docs/audit/2026-11-06-full-review.md section 17.2).
         const workspace_pattern = try directoryTreePattern(alloc, workspace_root);
         defer alloc.free(workspace_pattern);
 
-        for (path_always_permissions) |path_permission| {
-            try appendOwnedGrant(alloc, &grants, path_permission, workspace_pattern);
-        }
+        try appendOwnedGrant(alloc, &grants, permission, workspace_pattern);
         return grants.toOwnedSlice(alloc);
     }
 
@@ -2694,10 +2696,9 @@ test "suggestedSessionGrants returns exact broad workspace path suggestions" {
     const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent);
     defer freeGrants(alloc, grants);
 
-    try std.testing.expectEqual(@as(usize, path_always_permissions.len), grants.len);
-    for (path_always_permissions, 0..) |permission, i| {
-        try expectGrant(grants[i], permission, "/tmp/workspace/**");
-    }
+    // One grant, for the tool's own permission: read no longer widens to edit.
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try expectGrant(grants[0], "edit", "/tmp/workspace/**");
 }
 
 test "suggestedSessionGrants uses registered path metadata for provider tools" {
@@ -2710,11 +2711,9 @@ test "suggestedSessionGrants uses registered path metadata for provider tools" {
         .path_optional_existing,
     );
     defer freeGrants(alloc, grants);
-
-    try std.testing.expectEqual(@as(usize, path_always_permissions.len), grants.len);
-    for (path_always_permissions, 0..) |permission, i| {
-        try expectGrant(grants[i], permission, "/tmp/workspace/**");
-    }
+    // A registered path tool grants only its own permission.
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try expectGrant(grants[0], "glob", "/tmp/workspace/**");
 
     const unknown = try suggestedSessionGrants(
         alloc,
@@ -2826,7 +2825,7 @@ test "structured file grant offer cleans partial allocations" {
     defer deinitTestFileGrantOffer(alloc, offer);
 
     try std.testing.expect(offer.scope == .workspace_files);
-    try std.testing.expectEqual(path_always_permissions.len, offer.grants.len);
+    try std.testing.expectEqual(@as(usize, 1), offer.grants.len);
     for (offer.grants) |grant| {
         try std.testing.expectEqualStrings("/tmp/workspace/**", grant.target_path);
     }
