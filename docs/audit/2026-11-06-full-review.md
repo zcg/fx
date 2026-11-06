@@ -1388,19 +1388,19 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **10. Anthropic 路径补 JSON 深度检查**
   位置：`src/gateway/anthropic_messages.zig:416-424,604-608`
   验证：深 300 层 input 返回可恢复错误而非 abort
-- [ ] **11. 退出超时后不销毁 MCP sink**，改 retired + 引用计数
+- [x] **11. 退出超时后不销毁 MCP sink**，改 retired + 引用计数
   位置：`src/core/app/app_mcp_runtime.zig:379-395`
   验证：慢 MCP 场景退出不崩溃
-- [ ] **12. 修正 shell 工具描述与 schema 冲突**
+- [x] **12. 修正 shell 工具描述与 schema 冲突**
   位置：`src/builtins/tools.zig:80-81,97-105,118`
   验证：Windows 按描述切 Git Bash 不再整轮失败
-- [ ] **13. 收窄 validation 判重 digest、提高 budget、notice 加可操作恢复信息**
+- [x] **13. 收窄 validation 判重 digest、提高 budget、notice 加可操作恢复信息**
   位置：`tool_admission.zig:205-235`、`orchestrator.zig:155-156,12007-12027`
   验证：复现两个报废子代理场景
-- [ ] **14. `pacer.consume` 改读偏移**替代 `@memmove`
+- [x] **14. `pacer.consume` 改读偏移**替代 `@memmove`
   位置：`src/ui/assistant/pacer.zig:425-431`
   验证：长回答时 CPU 与分配对比
-- [ ] **15. `unescapeCarried` 精确匹配语义**
+- [x] **15. `unescapeCarried` 精确匹配语义**
   位置：`src/core/tooling/file_mutation.zig:1478-1486`
   验证：含 `&lt;fx-skill-used>` 的文档往返测试
 - [ ] **16. 路径工具 active scope 纳入准入**
