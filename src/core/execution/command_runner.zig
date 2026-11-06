@@ -3172,6 +3172,11 @@ const ProcessObserver = struct {
     stdout: std.Io.File,
     stderr: std.Io.File,
     detached_pipes: bool = false,
+    /// True once the child was reaped by `kill` rather than by `wait`. On
+    /// Windows `Child.kill` waits for the process itself and leaves `id` null,
+    /// so a later `wait` asserts. Recording it keeps the reader from calling
+    /// `wait` a second time and takes the process down with it.
+    reaped_by_kill: bool = false,
 
     fn init(child: *std.process.Child) !ProcessObserver {
         const process_id = child.id orelse return error.SpawnFailed;
@@ -3221,6 +3226,15 @@ const ProcessObserver = struct {
         if (comptime builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
+        }
+        // The child was already reaped by `kill`, so its exit is known and its
+        // `id` is null. Waiting again asserts, and the assertion is inside the
+        // standard library, which ends the process.
+        if (self.reaped_by_kill or self.waiter.child.id == null) {
+            // `kill` has already reaped it, so there is no wait status left to
+            // read. The command was terminated, which is what a signal status
+            // reports.
+            return .{ .signal = 9 };
         }
         const term = self.waiter.child.wait(self.waiter.io) catch |err| {
             return switch (source) {
@@ -3279,7 +3293,10 @@ const ProcessObserver = struct {
         intent: TerminationIntent,
     ) !void {
         if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
-            self.waiter.child.kill(self.waiter.io);
+            if (self.waiter.child.id != null) {
+                self.waiter.child.kill(self.waiter.io);
+                self.reaped_by_kill = true;
+            }
             return;
         }
         const target_pid = process_group_id orelse self.process_id;

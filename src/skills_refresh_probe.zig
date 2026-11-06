@@ -55,6 +55,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("skillRootsForProbe FAILED err={s}\n", .{@errorName(err)});
         return;
     };
+    defer {
+        for (roots_before) |root| c_alloc.free(root.path);
+        c_alloc.free(roots_before);
+    }
     for (roots_before) |root| {
         std.debug.print("root={s} absolute={} authority={?s}\n", .{
             root.path,
