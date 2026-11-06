@@ -49,7 +49,7 @@ has_platform_code() {
   grep -Eq "$2" <<<"$content"
 }
 
-zig_platform_code='\.linux([^A-Za-z0-9_]|$)|isBSD|\.macos|isDarwin|[Dd]arwin'
+zig_platform_code='\.linux([^A-Za-z0-9_]|$)|isBSD|\.macos|isDarwin|[Dd]arwin|\.windows|[Ww]indows|builtin\.target\.os|std\.os\.windows|std\.posix'
 ts_platform_code='process\.platform|platform\(\)'
 
 if ! jq -e 'type == "array"' "$platform_list" >/dev/null 2>&1; then
@@ -103,6 +103,8 @@ while IFS= read -r path; do
         require "$path: macOS platform E2E file changed"
       fi ;;
     tests/e2e/*.ts)
+      # Every helper under tests/e2e, not only the directory's first level: a
+      # platform branch in a nested helper decides the same tests.
       if has_platform_code "$path" "$ts_platform_code"; then
         require "$path: shared E2E helper has a platform branch"
       fi ;;

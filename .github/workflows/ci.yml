@@ -20,6 +20,11 @@ concurrency:
   group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
   cancel-in-progress: true
 
+# CI reads the repository and nothing else. A job that needs more asks for it
+# itself, so a step added later cannot quietly inherit write access.
+permissions:
+  contents: read
+
 jobs:
   zig_mode:
     name: Build & Test (${{ matrix.optimize }})

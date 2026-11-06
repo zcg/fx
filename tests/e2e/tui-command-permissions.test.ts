@@ -1542,7 +1542,9 @@ describe("effect-aware command permissions", () => {
     90_000,
   );
 
-  test.skipIf(!tmuxAvailable())(
+  // `/sound on` plays a sound, and sound playback on a macOS runner can
+  // overload the machine (AGENTS.md), so this test runs on other platforms.
+  test.skipIf(!tmuxAvailable() || process.platform === "darwin")(
     "TUI user-profile output preserves compact scrollback across slash commands",
     async () => {
       const root = createIsolatedRoot();

@@ -116,6 +116,10 @@ jobs:
     if: needs.detect.outputs.needed == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      # A sound played during a test run can overload a macOS runner and crash
+      # the machine (AGENTS.md), so the platform E2E shards never play one.
+      FX_SOUND: "0"
     strategy:
       fail-fast: false
       matrix:

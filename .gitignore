@@ -15,6 +15,10 @@ sdk/dist/
 # Workspace-local runtime state
 /skills/
 
+# Generated Python bytecode from the repository's own scripts
+__pycache__/
+*.pyc
+
 # Local environment files
 .env
 .env.*
