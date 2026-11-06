@@ -78,7 +78,7 @@ const shell_base_description =
 /// write POSIX syntax for PowerShell or a Windows path for Bash, and either
 /// fails in a way that reads like a broken tool.
 const shell_windows_description =
-    " On Windows this runs PowerShell 7 (pwsh) by default. Pass shell={\"kind\":\"bash\"} for Git Bash: use Bash for POSIX tools (sed, awk, grep, find, xargs, make), pwsh for Windows-native work (services, registry, .NET, cmdlets). Paths differ: Bash takes /c/Users/example/project, pwsh takes C:\\Users\\example\\project. If Bash lacks a tool, retry in pwsh.";
+    " On Windows this runs PowerShell 7 (pwsh) by default. Pass shell={\"kind\":\"bash\"} for Git Bash. Choose by the command, not by habit: Bash for POSIX text tools (sed, awk, grep, find, xargs, make), pipelines of them, and Unix-style build scripts; pwsh for Windows-native work (services, registry, .NET, cmdlets), Windows paths with backslashes, and anything whose output you will read as data. Prefer whichever runs it in one short command, because each call starts a new shell and a translation between the two costs more than picking the right one. Paths differ: Bash takes /c/Users/example/project, pwsh takes C:\\Users\\example\\project. If a retry reports the other shell is not installed, stay in the one that worked: only an installed shell can be chosen. If Bash lacks a tool, retry in pwsh.";
 
 fn baseDescription(comptime with_windows: bool) []const u8 {
     return shell_base_description ++ if (with_windows) shell_windows_description else "";

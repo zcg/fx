@@ -1,7 +1,14 @@
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
 
-pub const description_max_bytes: usize = 1024;
+/// How long a tool description may be before it is truncated.
+///
+/// This bounds what reaches the model, so it is a prompt budget rather than a
+/// data limit. A description that has to explain more than this is usually one
+/// that has to explain a platform difference, and cutting it at a size that
+/// fits a single-platform tool is what makes a cross-platform tool's description
+/// say half of what it needs.
+pub const description_max_bytes: usize = 2048;
 pub const truncation_marker = "... [truncated]";
 
 pub const JsonType = enum {
