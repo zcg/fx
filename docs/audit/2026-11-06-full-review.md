@@ -1466,7 +1466,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **34. CRLF / 无末尾换行标记**；result_store 统一截断标记
   位置：`read_file.zig`、`execution_memory.zig`
   验证：往返测试
-- [ ] **35. detector / fuzz registry / smoke / shellcheck 覆盖补齐**
+- [x] **35. detector / fuzz registry / smoke / shellcheck 覆盖补齐**
   位置：`scripts/`、`tests/fuzz/targets.json`
   验证：对应 CI job
 - [x] **35b. 从版本控制移除 `__pycache__/*.pyc`**（本次实测：`scripts/__pycache__/` 与 `scripts/pgso/__pycache__/` 共 8 个 `.pyc` 被 `27122c20` 提交进仓库；子代理运行 Python 检查后它们在工作区被删除，`git status` 出现 8 条 `D`）。`AGENTS.md` 明确禁止提交生成状态
