@@ -1489,12 +1489,13 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 
 ### 18.6 用户追加的缺陷（2026-11-06 使用中反馈）
 
-- [ ] **37. Provider 刷新出来的模型，思考层级只有 Default、无法选择**
+- [x] **37. Provider 刷新出来的模型，思考层级只有 Default、无法选择**
   位置：`src/core/config/model_capabilities.zig`（能力解析）、`src/core/gateway/model_catalog.zig` 与 `src/core/mcp/model_catalog.zig`（模型目录）、`src/core/config/configured_provider.zig`（自定义 provider）、思考层级在 UI 与 `/model` 选择器中的渲染。
   现象：通过 provider 的模型刷新接口拿到的模型，在设置里思考程度（effort / thinking）只有 Default，改不了也换不了。
   期望：思考层级应当跟随模型一起从 provider 获取，并且按 provider、按模型各不相同——不同 provider、不同模型的层级名称和档位都不一样，不能统一成一套硬编码枚举。
   参考实现：`D:\Projects\pi-rust`。它同样在拉取模型时一并取用对应的 thinking 层级，并用 thinking 命令配置层级，可以直接对照抄它的数据来源与命令接线。
   验收：给一个声明了多档思考层级的 provider 与模型，设置里能列出它自己那几档并选中生效；换一个 provider 不会串档；没声明的模型仍回落 Default。
+  落地：`configured_provider.ModelMetadata` 新增 `reasoning_efforts` 与 `supports_reasoning`，`parse_metadata` 解析并按 provider 自己的顺序保留；`chat_completions.lookup_capabilities` 把它们送进 `Capabilities.reasoning_efforts`。
 
 ## 19. 修复前必须要做的三件事
 
