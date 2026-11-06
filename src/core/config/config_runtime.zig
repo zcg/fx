@@ -43,6 +43,9 @@ pub const Settings = struct {
     providers: ?configured_provider.Registry = null,
     models: model_preferences.Preferences = .{},
     provider: ?model_provider.ProviderId = null,
+    /// A bare `model` read before `provider` was known, held until the file's
+    /// provider is read so the model lands under the right one. Owned while set.
+    bare_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -91,6 +94,7 @@ pub const Settings = struct {
     skill_symlink_authorities: ?[][]u8 = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.bare_model) |value| alloc.free(value);
         if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
@@ -1712,13 +1716,26 @@ fn parseProfileOnlyFields(
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
         settings_store.validateModel(value.string) catch return error.InvalidModelValue;
-        try settings.models.putCopy(alloc, .gateway, value.string);
+        settings.bare_model = try alloc.dupe(u8, value.string);
     }
 
     if (root.object.get("provider")) |provider_value| {
         if (provider_value != .string) return error.InvalidProviderType;
         settings.provider = model_provider.parse(provider_value.string) orelse
             return error.InvalidProviderValue;
+    }
+
+    // A bare `model` belongs to the provider the same file selects, not to the
+    // Gateway by definition. Reading it after `provider` is what makes that
+    // true whatever order the file lists them in. Treating it as Gateway's left
+    // a profile that named its own provider with no model for that provider, so
+    // the selection fell back to Gateway and the user's models never appeared,
+    // which is what hid their thinking levels
+    // (docs/audit/2026-11-06-full-review.md section 18.6).
+    if (settings.bare_model) |bare| {
+        try settings.models.putCopy(alloc, settings.provider orelse .gateway, bare);
+        alloc.free(bare);
+        settings.bare_model = null;
     }
 
     if (root.object.get("codex_model")) |model_value| {

@@ -435,7 +435,7 @@ test "merging keeps declared order and adds what the listing reports" {
     );
     defer registry.deinit(alloc);
     var listing = try parse(alloc,
-        \\{"data":[{"id":"newcomer","name":"Newcomer","context_length":4096},{"id":"chosen","name":"Chosen Model"}]}
+        \\{"data":[{"id":"newcomer","name":"Newcomer","context_length":4096,"reasoning_efforts":["low","high"]},{"id":"chosen","name":"Chosen Model","reasoning_options":[{"type":"effort","values":["minimal","medium","high"]}]}]}
     );
     defer listing.deinit();
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
@@ -448,9 +448,16 @@ test "merging keeps declared order and adds what the listing reports" {
     try std.testing.expectEqualStrings("Chosen Model", entries.items[0].name.?);
     try std.testing.expectEqual(@as(u32, 8192), entries.items[0].context_window);
     try std.testing.expect(entries.items[0].has_tool_use);
-    // Then the one only the listing knows.
+    // The provider's own levels win, read from AI Gateway's options shape.
+    try std.testing.expect(entries.items[0].has_reasoning);
+    try std.testing.expectEqual(@as(usize, 3), entries.items[0].reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("minimal", entries.items[0].reasoning_efforts.items[0].label());
+    // Then the one only the listing knows, with a plain level list.
     try std.testing.expectEqualStrings("newcomer", entries.items[1].id);
     try std.testing.expectEqual(@as(u32, 4096), entries.items[1].context_window);
+    try std.testing.expectEqual(@as(usize, 2), entries.items[1].reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("low", entries.items[1].reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("high", entries.items[1].reasoning_efforts.items[1].label());
 }
 
 test "a listing that cannot be read leaves the declared models alone" {
