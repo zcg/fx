@@ -1403,7 +1403,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **15. `unescapeCarried` 精确匹配语义**
   位置：`src/core/tooling/file_mutation.zig:1478-1486`
   验证：含 `&lt;fx-skill-used>` 的文档往返测试
-- [ ] **16. 路径工具 active scope 纳入准入**
+- [x] **16. 路径工具 active scope 纳入准入**
   位置：`src/core/permissions/`、`src/core/workspace/`
   验证：`--no-additional-dirs` / 符号链接回归
 - [ ] **17. `node.js` fetch 清理修 drain 死分支 + `fetchState` 改 Map**
