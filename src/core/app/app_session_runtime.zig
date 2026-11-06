@@ -4413,6 +4413,9 @@ pub fn Runtime(comptime App: type) type {
                 host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
                 // A subagent's own host can message the subagent's parent.
                 host.owner_has_parent = agent.role == .subagent;
+                // Only main starts children, and only as many as the profile
+                // allows (`subagent_max_children`).
+                host.max_children = app.subagent_max_children;
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
             }

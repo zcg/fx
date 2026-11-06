@@ -22,6 +22,10 @@ pub const Config = struct {
     pub const default_step_limit_notice = "Agent step limit reached; continue with a follow-up prompt if needed.";
 
     system_prompt: []const u8,
+    /// What an agent that starts subagents is told about its limit, appended
+    /// as its own system message. Empty for a subagent, whose own prompt
+    /// already says it starts none.
+    subagent_guidance: []const u8 = "",
     model_prompt_overlay: ?[]const u8 = null,
     host_instructions: []const u8 = "",
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },

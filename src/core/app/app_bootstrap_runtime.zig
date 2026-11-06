@@ -28,6 +28,7 @@ const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -577,6 +578,14 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initMode(app, agent, permission_mode);
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
+            app.subagent_max_children = startup.subagent_max_children;
+            // Main's prompt says how many subagents it may run, and that they
+            // cannot split further, so it plans within the same limit the tool
+            // enforces. The app owns this text for its lifetime.
+            app.subagent_prompt_guidance = subagent_agent_adapter.mainSubagentGuidance(
+                app.alloc,
+                .{ .max_children = startup.subagent_max_children },
+            ) catch "";
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;

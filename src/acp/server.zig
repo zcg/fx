@@ -3,6 +3,7 @@ const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
+const agent_steps = @import("../core/config/agent_steps.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -339,6 +340,8 @@ pub const ServerState = struct {
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
+    /// How many subagents this session may run at once (1 to 16).
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
@@ -799,6 +802,9 @@ fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *s
         return;
     };
     state.subagent_host.?.report_sink = .{ .context = state, .post_fn = postAcpReport };
+    // Only the session's own agent starts children, and only as many as its
+    // profile allows.
+    state.subagent_host.?.max_children = state.subagent_max_children;
     state.subagent_v2_children = children;
     // What a restart left owed reaches the session as its next turns.
     state.subagent_host.?.resumeReports(v2);
@@ -3000,6 +3006,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.permission_mode = startup.permission_mode;
     state.permission_rules = startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
+    state.subagent_max_children = startup.subagent_max_children;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;

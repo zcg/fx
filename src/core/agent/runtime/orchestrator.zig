@@ -6346,7 +6346,7 @@ fn appendStablePromptContext(
     messages: *std.ArrayList(ChatMessage),
 ) !void {
     const start = messages.items.len;
-    for ([_][]const u8{ config.system_prompt, config.custom_tool_guidance }) |content| {
+    for ([_][]const u8{ config.system_prompt, config.subagent_guidance, config.custom_tool_guidance }) |content| {
         if (content.len > 0) try messages.append(alloc, .{ .role = .system, .content = content });
     }
     // The system prompt and tool guidance are the same in every workspace, so

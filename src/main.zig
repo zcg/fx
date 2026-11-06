@@ -564,6 +564,11 @@ const App = struct {
     permission_engine: PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
+    /// How many subagents main may run at once (1 to 16), and the paragraph
+    /// its prompt adds so it plans within that limit. A subagent never starts
+    /// one of its own.
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
+    subagent_prompt_guidance: []const u8 = &.{},
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,

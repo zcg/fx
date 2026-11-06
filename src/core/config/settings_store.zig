@@ -5,6 +5,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const agent_steps = @import("agent_steps.zig");
 const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -122,6 +123,7 @@ pub const UserSettingsPatch = struct {
     auto_upgrade: ?bool = null,
     max_agent_steps: ?u32 = null,
     max_tool_result_bytes: ?u32 = null,
+    subagent_max_children: ?u32 = null,
     auto_compact_percent: ?u8 = null,
     provider_strict: ?bool = null,
     context: ?bool = null,
@@ -162,6 +164,7 @@ pub const UserSettingsPatch = struct {
             self.auto_upgrade == null and
             self.max_agent_steps == null and
             self.max_tool_result_bytes == null and
+            self.subagent_max_children == null and
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
@@ -1032,6 +1035,11 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.max_tool_result_bytes) |bytes| {
         if (bytes < tool_result_limits.min_configured_tool_result_bytes) return error.InvalidSettingsFormat;
     }
+    if (patch.subagent_max_children) |children| {
+        if (children < agent_steps.min_subagent_max_children or children > agent_steps.max_subagent_max_children) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (patch.auto_compact_percent) |percent| {
         if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
     }
@@ -1341,6 +1349,7 @@ fn applyUserPatchToRoot(
     if (patch.auto_upgrade) |value| application.changed = try putBool(arena, &root.object, "auto_upgrade", value) or application.changed;
     if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
     if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
+    if (patch.subagent_max_children) |value| application.changed = try putInteger(arena, &root.object, "subagent_max_children", value) or application.changed;
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
@@ -1516,12 +1525,13 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
         if (patch.max_agent_steps != null) "max_agent_steps" else null,
         if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
+        if (patch.subagent_max_children != null) "subagent_max_children" else null,
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,

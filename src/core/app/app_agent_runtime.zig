@@ -1617,6 +1617,14 @@ pub fn Runtime(comptime App: type) type {
                     if (run.system_prompt.len > 0) run.system_prompt else prompt_policy.system_prompt
                 else
                     prompt_policy.system_prompt,
+                // Main's prompt says how many subagents it may run and that
+                // they cannot split further; a child's own prompt says the same
+                // from the other side, inside `childSystemPrompt`.
+                .subagent_guidance = if (child_run != null or
+                    (comptime !@hasField(App, "subagent_prompt_guidance")))
+                    ""
+                else
+                    app.subagent_prompt_guidance,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
                 .skill_catalog = catalog,
                 .skill_bindings = bindings,

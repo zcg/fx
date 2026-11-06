@@ -109,6 +109,9 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
             .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{steps}) };
         try list.append(arena, .{ .variable = "FX_MAX_AGENT_STEPS", .key = "max_agent_steps", .value = value });
     }
+    if (agent_steps.parseSubagentMaxChildren(getenv("FX_SUBAGENT_MAX_CHILDREN"))) |children| {
+        try list.append(arena, .{ .variable = "FX_SUBAGENT_MAX_CHILDREN", .key = "subagent_max_children", .value = .{ .integer = @intCast(children) } });
+    }
     if (compactor.parsePercent(getenv("FX_AUTO_COMPACT_PERCENT"))) |percent| {
         try list.append(arena, .{ .variable = "FX_AUTO_COMPACT_PERCENT", .key = "auto_compact_percent", .value = .{ .integer = percent } });
     }

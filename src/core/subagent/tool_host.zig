@@ -15,6 +15,7 @@ const live_metrics = @import("live_metrics.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const agent_steps = @import("../config/agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profiles = @import("../profiles/profiles.zig");
@@ -204,6 +205,10 @@ pub const Runtime = struct {
     /// Whether this host's owner is itself a subagent, so a message to its
     /// parent has somewhere to go. Set by its runtime.
     owner_has_parent: bool = false,
+    /// How many subagents this host may run at once: main's
+    /// `subagent_max_children`, resolved by its runtime (1 to 16). A host
+    /// whose owner is a subagent never starts one at all, whatever this says.
+    max_children: usize = agent_steps.default_subagent_max_children,
 
     /// A host over a parent whose children live in its log (D22), returned
     /// only after abandoned child work has been recovered. Borrows
@@ -554,6 +559,7 @@ pub const Runtime = struct {
             .rejected => |failure| return self.encodeManaged(alloc, .{
                 .ok = false,
                 .error_code = failure.code,
+                .result = if (failure.advice.len > 0) failure.advice else null,
             }),
             .ready => |ready| {
                 keep_call = true;
@@ -1479,6 +1485,9 @@ pub const Runtime = struct {
         rejected: struct {
             child_id: ?[]u8 = null,
             code: []const u8,
+            /// Advice the model can act on, or empty when the code says it
+            /// all. Borrowed from the arena that made the admission.
+            advice: []const u8 = "",
         },
 
         fn deinit(self: *ManagedAdmission, alloc: Allocator) void {
@@ -1650,6 +1659,24 @@ pub const Runtime = struct {
                 }
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
+                // A new child counts against `max_children`; a message to one
+                // already running does not, and neither does a name the
+                // registry already knows.
+                if (registry.children.len >= self.max_children) {
+                    debug_trace.logf(
+                        "subagent",
+                        "admission rejected operation={s} code=subagent_children_exceeded children={d} limit={d}",
+                        .{ operation_id, registry.children.len, self.max_children },
+                    );
+                    return .{ .rejected = .{
+                        .code = "subagent_children_exceeded",
+                        .advice = try alloc.print(
+                            "{d} subagents already run under this session (limit {d}, set by subagent_max_children). " ++
+                                "Wait for a report or stop one with action \"stop\".",
+                            .{ registry.children.len, self.max_children },
+                        ),
+                    } };
+                }
                 try registry.appendPersistent(
                     alloc,
                     child_id,

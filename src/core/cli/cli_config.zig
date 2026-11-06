@@ -131,6 +131,7 @@ const Writable = enum {
     fast_mode,
     max_agent_steps,
     max_tool_result_bytes,
+    subagent_max_children,
     @"prompt_history.enabled",
     provider_strict,
     session_titles,
@@ -198,6 +199,14 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
                 return invalid(problem, "a whole number of steps; 0 means no limit");
             patch.max_agent_steps = steps;
             return .{ .patch = patch, .value = .{ .integer = steps } };
+        },        .subagent_max_children => {
+            const children = std.fmt.parseUnsigned(u32, raw, 10) catch
+                return invalid(problem, "a whole number of subagents, 1 to 16");
+            if (children < agent_steps.min_subagent_max_children or children > agent_steps.max_subagent_max_children) {
+                return invalid(problem, "a whole number of subagents, 1 to 16");
+            }
+            patch.subagent_max_children = children;
+            return .{ .patch = patch, .value = .{ .integer = children } };
         },
         .max_tool_result_bytes => {
             const bytes = std.fmt.parseUnsigned(u32, raw, 10) catch 0;
@@ -234,7 +243,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .@"status_line.session" => patch.statusline_item = .{ .item = .session, .enabled = enabled },
         .@"status_line.workspace" => patch.statusline_item = .{ .item = .workspace, .enabled = enabled },
         .ultrafast_mode => patch.ultrafast_mode = enabled,
-        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent => unreachable,
+        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent, .subagent_max_children => unreachable,
     }
     return .{ .patch = patch, .value = .{ .bool = enabled } };
 }
@@ -446,8 +455,8 @@ pub const resolved_keys = [_][]const u8{
     "review_model",             "session_titles",         "slash_menu_categories",
     "sound.attention_required", "sound.max",              "sound.turn_end",
     "startup_scrollback",       "status_line.context",    "status_line.session",
-    "status_line.workspace",    "theme",                  "ultrafast_mode",
-    "update_channel",
+    "status_line.workspace",    "subagent_max_children",   "theme",
+    "ultrafast_mode",           "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -480,6 +489,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());
     if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);
     if (eql(u8, key, "max_tool_result_bytes")) return integer(arena, state.max_tool_result_bytes);
+    if (eql(u8, key, "subagent_max_children")) return integer(arena, state.subagent_max_children);
     if (eql(u8, key, "permission_mode")) return string(state.permission_mode.label());
     if (eql(u8, key, "prompt_history.enabled")) return boolean(state.prompt_history_enabled);
     if (eql(u8, key, "provider")) return string(try arena.dupe(u8, provider.label()));

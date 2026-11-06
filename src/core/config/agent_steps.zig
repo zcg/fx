@@ -1,9 +1,43 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 
 pub const default_max_agent_steps: usize = 0;
 
+/// How many subagents main may run at once when the profile sets no
+/// `subagent_max_children`. The ceiling is small on purpose: each child is a
+/// session with its own worker and slot thread, and nesting is already
+/// limited to one level (`subagent.max_subagent_depth`).
+pub const default_subagent_max_children: usize = 4;
+pub const min_subagent_max_children: usize = 1;
+pub const max_subagent_max_children: usize = 16;
+
 pub fn resolveMaxAgentSteps(configured: ?usize, default_value: usize) usize {
     return configured orelse default_value;
+}
+
+/// The number of subagents main may run at once: the profile's setting when
+/// it is in range, and the default otherwise, so a bad file cannot widen it.
+pub fn resolveSubagentMaxChildren(configured: ?usize) usize {
+    const value = configured orelse return default_subagent_max_children;
+    if (value < min_subagent_max_children or value > max_subagent_max_children) {
+        return default_subagent_max_children;
+    }
+    return value;
+}
+
+/// The same, with `FX_SUBAGENT_MAX_CHILDREN` in front of the profile's
+/// setting, as every other `FX_*` override works.
+pub fn resolveSubagentMaxChildrenWithOverride(configured: ?usize) usize {
+    return parseSubagentMaxChildren(io_mod.getenv("FX_SUBAGENT_MAX_CHILDREN")) orelse
+        resolveSubagentMaxChildren(configured);
+}
+
+pub fn parseSubagentMaxChildren(raw: ?[]const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw orelse return null, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const value = std.fmt.parseUnsigned(usize, trimmed, 10) catch return null;
+    if (value < min_subagent_max_children or value > max_subagent_max_children) return null;
+    return value;
 }
 
 pub fn parseMaxAgentSteps(raw: ?[]const u8) ?usize {

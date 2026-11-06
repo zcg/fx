@@ -202,6 +202,9 @@ pub const StartupState = struct {
     yolo_acknowledged: bool = false,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize,
+    /// How many subagents main may run at once, 1 to 16; a subagent never
+    /// starts one of its own (`subagent.max_subagent_depth`).
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
@@ -260,7 +263,7 @@ pub const StartupState = struct {
             alloc.free(self.config_diagnostics);
         }
         if (self.theme) |value| alloc.free(value);
-        self.* = .{ .agent_step_limit = self.agent_step_limit };
+        self.* = .{ .agent_step_limit = self.agent_step_limit, .subagent_max_children = self.subagent_max_children };
     }
 
     pub fn takeWorkspaceRoot(self: *StartupState) []u8 {
@@ -685,6 +688,7 @@ pub fn loadStartupStatusWithAuthMode(
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
+        .subagent_max_children = agent_steps.resolveSubagentMaxChildren(settings.subagent_max_children),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
     };
@@ -901,6 +905,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
     state.agent_step_limit = loadAgentStepLimit(state.agent_step_limit, settings.max_agent_steps);
+    state.subagent_max_children = agent_steps.resolveSubagentMaxChildrenWithOverride(settings.subagent_max_children);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});

@@ -48,6 +48,9 @@ pub const Settings = struct {
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
+    /// How many subagents main may run at once, 1 to 16. Profile-only: how
+    /// much fan-out a machine affords is the user's, not a project's.
+    subagent_max_children: ?usize = null,
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
@@ -2008,6 +2011,16 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
         settings.provider_strict = strict_value.bool;
     }
 
+    if (root.object.get("subagent_max_children")) |subagent_max_children_value| {
+        const value = subagent_max_children_value;
+        if (value != .integer) return error.InvalidSubagentMaxChildrenType;
+        const steps = std.math.cast(usize, value.integer) orelse return error.InvalidSubagentMaxChildrenValue;
+        if (steps < agent_steps.min_subagent_max_children or steps > agent_steps.max_subagent_max_children) {
+            return error.InvalidSubagentMaxChildrenValue;
+        }
+        settings.subagent_max_children = steps;
+    }
+
     if (root.object.get("max_agent_steps")) |max_agent_steps_value| {
         const value = max_agent_steps_value;
         if (value != .integer) return error.InvalidMaxAgentStepsType;
@@ -2042,6 +2055,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
+    if (incoming.subagent_max_children) |value| target.subagent_max_children = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;

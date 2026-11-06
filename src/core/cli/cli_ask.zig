@@ -38,6 +38,7 @@ const select_watch = @import("../shared/select_watch.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const compactor = @import("../compactor/compactor.zig");
+const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const terminal_env = @import("../shared/terminal_env.zig");
 const cli_config = @import("cli_config.zig");
@@ -616,6 +617,8 @@ const AskContext = struct {
     /// duration of the run. Empty keeps the reviewer's compiled default.
     reviewer_model: []const u8 = "",
     agent_step_limit: usize = 0,
+    /// How many subagents this run may start at once (1 to 16).
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
@@ -1040,6 +1043,9 @@ const AskContext = struct {
         };
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
+        // Only this run's agent starts children, and only as many as its
+        // profile allows.
+        self.subagent_host.?.max_children = self.subagent_max_children;
         // What a restart left owed runs as this run's next turns.
         self.subagent_host.?.resumeReports(v2);
     }
@@ -1638,6 +1644,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.seed_model = startup.configured_model;
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
+    ctx.subagent_max_children = startup.subagent_max_children;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
