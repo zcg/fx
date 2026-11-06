@@ -804,7 +804,7 @@ fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *s
     state.subagent_host.?.report_sink = .{ .context = state, .post_fn = postAcpReport };
     // Only the session's own agent starts children, and only as many as its
     // profile allows.
-    state.subagent_host.?.max_children = state.subagent_max_children;
+    state.subagent_host.?.setMaxChildren(state.subagent_max_children);
     state.subagent_v2_children = children;
     // What a restart left owed reaches the session as its next turns.
     state.subagent_host.?.resumeReports(v2);

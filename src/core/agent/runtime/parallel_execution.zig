@@ -47,7 +47,7 @@ fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 
 fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
     var len: usize = 0;
-    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {}
+    while (len < calls.len and len < max_parallel_subagent_calls and isSubagentCall(registry, calls[len])) : (len += 1) {}
     return len;
 }
 
@@ -64,6 +64,11 @@ fn isConcurrentHostCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 /// journal barriers and permission prompts share, so a group stays well
 /// below that limit. Later calls form the next group.
 const max_parallel_host_calls = 16;
+
+/// How many subagent calls from one message start together. The subagent host
+/// refuses a child past `subagent_max_children` anyway, so a wider group only
+/// builds calls that are about to be refused. The rest run in the next group.
+const max_parallel_subagent_calls = 16;
 
 fn parallelHostPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
     var len: usize = 0;

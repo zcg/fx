@@ -56,6 +56,103 @@ jobs:
             echo "Tag ${TAG} missing, release needed"
           fi
 
+      # The changelog is checked before anything is tagged, so a malformed
+      # entry fails here instead of after a tag already exists on the remote.
+      - name: Check changelog entry
+        env:
+          RELEASE_TAG: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          python3 - "$VERSION" <<'PY'
+          import re
+          import sys
+
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          starts = text.count("<!-- release:start -->")
+          ends = text.count("<!-- release:end -->")
+          if starts != 1 or ends != 1:
+              raise SystemExit(
+                  f"CHANGELOG.md needs exactly one release marker pair, found {starts} start and {ends} end"
+              )
+          start = text.index("<!-- release:start -->")
+          end = text.index("<!-- release:end -->")
+          if end < start:
+              raise SystemExit("CHANGELOG.md release:end comes before release:start")
+          body = text[start + len("<!-- release:start -->") : end].strip()
+          if len(body.splitlines()) < 2:
+              raise SystemExit("CHANGELOG.md release notes are empty")
+          headings = re.findall(r"^## (.+)$", text, re.M)
+          if not headings or headings[0].strip() != version:
+              raise SystemExit(
+                  f"CHANGELOG.md starts with {headings[0].strip() if headings else 'no heading'}, expected {version}"
+              )
+          earlier = text[end:]
+          if "<!-- release:start -->" in earlier or "<!-- release:end -->" in earlier:
+              raise SystemExit("an earlier CHANGELOG.md entry still carries release markers")
+          print(f"CHANGELOG.md entry for {version} is well formed")
+          PY
+
+  # A stable release waits for the checks AGENTS.md calls authoritative on the
+  # same commit, named by SHA and not by branch: `Build & Test` covers the Linux
+  # gate, `E2E (deterministic)` and `Startup Latency` the behavior and budget,
+  # and `macOS arm64` the platform check. A skipped or failed check keeps the
+  # release from publishing while still allowing a manual dispatch to validate.
+  ci-gate:
+    needs: check-version
+    if: needs.check-version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: Wait for the commit's required checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          required=("Build & Test" "E2E (deterministic)" "Startup Latency" "macOS arm64")
+          deadline=$((SECONDS + 3600))
+          while :; do
+            report=$(gh api "repos/${REPO}/commits/${SHA}/check-runs" --paginate \
+              -q '[.check_runs[] | {name: .name, status: .status, conclusion: .conclusion}]')
+            pending=0
+            failed=()
+            for name in "${required[@]}"; do
+              row=$(printf '%s' "$report" | jq -r --arg name "$name" \
+                '[.[] | select(.name == $name)] | last // empty | "\(.status) \(.conclusion // "null")"')
+              if [ -z "$row" ]; then
+                echo "$name: not reported yet"
+                pending=1
+                continue
+              fi
+              status=${row% *}
+              conclusion=${row#* }
+              echo "$name: $status $conclusion"
+              if [ "$status" != "completed" ]; then
+                pending=1
+              elif [ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ]; then
+                failed+=("$name=$conclusion")
+              fi
+            done
+            if [ "${#failed[@]}" -gt 0 ]; then
+              echo "::error::release blocked by ${failed[*]}"
+              exit 1
+            fi
+            if [ "$pending" -eq 0 ]; then
+              echo "every required check succeeded for ${SHA}"
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::required checks did not finish within an hour"
+              exit 1
+            fi
+            sleep 30
+          done
+
   build-linux-aarch64:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
@@ -307,7 +404,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]
+    needs: [check-version, ci-gate, package-linux, build-macos-x86_64, sign-macos-arm64]
     if: needs.check-version.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.validate_only)
     runs-on: ubuntu-latest
     environment: release
@@ -321,6 +418,32 @@ jobs:
         with:
           pattern: fx-*
           merge-multiple: true
+
+      # Every platform ships an archive and its checksum. A missing pair, an
+      # empty archive, or a digest that does not match stops the release here,
+      # before the tag exists.
+      - name: Verify release artifacts
+        run: |
+          set -euo pipefail
+          expected="fx-linux-x86_64 fx-linux-aarch64 fx-macos-x86_64 fx-macos-aarch64"
+          for platform in $expected; do
+            archive="${platform}.tar.gz"
+            digest="${archive}.sha256"
+            if [ ! -s "$archive" ]; then
+              echo "::error::missing or empty $archive"
+              exit 1
+            fi
+            if [ ! -s "$digest" ]; then
+              echo "::error::missing or empty $digest"
+              exit 1
+            fi
+            sha256sum --check --strict "$digest"
+            if ! tar -tzf "$archive" | grep -qx 'fx'; then
+              echo "::error::$archive carries no fx binary"
+              exit 1
+            fi
+            echo "$archive verified"
+          done
 
       - name: Create git tag
         env:

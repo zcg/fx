@@ -208,6 +208,8 @@ pub const Runtime = struct {
     /// How many subagents this host may run at once: main's
     /// `subagent_max_children`, resolved by its runtime (1 to 16). A host
     /// whose owner is a subagent never starts one at all, whatever this says.
+    /// Setting it also bounds [`managed_owner.Owner.max_running`], the permit a
+    /// slot thread is started under.
     max_children: usize = agent_steps.default_subagent_max_children,
 
     /// A host over a parent whose children live in its log (D22), returned
@@ -253,6 +255,14 @@ pub const Runtime = struct {
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
         return runtime;
+    }
+
+    /// Sets how many children this host may run at once, from the profile's
+    /// `subagent_max_children`. The permit covers both a new child and the
+    /// slot thread behind it, so the two can never disagree.
+    pub fn setMaxChildren(self: *Runtime, children: usize) void {
+        self.max_children = children;
+        self.managed.max_running = children;
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -1527,6 +1537,17 @@ pub const Runtime = struct {
             _ = self.managed.start(child_id) catch |err| {
                 debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} work_id={s} error={s}", .{ child_id, operation_id, @errorName(err) });
                 self.clearBusyLocked(child_id);
+                // Admission checked the permit, but a slot can fill between
+                // that check and this start. Say the same thing the check does
+                // rather than failing the turn with a raw error.
+                if (err == error.TooManyChildren) return .{ .rejected = .{
+                    .code = "subagent_children_exceeded",
+                    .advice = try alloc.print(
+                        "{d} subagents already run under this session (limit {d}, set by subagent_max_children). " ++
+                            "Wait for a report or stop one with action \"stop\".",
+                        .{ self.max_children, self.max_children },
+                    ),
+                } };
                 return err;
             };
             if (admitted.ready.created)
@@ -1659,10 +1680,10 @@ pub const Runtime = struct {
                 }
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
-                // A new child counts against `max_children`; a message to one
-                // already running does not, and neither does a name the
-                // registry already knows.
-                if (registry.children.len >= self.max_children) {
+                // A new child counts against `max_children`. Both limits hold:
+                // the registry's names, and the owner's live slot threads, so a
+                // child stopped and restarted never runs past the permit.
+                if (registry.children.len >= self.max_children or !self.managed.hasCapacity()) {
                     debug_trace.logf(
                         "subagent",
                         "admission rejected operation={s} code=subagent_children_exceeded children={d} limit={d}",

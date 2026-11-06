@@ -95,6 +95,11 @@ const empty_length_limited_reply = "The reply ran out of output tokens before an
 const empty_reply_nudge_prompt =
     "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.";
 
+/// How many extra steps one turn may take on its own to recover a stalled or
+/// silent reply. The nudge and the continuation share it, so a model that
+/// keeps stalling ends the turn instead of spending API calls without bound.
+const max_recovery_steps: usize = 3;
+
 // What the empty-reply notice says happens next: fx asks the model again, or
 // the turn has failed and the next step is the user's.
 const empty_reply_asking = "Asking it to continue.";
@@ -7010,6 +7015,11 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    // Each extra step a turn takes on its own, to nudge a stalled reply or to
+    // ask a silent one to summarize, counts against its own budget. Without
+    // one, a model that keeps stalling spends an unbounded number of API
+    // calls inside a single step of the turn.
+    var recovery_steps: usize = 0;
     // The last reply stopped for `other` with nothing in it and was answered
     // with the empty-reply nudge. A step that shows text or calls a tool clears
     // it, so each separate stall in a long turn gets one nudge.
@@ -9207,11 +9217,13 @@ fn processQueuedPromptLoop(
                 disposition == .completed and
                 !empty_other and
                 !continuation_injected and
+                recovery_steps < max_recovery_steps and
                 silent_tool_steps >= 2 and
                 !has_content;
 
             if (needs_continuation) {
                 continuation_injected = true;
+                recovery_steps += 1;
                 const continuation_prompt = "Summarize what you just did.";
                 debug_trace.logf("agent", "injecting continuation after {d} silent tool steps omitted_assistant_bytes={d} preserved_provider_state={s}", .{
                     silent_tool_steps,
@@ -9245,13 +9257,16 @@ fn processQueuedPromptLoop(
                 const provider_reason = completion.finish_reason_raw.slice();
                 // One nudge per stall, and never past the step limit
                 // (`tests/tla/agent_runtime/EmptyReply.tla` NoDoubleNudge, StepsBounded).
-                const nudge = !empty_reply_nudged and agent_steps.allowsStep(config.agent_step_limit, step + 1);
+                const nudge = !empty_reply_nudged and
+                recovery_steps < max_recovery_steps and
+                agent_steps.allowsStep(config.agent_step_limit, step + 1);
                 debug_trace.eventf("agent", if (nudge) "empty_reply_nudge" else "empty_reply_failed", step_ctx, "provider_finish_reason={s} after_nudge={s}", .{
                     provider_reason,
                     if (empty_reply_nudged) "true" else "false",
                 });
                 if (nudge) {
                     empty_reply_nudged = true;
+                    recovery_steps += 1;
                     try deps.push_text(deps.ctx, .{ .operational = try emptyReplyNotice(arena, provider_reason, empty_reply_asking) });
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     try appendContinuationPrompt(arena, &within_turn_suffix, completion.content, provider_replay, empty_reply_nudge_prompt);

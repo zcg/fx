@@ -1,7 +1,11 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 
-pub const default_max_agent_steps: usize = 0;
+/// The most agent steps one turn may take when the profile does not say. Zero
+/// would let a turn loop for as long as the model keeps calling tools, which
+/// is what an unbounded run costs its user, so the default is finite and only
+/// an explicit `0` turns the limit off.
+pub const default_max_agent_steps: usize = 100;
 
 /// How many subagents main may run at once when the profile sets no
 /// `subagent_max_children`. The ceiling is small on purpose: each child is a
@@ -73,7 +77,7 @@ test "parse max agent steps accepts zero and rejects invalid input" {
 }
 
 test "process overrides resolve with configured and compiled defaults" {
-    try std.testing.expectEqual(@as(usize, 0), resolveMaxAgentStepsWithOverride(null, default_max_agent_steps, null));
+    try std.testing.expectEqual(default_max_agent_steps, resolveMaxAgentStepsWithOverride(null, default_max_agent_steps, null));
     try std.testing.expectEqual(@as(usize, 0), resolveMaxAgentStepsWithOverride(0, 24, null));
     try std.testing.expectEqual(@as(usize, 24), resolveMaxAgentStepsWithOverride(null, 0, "24"));
     try std.testing.expectEqual(@as(usize, 0), resolveMaxAgentStepsWithOverride(24, 8, "0"));

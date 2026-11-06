@@ -21,7 +21,10 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const StartResult = enum { started, already_running };
-pub const StartError = error{ OutOfMemory, OwnerClosed, ChildUnavailable, ThreadSpawnFailed };
+/// Errors `start` reports to main. `TooManyChildren` is the whole-session
+/// permit: main may run `max_running` children at once, and a call past that
+/// gets this instead of another thread.
+pub const StartError = error{ OutOfMemory, OwnerClosed, ChildUnavailable, ThreadSpawnFailed, TooManyChildren };
 pub const WaitError = error{ OutOfMemory, ChildUnavailable, StateUnavailable };
 pub const CancelError = error{ChildUnavailable};
 
@@ -131,6 +134,11 @@ pub const Owner = struct {
     authority_resolver: *authority.Resolver,
     approvals: *approval_registry.Registry,
     max_history_turns: usize = 8,
+    /// The most children this owner runs at once. A start past it fails with
+    /// `TooManyChildren` instead of spawning another slot thread, so the
+    /// thread count follows this bound and not the number of calls. Resolved
+    /// from `subagent_max_children` by the host.
+    max_running: usize = 4,
     mutex: std.Io.Mutex = .init,
     waiters_changed: std.Io.Condition = .init,
     slots: std.ArrayList(*Slot) = .empty,
@@ -229,6 +237,16 @@ pub const Owner = struct {
         return false;
     }
 
+    /// Whether one more child would still be within `max_running`. Admission
+    /// asks before it records a new child, so a refused call leaves no child
+    /// behind that never ran.
+    pub fn hasCapacity(self: *Owner) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) return false;
+        return self.slots.items.len < self.max_running;
+    }
+
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
         // A single-threaded build, such as the WebAssembly terminal, has no
         // slot threads, and its subagent tool is off, so no child is started.
@@ -261,6 +279,10 @@ pub const Owner = struct {
                         item.deinit(self.alloc);
                     } else feedback_index += 1;
                 }
+                // New child: this slot is the permit. A session that already
+                // runs `max_running` children starts none more, so the thread
+                // count follows the setting and not the calls.
+                if (self.slots.items.len >= self.max_running) return error.TooManyChildren;
                 const slot = try self.alloc.create(Slot);
                 errdefer self.alloc.destroy(slot);
                 slot.* = .{

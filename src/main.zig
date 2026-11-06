@@ -186,7 +186,14 @@ const RawEnviron = io_mod.RawEnviron;
 
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
-const focused_ui_worker_poll_timeout_ms: i32 = 1;
+/// How long the loop waits while a worker it is watching may have something
+/// for it. It used to be 1ms, which made the loop run a thousand times a
+/// second and collect every fact on each pass; work that lands between waits
+/// now lands within a few milliseconds instead.
+const focused_ui_worker_poll_timeout_ms: i32 = 4;
+/// The shortest wait a pass that has nothing to do takes, so a drain that put
+/// events back cannot spin the loop without bound.
+const min_idle_poll_timeout_ms: i32 = 2;
 const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
@@ -213,7 +220,7 @@ fn nativeLoopPollTimeoutMs(
     /// waiting for input.
     next_iteration_due: bool,
 ) i32 {
-    if (next_iteration_due) return 0;
+    if (next_iteration_due) return min_idle_poll_timeout_ms;
     return if (first_frame_pending or
         auth_refresh_active or
         skills_refresh_active or

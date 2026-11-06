@@ -1045,7 +1045,7 @@ const AskContext = struct {
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
         // Only this run's agent starts children, and only as many as its
         // profile allows.
-        self.subagent_host.?.max_children = self.subagent_max_children;
+        self.subagent_host.?.setMaxChildren(self.subagent_max_children);
         // What a restart left owed runs as this run's next turns.
         self.subagent_host.?.resumeReports(v2);
     }
