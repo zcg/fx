@@ -61,7 +61,20 @@ pub const Invocation = struct {
         self.len += 1;
     }
 
+    /// Appends the flag that introduces `command` and the command itself.
+    ///
+    /// The flag is not the same everywhere: POSIX shells take `-c`, PowerShell
+    /// spells it `-Command`, and cmd uses `/C`. Passing `-c` to PowerShell is
+    /// accepted as an abbreviation but passing it to cmd is not a switch at all,
+    /// so the kind of shell decides.
     pub fn setCommand(self: *Invocation, command: []const u8) void {
+        if (self.len > 0) {
+            if (shellKind(self.values[0])) |kind| {
+                self.append(commandFlag(kind));
+                self.append(command);
+                return;
+            }
+        }
         self.append("-c");
         self.append(command);
     }
@@ -114,10 +127,11 @@ pub fn resolve(
         // Windows shells take no login or startup-file flags of the POSIX kind.
         // `-NoLogo` keeps the banner out of the first frame; `-NoProfile` keeps
         // the user's profile from changing what a command does.
+        // `-NoExit` is deliberately absent: it keeps the shell running after the
+        // command finishes, so a caller waiting on the process waits forever.
         .pwsh, .powershell => {
             result.append("-NoLogo");
             result.append("-NoProfile");
-            result.append("-NoExit");
         },
         .cmd => result.append("/Q"),
     }
@@ -488,10 +502,22 @@ pub fn formatInvocationCommand(
     return output.toOwnedSlice(alloc);
 }
 
+/// Drops the interactive flag `resolve` may have added. A shell that never got
+/// one keeps its arguments: asserting here made a Windows shell, whose last flag
+/// is `-NoExit` rather than `-i`, end the process instead of running a command.
 fn removeInteractiveFlag(invocation: *Invocation) void {
-    std.debug.assert(invocation.len > 0);
-    std.debug.assert(std.mem.eql(u8, invocation.values[invocation.len - 1], "-i"));
+    if (invocation.len == 0) return;
+    if (!std.mem.eql(u8, invocation.values[invocation.len - 1], "-i")) return;
     invocation.len -= 1;
+}
+
+/// The flag that introduces a command for this shell kind.
+fn commandFlag(kind: ShellKind) []const u8 {
+    return switch (kind) {
+        .bash, .zsh => "-c",
+        .pwsh, .powershell => "-Command",
+        .cmd => "/C",
+    };
 }
 
 pub fn buildBootstrap(

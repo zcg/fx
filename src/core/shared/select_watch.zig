@@ -98,10 +98,18 @@ fn eventOperation(io: std.Io, done: *std.Io.Event) std.Io.Cancelable!u32 {
     return 9;
 }
 
+/// Whether the platform has the POSIX signal machinery these tests need.
+/// Windows has no `sigaction` at all: the type there is `void` and `SIG` has no
+/// `IO` member, so naming either one is a compile error rather than something a
+/// runtime check can guard.
+const has_signals = builtin.target.os.tag != .windows and
+    !builtin.single_threaded and
+    std.posix.Sigaction != void;
+
 /// Counts SIGIO deliveries while installed. `std.Io.Threaded` installs a
 /// handler that does nothing so the signal interrupts blocking syscalls; this
 /// one does the same with the same flags, plus a count.
-const SignalCounter = struct {
+const SignalCounter = if (has_signals) struct {
     var count: std.atomic.Value(u32) = .init(0);
     var previous: std.posix.Sigaction = undefined;
 
@@ -123,12 +131,15 @@ const SignalCounter = struct {
         std.posix.sigaction(.IO, &previous, null);
         return count.load(.monotonic);
     }
+} else struct {
+    fn install() void {}
+    fn uninstall() u32 {
+        return 0;
+    }
 };
 
 fn skipWithoutSignals() error{SkipZigTest}!void {
-    if (builtin.single_threaded or std.posix.Sigaction == void or builtin.target.os.tag == .windows) {
-        return error.SkipZigTest;
-    }
+    if (!has_signals) return error.SkipZigTest;
 }
 
 const EndRound = enum { finish, cancel };
