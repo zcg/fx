@@ -17,6 +17,7 @@ const streams = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const definitions = @import("../core/config/configured_provider.zig");
+const json_depth = @import("json_depth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -24,6 +25,10 @@ const Allocator = std.mem.Allocator;
 pub const default_max_tokens: u32 = 8192;
 /// The largest cap Anthropic documents; a larger request is refused.
 pub const max_tokens_ceiling: u32 = 64000;
+/// The largest `input` a streamed tool call may assemble, matching the other
+/// providers' tool-argument limit.
+const max_tool_input_bytes: usize = 4 * 1024 * 1024;
+
 /// Anthropic's format is versioned by date and rejects a request without it.
 pub const api_version = "2023-06-01";
 
@@ -415,6 +420,11 @@ pub const Reducer = struct {
     /// Applies one `data:` payload from the event stream.
     pub fn applyJson(self: *Reducer, alloc: Allocator, payload: []const u8) !void {
         if (self.finished) return error.StreamClosed;
+        // A payload nested past the shared limit is refused before the parser
+        // reads it: in a safe build the parser would otherwise abort rather
+        // than return, and this path had no check where the other providers
+        // have one (docs/audit/2026-11-06-full-review.md section 14.1).
+        if (json_depth.exceeds(payload)) return error.InvalidChunk;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{
             .duplicate_field_behavior = .use_last,
             .max_value_len = 8 * 1024 * 1024,
@@ -496,6 +506,12 @@ pub const Reducer = struct {
                 if (!block.input_delta_started) {
                     block.input.clearRetainingCapacity();
                     block.input_delta_started = true;
+                }
+                // A tool call's arguments are bounded like every other tool
+                // argument: a stream that never stops sending fragments is
+                // refused instead of growing without limit (section 14.3).
+                if (partial.len > max_tool_input_bytes -| block.input.items.len) {
+                    return error.InvalidChunk;
                 }
                 try block.input.appendSlice(alloc, partial);
             }
