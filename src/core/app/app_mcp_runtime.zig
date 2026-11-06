@@ -24,6 +24,10 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
+/// How long exit waits for retired MCP hosts to finish, before it keeps their
+/// notice sink rather than freeing it underneath them.
+const retired_sink_deadline_ms: u32 = 5000;
+
 const Allocator = std.mem.Allocator;
 
 /// The server a typed `/mcp ARGS` signs in to, or null if it isn't a valid
@@ -382,16 +386,23 @@ pub const State = struct {
         while (self.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
         if (self.host_verbs.load(.acquire) > 0) debug_trace.logf("mcp", "MCP commands still running at exit count={d}", .{self.host_verbs.load(.acquire)});
         self.replaceHost(null);
-        // The retired hosts' servers notify the sink until they're gone.
-        mcp_host.waitRetired();
+        // The retired hosts' servers notify the sink until they're gone, so the
+        // sink outlives them. A retired host that outlasts the deadline keeps
+        // it: freeing a sink a background thread still notifies is a use after
+        // free, and leaking one allocations block at exit is the lesser cost
+        // (docs/audit/2026-11-06-full-review.md section 16.1).
+        const retired_gone = mcp_host.waitRetiredFor(retired_sink_deadline_ms);
         if (self.host_completion_arena) |*arena| arena.deinit();
         self.host_completion_arena = null;
         self.host_completion = &.{};
         // No host is left to notify, and no `/mcp` thread to push.
-        if (self.host_sink) |sink| {
+        if (retired_gone) if (self.host_sink) |sink| {
             sink.deinit();
             std.heap.c_allocator.destroy(sink);
             self.host_sink = null;
+        };
+        if (!retired_gone) {
+            debug_trace.logf("mcp", "retired hosts outlived their deadline; keeping the notice sink", .{});
         }
     }
 

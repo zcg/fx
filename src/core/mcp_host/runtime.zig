@@ -68,7 +68,20 @@ fn retireEnded() void {
 
 /// Waits until every retired runtime's servers are gone.
 pub fn waitRetired() void {
-    while (retiring.load(.acquire) != 0) io_mod.sleep(5 * std.time.ns_per_ms);
+    _ = waitRetiredFor(std.math.maxInt(u32));
+}
+
+/// Waits up to `timeout_ms` for every retired runtime's servers to go. Returns
+/// whether they all did. A caller that must free something those servers still
+/// notify uses the answer to keep it alive instead of freeing it underneath
+/// them (docs/audit/2026-11-06-full-review.md section 16.1).
+pub fn waitRetiredFor(timeout_ms: u32) bool {
+    const deadline = io_mod.milliTimestamp() + @as(i64, timeout_ms);
+    while (retiring.load(.acquire) != 0) {
+        if (io_mod.milliTimestamp() >= deadline) return false;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    }
+    return true;
 }
 
 pub const State = enum {

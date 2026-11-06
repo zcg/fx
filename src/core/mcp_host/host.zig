@@ -20,6 +20,7 @@ pub const Notice = runtime_mod.Notice;
 pub const Status = runtime_mod.Status;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
 pub const waitRetired = runtime_mod.waitRetired;
+pub const waitRetiredFor = runtime_mod.waitRetiredFor;
 pub const menu = @import("menu.zig");
 
 pub const Extras = struct {
