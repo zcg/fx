@@ -405,18 +405,26 @@ pub const RequestRecovery = struct {
 
     fn tickerMain(self: *RequestRecovery) void {
         const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        while (!self.ticker_stop) {
-            self.ticker_wake.waitTimeout(io, &self.mutex, .{ .duration = .{
-                .raw = .fromNanoseconds(ticker_interval_ns),
-                .clock = .awake,
-            } }) catch |err| switch (err) {
-                error.Timeout => {},
-                error.Canceled => return,
-            };
-            if (self.ticker_stop) return;
-            _ = self.stepLocked(.tick) catch |err| {
+        // The lock covers the recovery state machine only. Putting a status on
+        // the transcript or saving the record is the host's work, and a host
+        // that blocks would hold `endSend` behind the ticker
+        // (docs/audit/2026-11-06-full-review.md section 16.3).
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            const stop = self.ticker_stop;
+            if (!stop) {
+                self.ticker_wake.waitTimeout(io, &self.mutex, .{ .duration = .{
+                    .raw = .fromNanoseconds(ticker_interval_ns),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {},
+                };
+            }
+            const stopping = self.ticker_stop;
+            self.mutex.unlock(io);
+            if (stop or stopping) return;
+            _ = self.step(.tick) catch |err| {
                 debug_trace.logf("recovery", "status tick publication failed err={s}", .{@errorName(err)});
             };
         }
@@ -427,6 +435,12 @@ pub const RequestRecovery = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.stepLocked(value);
+    }
+
+    /// Applies one event on its own, taking the lock itself, as a thread that
+    /// does not already hold it does.
+    fn step(self: *RequestRecovery, value: recovery.Event) !?Send {
+        return self.event(value);
     }
 
     /// Steps the module and carries out its plan in field order. Returns
