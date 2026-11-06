@@ -186,6 +186,11 @@ const RawEnviron = io_mod.RawEnviron;
 
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
+/// How long an idle loop waits on targets that report a resize only by
+/// polling, as Windows does: no SIGWINCH means each pass has to ask, and a
+/// resize is a human action that 150ms of latency does not hurt. A pass that
+/// has work to do keeps `active_poll_timeout_ms`.
+const idle_resize_poll_timeout_ms: i32 = 150;
 /// How long the loop waits while a worker it is watching may have something
 /// for it. It used to be 1ms, which made the loop run a thousand times a
 /// second and collect every fact on each pass; work that lands between waits
@@ -1269,7 +1274,7 @@ const App = struct {
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
-            return nativeLoopPollTimeoutMs(
+            const resolved = nativeLoopPollTimeoutMs(
                 default_timeout_ms,
                 self.shell.render_requests.hasReason(.first_frame),
                 self.auth.sourceInventoryRefreshActive(),
@@ -1278,6 +1283,13 @@ const App = struct {
                 InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
                 self.takeDrainContinuationDue(),
             );
+            // A target that reports a resize only by polling takes every pass
+            // for one, so an idle loop asks less often there. Anything with
+            // work to do already resolved to a short wait and keeps it.
+            if (comptime !shell_runtime.supports_resize_signal) {
+                if (resolved >= active_poll_timeout_ms) return @max(resolved, idle_resize_poll_timeout_ms);
+            }
+            return resolved;
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
     }
