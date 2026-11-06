@@ -1406,10 +1406,10 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [x] **16. 路径工具 active scope 纳入准入**
   位置：`src/core/permissions/`、`src/core/workspace/`
   验证：`--no-additional-dirs` / 符号链接回归
-- [ ] **17. `node.js` fetch 清理修 drain 死分支 + `fetchState` 改 Map**
+- [x] **17. `node.js` fetch 清理修 drain 死分支 + `fetchState` 改 Map**
   位置：`sdk/node.js:405-456,520-543`
   验证：并发 fetch + 取消不泄漏
-- [ ] **18. WASM HTTP 流统一 `closeStream`**
+- [x] **18. WASM HTTP 流统一 `closeStream`**
   位置：`sdk/wasm-runtime.js:310-338,929-932`
   验证：多轮流后 `streams` 不增长
 
