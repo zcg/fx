@@ -1445,7 +1445,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 
 ### 18.4 第四批：体验与契约（P2/P3）
 
-- [ ] **28. 统一 CLI `UsageProblem` snapshot**；`--help` 不再绕过校验
+- [x] **28. 统一 CLI `UsageProblem` snapshot**；`--help` 不再绕过校验
   位置：`src/core/cli/`、`output_contracts.zig`
   验证：`cli.test.ts` 负例矩阵
 - [x] **29. 正常退出补 `\x1b[?7h`**
