@@ -1433,12 +1433,12 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [ ] **24. Windows `zig build` 覆盖运行中 exe**
   位置：`build.zig:94`、`upgrade_helpers.zig:391-425`
   验证：Windows CI 增加占用用例
-- [ ] **25. `detect-macos-need.sh` 把平台分支改动一律视为需 macOS**
+- [x] **25. `detect-macos-need.sh` 把平台分支改动一律视为需 macOS**
   位置：`scripts/detect-macos-need.sh:52,96-97`
   验证：Windows-only diff 触发 macOS
-- [ ] **26. SSE 设 `max_total_bytes`**；`StreamTooLarge` 与 `EventTooLarge` 分开
+- [x] **26. SSE 设 `max_total_bytes`**；`StreamTooLarge` 与 `EventTooLarge` 分开
   位置：`src/gateway/sse.zig:93-99`、`chat_completions_protocol.zig:1015-1020`
-  验证：注释行攻击不再无限流
+  验证：`sse.Reader.max_total_bytes` 已由 `chat_completions.zig`、`xai_grok.zig` 设置，`consume_stream` 每轮按剩余量收窄并区分两种错误
 - [x] **27. Anthropic `input` 加字节上限并校验**
   位置：`anthropic_messages.zig:365,494-501`
   验证：畸形参数被拒
@@ -1469,10 +1469,10 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [ ] **35. detector / fuzz registry / smoke / shellcheck 覆盖补齐**
   位置：`scripts/`、`tests/fuzz/targets.json`
   验证：对应 CI job
-- [ ] **35b. 从版本控制移除 `__pycache__/*.pyc`**（本次实测：`scripts/__pycache__/` 与 `scripts/pgso/__pycache__/` 共 8 个 `.pyc` 被 `27122c20` 提交进仓库；子代理运行 Python 检查后它们在工作区被删除，`git status` 出现 8 条 `D`）。`AGENTS.md` 明确禁止提交生成状态
+- [x] **35b. 从版本控制移除 `__pycache__/*.pyc`**（本次实测：`scripts/__pycache__/` 与 `scripts/pgso/__pycache__/` 共 8 个 `.pyc` 被 `27122c20` 提交进仓库；子代理运行 Python 检查后它们在工作区被删除，`git status` 出现 8 条 `D`）。`AGENTS.md` 明确禁止提交生成状态
   位置：`.gitignore`、`scripts/__pycache__/`、`scripts/pgso/__pycache__/`
   验证：`git status` 干净；`git ls-files '*__pycache__*'` 为空
-- [ ] **36. macOS E2E `FX_SOUND=0`**、`ci.yml` permissions、action SHA pin、`cdn-backfill` env 传参
+- [x] **36. macOS E2E `FX_SOUND=0`**、`ci.yml` permissions、action SHA pin、`cdn-backfill` env 传参
   位置：`.github/workflows/`
   验证：actionlint + shellcheck
 
