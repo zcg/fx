@@ -78,7 +78,7 @@ const shell_base_description =
 /// write POSIX syntax for PowerShell or a Windows path for Bash, and either
 /// fails in a way that reads like a broken tool.
 const shell_windows_description =
-    " On Windows this runs PowerShell 7 (pwsh) by default. Pass shell={\"kind\":\"bash\"} for Git Bash. Choose by the command, not by habit: Bash for POSIX text tools (sed, awk, grep, find, xargs, make), pipelines of them, and Unix-style build scripts; pwsh for Windows-native work (services, registry, .NET, cmdlets), Windows paths with backslashes, and anything whose output you will read as data. Prefer whichever runs it in one short command, because each call starts a new shell and a translation between the two costs more than picking the right one. Paths differ: Bash takes /c/Users/example/project, pwsh takes C:\\Users\\example\\project. If a retry reports the other shell is not installed, stay in the one that worked: only an installed shell can be chosen. If Bash lacks a tool, retry in pwsh.";
+    " On Windows this runs PowerShell 7 (pwsh) by default. To run a command in Bash, pass shell={\"kind\":\"executable\",\"path\":\"bash\"} (or \"pwsh\"). Choose by the command, not by habit: Bash for POSIX text tools (sed, awk, grep, find, xargs, make), pipelines of them, and Unix-style build scripts; pwsh for Windows-native work (services, registry, .NET, cmdlets), Windows paths with backslashes, and anything whose output you will read as data. Prefer whichever runs it in one short command, because each call starts a new shell and a translation between the two costs more than picking the right one. Paths differ: Bash takes /c/Users/example/project, pwsh takes C:\\Users\\example\\project. If a retry reports the other shell is not installed, stay in the one that worked: only an installed shell can be chosen. If Bash lacks a tool, retry in pwsh.";
 
 fn baseDescription(comptime with_windows: bool) []const u8 {
     return shell_base_description ++ if (with_windows) shell_windows_description else "";
@@ -115,7 +115,7 @@ const shell_properties = [_]model_tool_schema.Property{
     .{ .name = "command", .json_type = .string, .description = "For run." },
     .{ .name = "cwd", .json_type = .string, .description = "For run. Defaults to the workspace." },
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "For run: clean skips the user's startup files." },
-    .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "For run with tty=true: use this shell instead of the default." },
+    .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "For run with tty=true: use this shell instead of the default. Its shape is {\"kind\":\"executable\",\"path\":<name or absolute path>}." },
     .{ .name = "tty", .json_type = .boolean, .description = "For run: give the command a terminal, for interactive programs." },
     .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 30000 (the default), interact up to 300000 (default 5000)." },
     .{ .name = "timeout_ms", .json_type = .integer, .description = "For run: kill the command after this long. Only when asked for a deadline." },
