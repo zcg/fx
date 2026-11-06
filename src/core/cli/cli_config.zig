@@ -200,7 +200,8 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
                 return invalid(problem, "a whole number of steps; 0 means no limit");
             patch.max_agent_steps = steps;
             return .{ .patch = patch, .value = .{ .integer = steps } };
-        },        .subagent_max_children => {
+        },
+        .subagent_max_children => {
             const children = std.fmt.parseUnsigned(u32, raw, 10) catch
                 return invalid(problem, "a whole number of subagents, 1 to 16");
             if (children < agent_steps.min_subagent_max_children or children > agent_steps.max_subagent_max_children) {
@@ -456,7 +457,7 @@ pub const resolved_keys = [_][]const u8{
     "review_model",             "session_titles",         "slash_menu_categories",
     "sound.attention_required", "sound.max",              "sound.turn_end",
     "startup_scrollback",       "status_line.context",    "status_line.session",
-    "status_line.workspace",    "subagent_max_children",   "theme",
+    "status_line.workspace",    "subagent_max_children",  "theme",
     "ultrafast_mode",           "update_channel",
 };
 

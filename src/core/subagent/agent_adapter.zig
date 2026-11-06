@@ -428,8 +428,7 @@ pub fn childSystemPrompt(
 /// plans within it instead of being refused.
 pub fn mainSubagentGuidance(alloc: Allocator, scope: Scope) Allocator.Error![]const u8 {
     if (scope.role != null) return "";
-    if (scope.max_children == 0) return
-        "You cannot start subagents in this session. Do the work yourself with your own tools.";
+    if (scope.max_children == 0) return "You cannot start subagents in this session. Do the work yourself with your own tools.";
     return alloc.print(
         "You are the only agent that starts subagents, and you may run at most {d} of them at once " ++
             "(subagent_max_children); a call past that is refused, so plan for {d} or fewer. " ++

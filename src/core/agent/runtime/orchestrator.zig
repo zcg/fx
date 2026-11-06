@@ -9261,8 +9261,8 @@ fn processQueuedPromptLoop(
                 // One nudge per stall, and never past the step limit
                 // (`tests/tla/agent_runtime/EmptyReply.tla` NoDoubleNudge, StepsBounded).
                 const nudge = !empty_reply_nudged and
-                recovery_steps < max_recovery_steps and
-                agent_steps.allowsStep(config.agent_step_limit, step + 1);
+                    recovery_steps < max_recovery_steps and
+                    agent_steps.allowsStep(config.agent_step_limit, step + 1);
                 debug_trace.eventf("agent", if (nudge) "empty_reply_nudge" else "empty_reply_failed", step_ctx, "provider_finish_reason={s} after_nudge={s}", .{
                     provider_reason,
                     if (empty_reply_nudged) "true" else "false",

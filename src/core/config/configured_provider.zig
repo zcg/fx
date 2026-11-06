@@ -171,7 +171,6 @@ pub const Definition = struct {
     }
 };
 
-
 pub const Registry = struct {
     definitions: []const Definition = &.{},
 
