@@ -1418,16 +1418,16 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [ ] **19. terminal backend 延迟回收**（不再「留到进程退出」）
   位置：`src/core/terminal/client.zig:466-479`
   验证：关闭终端后 WS 回落
-- [ ] **20. 终端启动失败路径 `kill` 后 `wait`**
+- [x] **20. 终端启动失败路径 `kill` 后 `wait`**
   位置：`src/core/terminal/native_session.zig:441-457,1728-1830`
   验证：失败路径不留 zombie
-- [ ] **21. ticker 持锁不做 I/O**
+- [x] **21. ticker 持锁不做 I/O**
   位置：`src/core/agent/runtime/request_recovery.zig:406-423`
   验证：宿主阻塞时 `endSend` 不被拖住
-- [ ] **22. `shell_snapshot` join 前释放锁**
+- [x] **22. `shell_snapshot` join 前释放锁**
   位置：`src/core/terminal/shell_snapshot.zig:536-541`
   验证：连续采集不死锁
-- [ ] **23. MCP runtime 等待加截止时间**
+- [x] **23. MCP runtime 等待加截止时间**
   位置：`src/core/mcp_host/runtime.zig:513-521`
   验证：卡住时 deinit 能完成
 - [ ] **24. Windows `zig build` 覆盖运行中 exe**
@@ -1439,7 +1439,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [ ] **26. SSE 设 `max_total_bytes`**；`StreamTooLarge` 与 `EventTooLarge` 分开
   位置：`src/gateway/sse.zig:93-99`、`chat_completions_protocol.zig:1015-1020`
   验证：注释行攻击不再无限流
-- [ ] **27. Anthropic `input` 加字节上限并校验**
+- [x] **27. Anthropic `input` 加字节上限并校验**
   位置：`anthropic_messages.zig:365,494-501`
   验证：畸形参数被拒
 
@@ -1448,7 +1448,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [ ] **28. 统一 CLI `UsageProblem` snapshot**；`--help` 不再绕过校验
   位置：`src/core/cli/`、`output_contracts.zig`
   验证：`cli.test.ts` 负例矩阵
-- [ ] **29. 正常退出补 `\x1b[?7h`**
+- [x] **29. 正常退出补 `\x1b[?7h`**
   位置：`src/core/app/app_lifecycle.zig:48`
   验证：退出后长行不串行
 - [ ] **30. 审批屏紧凑布局保留文件名与按键提示**
@@ -1457,7 +1457,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 - [ ] **31. 审批屏 layout 缓存**，避免每帧重建
   位置：`src/ui/approval_screen.zig:317-322`
   验证：5 万行滚动不卡
-- [ ] **32. Windows resize 轮询降到 100–200ms**
+- [x] **32. Windows resize 轮询降到 100–200ms**
   位置：`src/ui/resize_runtime.zig:28-45,271-284`、`main.zig:187-188`
   验证：空闲 CPU 下降
 - [ ] **33. `catalog_menu` 接线或删除**
