@@ -333,15 +333,40 @@ function createRuntime(options) {
       state.reader = response.body?.getReader() || null;
     }).catch((error) => {
       state.responseError = error;
+      // A failed request leaves nothing to read, so its handle is released
+      // here. Without this a failed stream stayed in the map until the whole
+      // runtime was torn down (docs/audit/2026-11-06-full-review.md 15.1).
+      state.reader = null;
     });
     return handle;
+  }
+
+  /// Drops one stream and releases the response body it holds. Every exit that
+  /// ends a stream goes through here, so `streams` cannot outgrow the requests
+  /// that are actually live.
+  function closeStream(handle) {
+    const state = streams.get(handle);
+    if (!state) return false;
+    streams.delete(handle);
+    try { state.controller.abort(abortReason); } catch {}
+    const reader = state.reader;
+    state.reader = null;
+    if (reader) {
+      try { void reader.cancel().catch(() => {}); } catch {}
+      try { reader.releaseLock(); } catch {}
+    }
+    return true;
   }
 
   function streamStatus(handle, statusOut) {
     const state = streams.get(handle);
     if (!state) return -1;
     const settled = () => {
-      if (state.responseError) return state.responseError?.name === "AbortError" ? -2 : -1;
+      if (state.responseError) {
+        // The request ended in an error: report it and release the handle.
+        void closeStream(handle);
+        return state.responseError?.name === "AbortError" ? -2 : -1;
+      }
       if (!state.response) return 0;
       new DataView(memory().buffer).setUint16(statusOut, state.response.status, true);
       return 1;
@@ -374,7 +399,12 @@ function createRuntime(options) {
       if (!state.readResult) return null;
       const { done, value } = state.readResult;
       state.readResult = null;
-      if (done) return 0;
+      if (done) {
+        // The body ended: nothing will read it again, so release the handle
+        // and the reader it owns.
+        void closeStream(handle);
+        return 0;
+      }
       if (!value?.length) return null;
       options.onTransportChunk?.(value.length);
       return copy(value);
@@ -389,6 +419,7 @@ function createRuntime(options) {
       }).catch((error) => {
         state.readError = error;
         state.pendingRead = null;
+        void closeStream(handle);
       });
     }
     return raceWithTimeout(state.pendingRead.then(() => true), 50, false).then((ready) => {
@@ -929,7 +960,7 @@ function createRuntime(options) {
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
-    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
+    fx_http_stream_close(handle) { closeStream(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_journal_flush: new WebAssembly.Suspending(journalFlush),
