@@ -75,9 +75,19 @@ pub fn enableRaw(saved: Saved, input_fd: std.posix.fd_t, output_fd: std.posix.fd
 
         // The screen writes ANSI escape sequences, so the console has to be told
         // to interpret them. Without this flag a console prints them as text.
-        const output_mode = windowsGetMode(output_fd) orelse return error.NotATerminal;
+        // From here on the input handle is already raw, so a failure has to put
+        // it back: a caller that sees an error does not restore, because it never
+        // recorded that the mode changed, and the terminal would stay raw with
+        // echo off for the rest of the process.
+        const output_mode = windowsGetMode(output_fd) orelse {
+            restore(saved, input_fd, output_fd);
+            return error.NotATerminal;
+        };
         const wanted_output = output_mode | windows_enable_processed_output | windows_enable_virtual_terminal_processing;
-        if (!setMode(output_fd, wanted_output)) return error.Unexpected;
+        if (!setMode(output_fd, wanted_output)) {
+            restore(saved, input_fd, output_fd);
+            return error.Unexpected;
+        }
 
         // The console has been asked for virtual terminal processing, which is
         // what makes it interpret the escape sequences fx writes. A host that
@@ -87,7 +97,10 @@ pub fn enableRaw(saved: Saved, input_fd: std.posix.fd_t, output_fd: std.posix.fd
         // fx writes UTF-8. A console whose output code page is not UTF-8
         // transcribes those bytes through a legacy table, which turns the screen
         // into mojibake for anything outside ASCII.
-        if (!setOutputCodePage(windows_utf8_code_page)) return error.Unexpected;
+        if (!setOutputCodePage(windows_utf8_code_page)) {
+            restore(saved, input_fd, output_fd);
+            return error.Unexpected;
+        }
         return;
     }
     if (comptime is_wasi) return;

@@ -137,11 +137,30 @@ fn openReparsePointInside(dir: std.Io.Dir, name: []const u8) !std.Io.Dir {
 }
 
 /// Whether `child` lies beneath `parent`, comparing whole path components.
+///
+/// Windows compares paths without regard to letter case, so a comparison that
+/// respected it would reject `C:\Users\Ann` against `c:\users\ann`, the same
+/// directory written two ways. A separator counts as a boundary on either
+/// platform, because a path can arrive with either one.
 fn pathIsInside(parent: []const u8, child: []const u8) bool {
-    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len < parent.len) return false;
+    if (comptime builtin.target.os.tag == .windows) {
+        for (parent, child[0..parent.len]) |a, b| {
+            if (isPathSeparator(a) and isPathSeparator(b)) continue;
+            if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+        }
+    } else {
+        if (!std.mem.startsWith(u8, child, parent)) return false;
+    }
     if (child.len == parent.len) return true;
-    const boundary = child[parent.len];
-    return boundary == std.Io.Dir.path.sep or boundary == '/' or boundary == '\\';
+    // A parent that already ends at a separator ("C:\\") has no boundary byte
+    // of its own to check; everything after it is beneath it.
+    if (parent.len == 0 or isPathSeparator(parent[parent.len - 1])) return true;
+    return isPathSeparator(child[parent.len]);
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == std.Io.Dir.path.sep or byte == '/' or byte == '\\';
 }
 
 test "Darwin process I/O replaces only processSpawn with stable storage" {
