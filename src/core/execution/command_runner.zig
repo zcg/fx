@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const windows_job = @import("../shared/windows_job.zig");
 const readiness = @import("../shared/readiness.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
@@ -3177,6 +3178,10 @@ const ProcessObserver = struct {
     /// so a later `wait` asserts. Recording it keeps the reader from calling
     /// `wait` a second time and takes the process down with it.
     reaped_by_kill: bool = false,
+    /// The job the child was placed in, on a platform with job objects. Ending
+    /// the job ends every process the command started, which is what a POSIX
+    /// process group does and what Windows otherwise has no way to express.
+    job: windows_job.Job = windows_job.none,
 
     fn init(child: *std.process.Child) !ProcessObserver {
         const process_id = child.id orelse return error.SpawnFailed;
@@ -3188,16 +3193,21 @@ const ProcessObserver = struct {
             child.stdout = null;
             child.stderr = null;
         }
+        // Assigned before the command can start any child of its own, so
+        // anything it spawns is already inside the job.
+        const job = if (comptime windows_job.supported) windows_job.assign(process_id) else windows_job.none;
         return .{
             .waiter = ChildWaiter.init(child),
             .process_id = process_id,
             .stdout = stdout,
             .stderr = stderr,
             .detached_pipes = detached_pipes,
+            .job = job,
         };
     }
 
     fn deinit(self: *ProcessObserver) void {
+        self.job.deinit();
         if (self.detached_pipes) {
             self.stdout.close(self.waiter.io);
             self.stderr.close(self.waiter.io);
@@ -3293,6 +3303,13 @@ const ProcessObserver = struct {
         intent: TerminationIntent,
     ) !void {
         if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+            // The job ends every process the command started, which is the
+            // part a bare `kill` of the child cannot reach: a command that runs
+            // a server leaves it running, holding its port and its memory.
+            if (windows_job.isActive(self.job)) {
+                self.job.terminate();
+                self.job = windows_job.none;
+            }
             if (self.waiter.child.id != null) {
                 self.waiter.child.kill(self.waiter.io);
                 self.reaped_by_kill = true;
@@ -3384,7 +3401,7 @@ fn collectOutput(
                 }
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
-                        terminateRemainingProcessGroup(pid);
+                        terminateRemainingProcessGroup(observer, pid);
                         debug_trace.logf(
                             "core",
                             "captured command leader completed; remaining process group terminated",
@@ -3688,7 +3705,7 @@ fn waitForCollectedProcess(
     }
     const status = try observer.awaitTermination(source);
     if (process_group_id) |pid| {
-        terminateRemainingProcessGroup(pid);
+        terminateRemainingProcessGroup(observer, pid);
     }
     return status;
 }
@@ -3905,12 +3922,19 @@ fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
     return signalProcess(-pid, signal);
 }
 
-fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
+fn terminateRemainingProcessGroup(observer: ?*ProcessObserver, pid: std.posix.pid_t) void {
     if (comptime builtin.target.os.tag == .windows) {
-        // Windows has no process groups to signal, so only the process itself is
-        // ended. fx assigns no job object to a captured command, so children that
-        // command started keep running; ending that tree needs a job object at
-        // spawn time, which is not implemented yet.
+        // A Windows command is placed in a job at spawn, and ending the job ends
+        // every process it started. That is the process-group equivalent: without
+        // it a command that runs a server leaves the server behind, holding a
+        // port and its memory for the rest of the session.
+        if (observer) |watched| {
+            if (windows_job.isActive(watched.job)) {
+                watched.job.terminate();
+                watched.job = windows_job.none;
+                return;
+            }
+        }
         if (io_mod.pidIsValid(pid)) {
             io_mod.killProcess(pid) catch |err| debug_trace.logf(
                 "core",
