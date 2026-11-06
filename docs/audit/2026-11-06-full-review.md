@@ -1488,13 +1488,15 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
 
 ### 18.6 用户追加的缺陷（2026-11-06 使用中反馈）
 
+> **复核补充（2026-11-07）**：逐项复核时发现第 37 项的真正根因不在能力解析，而在配置绑定：顶层 `"model"` 永远被记到 Gateway 名下，导致选了自定义 provider 的 profile 出现 `ConfiguredModelNotSelected`、整体回落 Gateway，于是用户看到的一直是 Gateway 的模型。已修（`config_runtime.zig` 的 `bare_model` 先暂存、读完 `provider` 再归属）。修复后实测：`provider=lp`、`model=thinker`、`efforts=[low,medium,high]`，层级确实来自 provider 的 `/v1/models` 响应。
+
 - [x] **37. Provider 刷新出来的模型，思考层级只有 Default、无法选择**
   位置：`src/core/config/model_capabilities.zig`（能力解析）、`src/core/gateway/model_catalog.zig` 与 `src/core/mcp/model_catalog.zig`（模型目录）、`src/core/config/configured_provider.zig`（自定义 provider）、思考层级在 UI 与 `/model` 选择器中的渲染。
   现象：通过 provider 的模型刷新接口拿到的模型，在设置里思考程度（effort / thinking）只有 Default，改不了也换不了。
   期望：思考层级应当跟随模型一起从 provider 获取，并且按 provider、按模型各不相同——不同 provider、不同模型的层级名称和档位都不一样，不能统一成一套硬编码枚举。
   参考实现：`D:\Projects\pi-rust`。它同样在拉取模型时一并取用对应的 thinking 层级，并用 thinking 命令配置层级，可以直接对照抄它的数据来源与命令接线。
   验收：给一个声明了多档思考层级的 provider 与模型，设置里能列出它自己那几档并选中生效；换一个 provider 不会串档；没声明的模型仍回落 Default。
-  落地：`configured_provider.ModelMetadata` 新增 `reasoning_efforts` 与 `supports_reasoning`，`parse_metadata` 解析并按 provider 自己的顺序保留；`chat_completions.lookup_capabilities` 把它们送进 `Capabilities.reasoning_efforts`。
+  落地：**层级来自刷新接口本身，不是手写设定**。`gateway/model_listing.zig` 的刷新解析新增 `reasoning_efforts`，同时接受 `"reasoning_efforts":[...]` 与 AI Gateway 的 `"reasoning_options":[{"type":"effort","values":[...]}]` 两种形状，provider 自报的层级覆盖 profile 猜测；`configured_provider.ModelMetadata` 也能声明层级作为兜底。`chat_completions.lookup_capabilities` 把它们送进 `Capabilities.reasoning_efforts`。`main.zig` 补导入 `gateway/model_listing.zig`，否则它的测试从未跑过。
 
 ## 19. 修复前必须要做的三件事
 
