@@ -149,12 +149,25 @@ pub fn fetch(alloc: Allocator, initial: url_policy.ValidatedUrl, options: FetchO
         defer alloc.free(addresses);
 
         if (addresses.len == 0) return error.NoAddressReturned;
+        // A local proxy in fake-ip mode answers with 198.18.0.0/15 and routes the
+        // request itself, so that answer is a public route. A literal URL naming
+        // the same block is still refused by `normalize`, where the user is
+        // aiming fx at a specific host.
+        //
+        // The fake-ip range is only accepted when nothing else came back. A
+        // resolver that returns a public address for the same name is answering
+        // for the real host, and preferring its answer keeps a name that also
+        // resolves into that reserved range from being dialed there instead.
+        var has_public = false;
         for (addresses) |address| {
-            // A local proxy in fake-ip mode answers with 198.18.0.0/15 and
-            // routes the request itself, so that answer is a public route. A
-            // literal URL naming the same block is still refused by
-            // `normalize`, where the user is aiming fx at a specific host.
-            if (!url_policy.isPublicAddress(address) and !url_policy.isFakeIpAnswer(address)) return error.NonPublicDnsAnswer;
+            if (url_policy.isPublicAddress(address)) has_public = true;
+        }
+        for (addresses) |address| {
+            const allowed = if (has_public)
+                url_policy.isPublicAddress(address)
+            else
+                url_policy.isPublicAddress(address) or url_policy.isFakeIpAnswer(address);
+            if (!allowed) return error.NonPublicDnsAnswer;
         }
 
         const host_header = try hostHeader(alloc, current);

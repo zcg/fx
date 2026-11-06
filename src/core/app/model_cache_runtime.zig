@@ -596,6 +596,11 @@ pub const Runtime = struct {
         access: credentials.CatalogAccess,
     ) void {
         self.from_profile_settings = provider.provider_id == .configured;
+        // The cooperative path loads in place rather than through the worker, so
+        // it has to name its connection here: the rows a menu builds from this
+        // catalog carry the name, and without it a cooperative host's models all
+        // claim to come from the Gateway.
+        self.setProviderName(provider.provider_id.label());
         if (!self.beginLoad(access, provider.refresh_interval_ms, .activity)) return;
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
