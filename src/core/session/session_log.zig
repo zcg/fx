@@ -327,7 +327,10 @@ fn load_conversation_state_at_boundary(
     if (recovery_checkpoint) |*checkpoint| {
         var capability: ?session_child_store.SessionChildCapability = null;
         defer if (capability) |*value| value.deinit();
-        try restoreExecutionResultBodies(alloc, dir, &capability, &checkpoint.execution);
+        // A recovery checkpoint is one turn, and the request that continues it
+        // needs its output whole, so there is no budget to hold back.
+        var checkpoint_budget: usize = std.math.maxInt(usize);
+        try restoreExecutionResultBodiesWithin(alloc, dir, &capability, &checkpoint.execution, &checkpoint_budget);
         if (checkpoint.user.work_id == null) {
             checkpoint.user.work_id = open_work_id;
             open_work_id = null;
@@ -1824,28 +1827,64 @@ fn latestConversationCheckpointIndex(history: []const session.HistoryTurn) usize
     return index;
 }
 
+/// How much restored tool output a resumed session keeps in memory before the
+/// older turns fall back to their preview.
+///
+/// A stored result has two forms on disk: the whole output, and a short preview
+/// of its beginning. The whole output is what a model request needs, so a resume
+/// reads it back — but a long session holds hundreds of results, and a run that
+/// read large files can reach tens of megabytes that way. Restoring from the
+/// newest turn backwards, and keeping only the preview once the budget is spent,
+/// bounds a resume at this size while leaving the recent turns a model is
+/// actually reasoning about intact.
+///
+/// The rest is not lost: every result keeps its handle, so `read_tool_result`
+/// still reaches the full output when a model asks for it.
+const restore_output_budget_bytes: usize = 8 * 1024 * 1024;
+
 fn restoreContextResultBodies(alloc: Allocator, dir: *io_mod.VerifiedDir, history: []session.HistoryTurn) !void {
     var capability: ?session_child_store.SessionChildCapability = null;
     defer if (capability) |*value| value.deinit();
-    for (history) |*turn| {
-        const execution = switch (turn.*) {
+    var remaining = restore_output_budget_bytes;
+    // Newest first: the turns a model is working with are the ones nearest its
+    // next request, so they are the ones worth spending the budget on.
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        const execution = switch (history[index]) {
             .assistant => |*entry| &entry.execution,
             .interrupted => |*entry| &entry.execution,
             .compacted_summary => continue,
         };
-        try restoreExecutionResultBodies(alloc, dir, &capability, execution);
+        try restoreExecutionResultBodiesWithin(alloc, dir, &capability, execution, &remaining);
     }
 }
 
-fn restoreExecutionResultBodies(
+/// Restores whole tool output for one turn while the budget lasts, and leaves
+/// the rest holding only their preview.
+fn restoreExecutionResultBodiesWithin(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     capability: *?session_child_store.SessionChildCapability,
     execution: *types.ExecutionMemory,
+    remaining: *usize,
 ) !void {
+    // Per-turn reservation is charged per result, so a turn with many results
+    // cannot spend the whole budget on its own.
     for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
         const handle = result.output_handle orelse continue;
         if (!result.truncated and result.output.len == result.stored_output_bytes) continue;
+        // Over budget: keep the preview already in memory and leave the handle
+        // pointing at the whole output for `read_tool_result`.
+        if (result.stored_output_bytes > remaining.*) {
+            if (result.preview) |preview| {
+                const bounded = try alloc.dupe(u8, preview);
+                alloc.free(result.output);
+                result.output = bounded;
+            }
+            continue;
+        }
+        remaining.* -= @min(result.stored_output_bytes, remaining.*);
         const body = if (result.truncated)
             try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes)
         else blk: {
