@@ -91,7 +91,18 @@ pub fn build(b: *std.Build) void {
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
     session_manager.sanitize_thread = sanitize_thread;
 
-    b.installArtifact(exe);
+    // On Windows a running `fx.exe` cannot be replaced. The name this build
+    // always writes is `fx-dev.exe`, which a running `fx.exe` never holds, so
+    // the develop-run-rebuild loop keeps working
+    // (docs/audit/2026-11-06-full-review.md section 5.2). `fx.exe` is refreshed
+    // only as a convenience for a fresh checkout; a build while fx is open
+    // keeps the running copy and still succeeds.
+    if (target.result.os.tag == .windows) {
+        exe.name = "fx-dev";
+        b.installArtifact(exe);
+    } else {
+        b.installArtifact(exe);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
