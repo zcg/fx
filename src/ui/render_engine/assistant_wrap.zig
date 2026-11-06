@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_checkpoint = @import("build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const assistant_pacer = @import("../assistant/pacer.zig");
 
@@ -63,6 +64,36 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
 }
 
 fn wrapAssistantTextWithBaseGutter(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    base_gutter: u16,
+    replace_wide_runes_at_one_content_col: bool,
+    literal_command: bool,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    finalized_prefix_bytes: ?*usize,
+    source_map: ?*RetentionSourceMap,
+) ![]u8 {
+    // A reply, a file's content, or a tool result can carry terminal control
+    // sequences, and this is where all of them reach the screen. Keep the SGR
+    // this text was styled with and drop every other sequence, so `\x1b[2J`
+    // in a file cannot clear the terminal (section 11.1).
+    const filtered = try text_utils.filterTerminalControl(alloc, text);
+    defer if (filtered.ptr != text.ptr) alloc.free(@constCast(filtered));
+    return wrapFilteredAssistantText(
+        alloc,
+        filtered,
+        cols,
+        base_gutter,
+        replace_wide_runes_at_one_content_col,
+        literal_command,
+        checkpoint,
+        finalized_prefix_bytes,
+        source_map,
+    );
+}
+
+fn wrapFilteredAssistantText(
     alloc: Allocator,
     text: []const u8,
     cols: u16,

@@ -21,6 +21,70 @@ pub fn isModelSafeText(text: []const u8) bool {
     return std.unicode.utf8ValidateSlice(text);
 }
 
+/// Whether `text` is safe to hand to a terminal as it stands: valid UTF-8, no
+/// NUL, and no byte that starts a control sequence. `encodeTerminalSafe`
+/// escapes those bytes rather than dropping them; this is for the one check
+/// that only needs the answer.
+pub fn isTerminalSafeText(text: []const u8) bool {
+    if (!isModelSafeText(text)) return false;
+    for (text) |byte| {
+        if (byte < 0x20 and byte != '\n' and byte != '\t') return false;
+        if (byte == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Removes every terminal control sequence `text` carries except the SGR ones
+/// fx itself writes for color and weight.
+///
+/// A model reply, a file `cat` printed, or a tool result can carry
+/// `\x1b[2J` or `\x1b[?1049h`. Passed through, those clear the screen or move
+/// fx into the alternate buffer and break every later frame, which is a
+/// rendering bug anyone can trigger with a file's content
+/// (docs/audit/2026-11-06-full-review.md section 11.1). SGR is kept because
+/// the wrapped text already carries the styling fx applied, and dropping it
+/// would lose the code highlighting the same reply depends on.
+///
+/// Returns `text` when it carries nothing to remove, so the common case does
+/// not copy. Otherwise the caller owns the result and frees it with `alloc`.
+pub fn filterTerminalControl(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.findScalar(u8, text, 0x1b) == null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, text.len);
+    var index: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte != 0x1b) {
+            out.appendAssumeCapacity(byte);
+            index += 1;
+            continue;
+        }
+        const end = display_width.ansiSequenceEnd(text, index);
+        if (end <= index + 1) {
+            // A lone escape byte with nothing after it: drop it.
+            index = @max(end, index + 1);
+            continue;
+        }
+        const sequence = text[index..end];
+        if (isSgrSequence(sequence)) out.appendSliceAssumeCapacity(sequence);
+        index = end;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Whether `sequence` is a select-graphic-rendition sequence, `\x1b[...m`.
+fn isSgrSequence(sequence: []const u8) bool {
+    if (sequence.len < 3) return false;
+    if (sequence[0] != 0x1b or sequence[1] != '[') return false;
+    const last = sequence[sequence.len - 1];
+    if (last != 'm') return false;
+    for (sequence[2 .. sequence.len - 1]) |byte| {
+        if (byte < 0x20 or byte > 0x3f) return false;
+    }
+    return true;
+}
+
 pub fn utf8BackwardBoundary(text: []const u8, index: usize) usize {
     var len = @min(index, text.len);
     while (len > 0 and len < text.len and (text[len] & 0b1100_0000) == 0b1000_0000) {
