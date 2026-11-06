@@ -21,6 +21,8 @@ test {
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/mcp_host/credentials.zig");
+    _ = @import("mcp/auth/client.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
     _ = @import("core/session/session_codec.zig");
@@ -46,6 +48,7 @@ test {
     _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/url_policy.zig");
     _ = @import("ui/resize_tests.zig");
+    _ = @import("ui/footer/mcp_host_menu_presentation.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
 }

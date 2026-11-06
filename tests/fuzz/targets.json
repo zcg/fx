@@ -1,6 +1,9 @@
 {
   "targets": [
     {"name": "acp_mcp_servers", "module": "fx", "test": "ACP MCP parser handles fuzzed request bytes", "iterations": 1500000},
+    {"name": "mcp_store_document", "module": "fx", "test": "a store document that parses always saves back readable", "iterations": 500000},
+    {"name": "mcp_credential_restore", "module": "fx", "test": "a saved credential of any shape is taken whole or not at all", "iterations": 500000},
+    {"name": "mcp_waiting_address", "module": "fx", "test": "a waiting address of any bytes stays in its rows and inside its link", "iterations": 500000},
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},

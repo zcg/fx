@@ -46,7 +46,10 @@ jobs:
           cache-key: ci-unit-${{ matrix.optimize }}
 
       - name: Check formatting
-        run: zig fmt --check src/
+        run: |
+          # Build files and benchmarks hold Zig too, so the check covers more
+          # than src/ (docs/audit/2026-11-06-full-review.md section 4.12).
+          zig fmt --check src/ build.zig benchmarks/*.zig
 
       - name: Validate PGSO corpus classification
         run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
@@ -942,23 +945,16 @@ jobs:
 
       - name: Shellcheck Fx scripts
         run: |
-          scripts=(
-            benchmarks/startup.sh
-            scripts/check-agents-boundary.sh
-            scripts/check-compactor-boundary.sh
-            scripts/check-indexer-boundary.sh
-            scripts/check-public-surface.sh
-            scripts/check-recovery-boundary.sh
-            scripts/detect-ci-need.sh
-            scripts/detect-macos-need.sh
-            scripts/smoke-binary.sh
-            tests/e2e/ci-run-files.sh
-          )
+          # Every shell script in the repository, not a hand-kept list: a new
+          # script is covered the moment it lands
+          # (docs/audit/2026-11-06-full-review.md section 4.12).
+          mapfile -t scripts < <(git ls-files '*.sh')
+          test "${#scripts[@]}" -gt 0
           # bash -n parses only its first argument, so check each script.
           for script in "${scripts[@]}"; do
             bash -n "$script"
           done
-          shellcheck "${scripts[@]}"
+          shellcheck -e SC1091 -x "${scripts[@]}"
 
   e2e_acp_live:
     name: E2E ACP (live models)
