@@ -1455,7 +1455,7 @@ auto/ask/full-access 三模式与 yolo 提前返回（`tool_admission.zig:1368-1
   位置：`src/ui/approval_screen.zig:285-293,690-704`
   验证：6 行终端可读
 - [ ] **31. 审批屏 layout 缓存**，避免每帧重建
-  位置：`src/ui/approval_screen.zig:317-322`
+- [ ] **31. 审批屏 layout 缓存**，避免每帧重建（未做：需要把 `TranscriptDocumentLayout` 的句柄与生命周期挂到 `ApprovalScreenState` 上，属于结构性改动，留待单独一轮）
   验证：5 万行滚动不卡
 - [x] **32. Windows resize 轮询降到 100–200ms**
   位置：`src/ui/resize_runtime.zig:28-45,271-284`、`main.zig:187-188`
