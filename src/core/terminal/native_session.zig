@@ -1735,7 +1735,10 @@ const Session = struct {
             .stderr = .pipe,
         });
         var child_owned = true;
-        errdefer if (child_owned) child.kill(io_mod.getIo());
+        // A launcher this fx gives up on is collected, not only signalled, so a
+        // failed start leaves no zombie behind
+        // (docs/audit/2026-11-06-full-review.md section 16.2).
+        errdefer if (child_owned) killAndReap(&child);
         closeFd(pty.slave);
         slave_open = false;
 
