@@ -142,7 +142,54 @@ fn startCloser(tmux: bool) bool {
 /// fx saves the request in flight and restores terminal state before dying.
 /// SIGINT is not included because raw mode disables terminal-generated
 /// SIGINT.
+/// Which restore sequence a console close should write, chosen once when the
+/// handlers are installed.
+var tmux_restore_on_console_close = false;
+
+/// Windows delivers a closed window, a logout, and Ctrl+C as console control
+/// events rather than as signals, so the POSIX handlers never run there.
+///
+/// A console control handler runs on a thread the system creates and has a few
+/// seconds before the process dies. It cannot allocate, take a lock, or start a
+/// thread, so it only writes the restore sequence and lets the default
+/// termination happen: `TRUE` says fx handled the event, and the process still
+/// exits with the code Windows chooses.
+const windows_console = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn SetConsoleCtrlHandler(
+        handler: *const fn (u32) callconv(.winapi) c_int,
+        add: c_int,
+    ) callconv(.winapi) c_int;
+};
+
+/// The console control handler itself only exists on Windows; elsewhere the
+/// POSIX signal handlers cover the same events.
+const windowsConsoleCtrlHandler = if (builtin.target.os.tag != .windows) struct {
+    fn handler(_: u32) callconv(.c) c_int {
+        return 0;
+    }
+}.handler else struct {
+    fn handler(_: u32) callconv(.winapi) c_int {
+        const restore = if (tmux_restore_on_console_close)
+            tmux_abnormal_exit_restore
+        else
+            abnormal_exit_restore;
+        // The console write path fx uses everywhere else, which is
+        // `WriteConsoleW` here; there is no POSIX `write` on this target.
+        io_mod.writeFd(io_mod.stdoutHandle(), restore) catch {};
+        // Ctrl+C and Ctrl+Break keep the process alive when handled, which raw
+        // mode wants: the input loop reads ETX as a keystroke. A close, a logout,
+        // or a shutdown is already ending the process, so returning TRUE after
+        // the restore is enough.
+        return 1;
+    }
+}.handler;
+
 pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
+    if (comptime builtin.target.os.tag == .windows) {
+        tmux_restore_on_console_close = tmux != null;
+        _ = windows_console.SetConsoleCtrlHandler(windowsConsoleCtrlHandler, 1);
+        return;
+    }
     if (!shell_runtime.supports_resize_signal) return;
 
     const handler: std.posix.Sigaction.handler_fn = if (startCloser(tmux != null))
@@ -167,6 +214,10 @@ pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
 }
 
 pub fn uninstallAbnormalExitHandlers() void {
+    if (comptime builtin.target.os.tag == .windows) {
+        _ = windows_console.SetConsoleCtrlHandler(windowsConsoleCtrlHandler, 0);
+        return;
+    }
     if (!shell_runtime.supports_resize_signal) return;
 
     if (old_sigterm_action) |old| {
