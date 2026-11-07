@@ -297,10 +297,7 @@ pub fn itemAt(snapshot: Snapshot, category: Category, query: []const u8, display
 
 pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
     return switch (id) {
-        .effort => if (snapshot.reasoning_efforts.len > 0 or !std.ascii.eqlIgnoreCase(snapshot.effort, "default"))
-            snapshot.reasoning_efforts.len + 1
-        else
-            0,
+        .effort => model_capabilities.reasoningEffortOptionCount(.{ .reasoning_efforts = snapshot.reasoning_efforts }),
         .fast_mode => if (snapshot.supports_fast_mode or snapshot.fast_mode) on_off_options.len else 0,
         .ultrafast_mode => if (snapshot.supports_ultrafast_mode or snapshot.ultrafast_mode) on_off_options.len else 0,
         else => staticOptionsFor(id).len,
@@ -311,7 +308,8 @@ pub fn optionAt(snapshot: *const Snapshot, id: SettingId, index: usize) ?[]const
     if (id == .effort) {
         if (index >= optionCount(snapshot, id)) return null;
         if (index == 0) return "default";
-        return snapshot.reasoning_efforts.values[index - 1].displayLabel();
+        const levels = model_capabilities.effectiveReasoningEfforts(.{ .reasoning_efforts = snapshot.reasoning_efforts });
+        return levels.values[index - 1].displayLabel();
     }
     if (index >= optionCount(snapshot, id)) return null;
     const options = staticOptionsFor(id);

@@ -1036,16 +1036,6 @@ pub fn Commands(comptime App: type) type {
         pub fn handleEffort(app: *App, agent: *AppAgent, rest: []const u8) !EffortRequest {
             const model = provider_runtime.modelOf(app, agent);
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len == 0) {
-                const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
-                const message = if (loading)
-                    try app.alloc.print("levels for {s} are still loading; try /effort again in a moment", .{model})
-                else
-                    try app.alloc.print("{s} has no levels to choose from", .{model});
-                defer app.alloc.free(message);
-                try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
-                return .done;
-            }
             const level = std.mem.trim(u8, rest, " \t\r\n");
             if (level.len == 0) return .{ .open_menu = capabilities };
             const parsed = types.ReasoningEffort.parse(level);
@@ -1058,7 +1048,7 @@ pub fn Commands(comptime App: type) type {
             var offered: std.ArrayList(u8) = .empty;
             defer offered.deinit(app.alloc);
             try offered.appendSlice(app.alloc, "default");
-            for (capabilities.reasoning_efforts.slice()) |*option| {
+            for (model_capabilities.effectiveReasoningEfforts(capabilities).slice()) |*option| {
                 try offered.appendSlice(app.alloc, ", ");
                 try offered.appendSlice(app.alloc, option.displayLabel());
             }
@@ -1086,7 +1076,7 @@ pub fn Commands(comptime App: type) type {
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len > 0) {
+            if (model_capabilities.reasoningEffortSupported(capabilities, effort)) {
                 try applyEffort(app, agent, effort, false, false);
                 patch.effort = effort;
             }

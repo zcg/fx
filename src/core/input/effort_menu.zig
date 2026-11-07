@@ -37,7 +37,7 @@ pub const State = struct {
         try self.model.ensureTotalCapacity(alloc, model.len);
         self.model.clearRetainingCapacity();
         self.model.appendSliceAssumeCapacity(model);
-        const declared = capabilities.reasoning_efforts.slice();
+        const declared = model_capabilities.effectiveReasoningEfforts(capabilities).slice();
         const count = @min(declared.len, max_options - 1);
         self.options[0] = .auto;
         @memcpy(self.options[1 .. count + 1], declared[0..count]);

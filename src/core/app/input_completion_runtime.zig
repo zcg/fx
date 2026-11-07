@@ -1379,7 +1379,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn beginModelPickerOptions(app: *App, agent: *AppAgent, model: []const u8) !void {
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            const supports_effort = capabilities.reasoning_efforts.len > 0;
+            const supports_effort = model_capabilities.reasoningEffortOptionCount(capabilities) > 0;
             const supports_fast = capabilities.supports_fast_mode;
             const supports_ultrafast = capabilities.supports_ultrafast_mode;
             const supports_speed = supports_fast or supports_ultrafast;
@@ -1428,7 +1428,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 },
                 .fast => {
                     const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    if (capabilities.reasoning_efforts.len > 0) {
+                    if (model_capabilities.reasoningEffortOptionCount(capabilities) > 0) {
                         const effort_index = model_capabilities.reasoningEffortIndex(capabilities, model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index));
                         try setModelComposerText(app, "/model {s} ", .{model});
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, app.fast_mode, agent.worker.agent_turn_settings.ultrafast_mode, .effort);
@@ -1521,7 +1521,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn exactEffortCompletion(app: *App, model: ?[]const u8, raw_query: []const u8) ?types.ReasoningEffort {
             const capabilities = model_capabilities.resolveForApp(App, app, model orelse return null);
-            if (capabilities.reasoning_efforts.len == 0) return null;
+            if (model_capabilities.reasoningEffortOptionCount(capabilities) == 0) return null;
             const query = std.mem.trim(u8, raw_query, " \t");
             const effort = types.ReasoningEffort.parseDisplayLabel(query) orelse return null;
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) return null;

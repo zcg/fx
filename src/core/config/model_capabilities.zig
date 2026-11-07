@@ -126,6 +126,27 @@ pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata
     return mergeCapabilities(capabilitiesForModel(model), gateway_metadata);
 }
 
+/// The thinking levels a provider can be expected to understand when its
+/// model listing names none. fx offers these only as a fallback: a listing
+/// that declares its own levels always wins, in the order it declares them.
+pub const standard_reasoning_efforts = [_]types.ReasoningEffort{
+    types.ReasoningEffort.literal("none"),
+    types.ReasoningEffort.literal("minimal"),
+    types.ReasoningEffort.literal("low"),
+    types.ReasoningEffort.literal("medium"),
+    types.ReasoningEffort.literal("high"),
+    types.ReasoningEffort.literal("xhigh"),
+    types.ReasoningEffort.literal("max"),
+};
+
+/// The levels the UI offers for a model. A provider's own declaration wins;
+/// a model with no declared levels still gets the industry-standard set so a
+/// user can pick one, and fx sends the chosen value to the provider.
+pub fn effectiveReasoningEfforts(capabilities: Capabilities) ReasoningEffortOptions {
+    if (capabilities.reasoning_efforts.len > 0) return capabilities.reasoning_efforts;
+    return .fromSlice(&standard_reasoning_efforts);
+}
+
 pub fn capabilitiesForModel(model: []const u8) Capabilities {
     return .{ .intrinsic_fast = std.mem.endsWith(u8, model, "-fast") };
 }
@@ -237,7 +258,7 @@ test "request output limit bounds full-window catalog limits" {
 
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
     if (effort.isDefault()) return true;
-    for (capabilities.reasoning_efforts.slice()) |option| {
+    for (effectiveReasoningEfforts(capabilities).slice()) |option| {
         if (option.eql(effort)) return true;
     }
     return false;
@@ -245,24 +266,26 @@ pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.Reason
 
 pub fn reasoningEffortIndex(capabilities: Capabilities, effort: types.ReasoningEffort) usize {
     if (effort.isDefault()) return 0;
-    for (capabilities.reasoning_efforts.slice(), 0..) |option, i| {
+    for (effectiveReasoningEfforts(capabilities).slice(), 0..) |option, i| {
         if (option.eql(effort)) return i + 1;
     }
     return 0;
 }
 
 pub fn reasoningEffortAtIndex(capabilities: Capabilities, index: usize) types.ReasoningEffort {
-    if (index == 0 or capabilities.reasoning_efforts.len == 0) return .auto;
-    return capabilities.reasoning_efforts.values[(index - 1) % capabilities.reasoning_efforts.len];
+    if (index == 0) return .auto;
+    const levels = effectiveReasoningEfforts(capabilities);
+    return levels.values[(index - 1) % levels.len];
 }
 
 pub fn reasoningEffortLabelAtIndex(capabilities: *const Capabilities, index: usize) []const u8 {
-    if (index == 0 or capabilities.reasoning_efforts.len == 0) return "default";
-    return capabilities.reasoning_efforts.values[(index - 1) % capabilities.reasoning_efforts.len].displayLabel();
+    if (index == 0) return "default";
+    const levels = effectiveReasoningEfforts(capabilities.*);
+    return levels.values[(index - 1) % levels.len].displayLabel();
 }
 
 pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {
-    return if (capabilities.reasoning_efforts.len == 0) 0 else capabilities.reasoning_efforts.len + 1;
+    return effectiveReasoningEfforts(capabilities).len + 1;
 }
 
 pub fn resolveProviderOptionsForCapabilities(
@@ -274,6 +297,8 @@ pub fn resolveProviderOptionsForCapabilities(
         .parallel_tool_calls = capabilities.parallel_tool_calls,
     };
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {
+        // A fallback level has no catalog entry, but the user chose it, so fx
+        // sends it as-is rather than silently dropping the request.
         resolved.reasoning = effort;
     }
     resolved.fast = fast_mode and capabilities.supports_fast_mode;

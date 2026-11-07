@@ -664,7 +664,7 @@ pub fn Runtime(comptime App: type) type {
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
             const model_supports_fast = visible_capabilities.supports_fast_mode;
-            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
+            const model_supports_effort = model_capabilities.reasoningEffortOptionCount(visible_capabilities) > 0 or
                 (active_capabilities_pending and !agent.effort.isDefault());
             const visible_effort = if (effort_command_preview) |effort|
                 effort
