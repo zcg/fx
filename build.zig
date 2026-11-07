@@ -274,6 +274,17 @@ pub fn build(b: *std.Build) void {
     const shell_probe_step = b.step("probe-shell", "Report the shell this machine resolves");
     shell_probe_step.dependOn(&run_shell_probe.step);
 
+    // Whether a directory handle can be flushed, which is what makes a rename
+    // durable on Windows.
+    const dir_sync_probe = b.addExecutable(.{
+        .name = "dir-sync-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("scripts/windows/dir_sync_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    dir_sync_probe.root_module.addImport("io", b.createModule(.{ .root_source_file = b.path("src/core/shared/io.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    const run_dir_sync_probe = b.addRunArtifact(dir_sync_probe);
+    const dir_sync_probe_step = b.step("probe-dir-sync", "Check that a directory handle can be flushed");
+    dir_sync_probe_step.dependOn(&run_dir_sync_probe.step);
+
     // Which step of the skills refresh fails, and with what error.
     const skills_refresh_probe = b.addExecutable(.{
         .name = "skills-refresh-probe",

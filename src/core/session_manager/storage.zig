@@ -317,10 +317,14 @@ pub const Storage = struct {
 
     /// Makes created, renamed and removed names inside `dir` durable.
     ///
-    /// A POSIX filesystem makes a rename durable by syncing the directory. Windows
-    /// cannot sync a directory handle at all, so there is nothing to wait for
-    /// there and the call reports success: the file's own data was already synced
-    /// by the caller, and refusing here would fail every write on that platform.
+    /// A POSIX filesystem makes a rename durable by syncing the directory.
+    /// Windows has no equivalent call: `NtFlushBuffersFile` on a directory
+    /// handle fails with `AccessDenied`, because the handle was opened for
+    /// backup intent without write access and the flush would have to update
+    /// the directory's timestamps. Measured on Windows 11 with
+    /// `zig build probe-dir-sync`. The file's own data is synced by the caller
+    /// before the rename, so the remaining exposure is the rename's name entry,
+    /// and refusing here would fail every session write on the platform.
     pub fn syncDir(s: Storage, dir: Dir) Error!void {
         try s.alive();
         try s.mutate();
