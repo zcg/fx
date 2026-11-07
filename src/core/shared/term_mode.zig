@@ -32,6 +32,11 @@ pub const is_wasi = builtin.target.os.tag == .wasi;
 pub const Saved = if (is_windows) struct {
     input_mode: u32,
     output_mode: u32,
+    /// The console's input and output code pages before fx set them. Windows
+    /// keeps these on the console, not on a file descriptor, so they outlive
+    /// the process unless they are put back.
+    input_code_page: u32,
+    output_code_page: u32,
 } else struct {
     termios: std.posix.termios,
 };
@@ -51,6 +56,8 @@ pub fn capture(input_fd: std.posix.fd_t, output_fd: std.posix.fd_t) Error!Saved 
         return .{
             .input_mode = windowsGetMode(input_fd) orelse return error.NotATerminal,
             .output_mode = windowsGetMode(output_fd) orelse return error.NotATerminal,
+            .input_code_page = windowsGetConsoleCP(),
+            .output_code_page = windowsGetConsoleOutputCP(),
         };
     }
     if (comptime is_wasi) return error.NotATerminal;
@@ -97,7 +104,13 @@ pub fn enableRaw(saved: Saved, input_fd: std.posix.fd_t, output_fd: std.posix.fd
         // fx writes UTF-8. A console whose output code page is not UTF-8
         // transcribes those bytes through a legacy table, which turns the screen
         // into mojibake for anything outside ASCII.
-        if (!setOutputCodePage(windows_utf8_code_page)) {
+        //
+        // Both code pages move together. Input is read as bytes, so leaving the
+        // input code page at the OEM default transcribes a Chinese or emoji
+        // keystroke in that table before fx ever sees it.
+        const output_set = setOutputCodePage(windows_utf8_code_page);
+        const input_set = setInputCodePage(windows_utf8_code_page);
+        if (!output_set or !input_set) {
             restore(saved, input_fd, output_fd);
             return error.Unexpected;
         }
@@ -132,6 +145,10 @@ pub fn restore(saved: Saved, input_fd: std.posix.fd_t, output_fd: std.posix.fd_t
     if (comptime is_windows) {
         _ = setMode(input_fd, saved.input_mode);
         _ = setMode(output_fd, saved.output_mode);
+        // The code pages belong to the console window, so leaving them at UTF-8
+        // changes every program that shares it after fx exits.
+        _ = setInputCodePage(saved.input_code_page);
+        _ = setOutputCodePage(saved.output_code_page);
         return;
     }
     if (comptime is_wasi) return;
@@ -179,6 +196,21 @@ fn setOutputCodePage(code_page: u32) bool {
     return windows_console.SetConsoleOutputCP(code_page) != 0;
 }
 
+fn setInputCodePage(code_page: u32) bool {
+    if (comptime !is_windows) return false;
+    return windows_console.SetConsoleCP(code_page) != 0;
+}
+
+fn windowsGetConsoleCP() u32 {
+    if (comptime !is_windows) return 0;
+    return windows_console.GetConsoleCP();
+}
+
+fn windowsGetConsoleOutputCP() u32 {
+    if (comptime !is_windows) return 0;
+    return windows_console.GetConsoleOutputCP();
+}
+
 const windows_enable_processed_input: u32 = 0x0001;
 const windows_enable_line_input: u32 = 0x0002;
 const windows_enable_echo_input: u32 = 0x0004;
@@ -204,6 +236,8 @@ const windows_console = if (!is_windows) struct {} else struct {
     extern "kernel32" fn SetConsoleMode(h_console: std.posix.fd_t, mode: u32) callconv(.winapi) c_int;
     extern "kernel32" fn SetConsoleOutputCP(code_page_id: u32) callconv(.winapi) c_int;
     extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) u32;
+    extern "kernel32" fn SetConsoleCP(code_page_id: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn GetConsoleCP() callconv(.winapi) u32;
 };
 
 /// Whether the platform's terminal state lives in a `termios` structure, which
@@ -217,4 +251,9 @@ test "capture reports a regular file as not a terminal" {
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
     defer file.close(std.testing.io);
     try std.testing.expectError(error.NotATerminal, capture(file.handle, file.handle));
+}
+
+test "the UTF-8 code page is the one fx writes bytes in" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 65001), windows_utf8_code_page);
 }
