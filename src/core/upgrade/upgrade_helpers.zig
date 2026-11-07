@@ -59,11 +59,16 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
 /// An unsupported target reports null rather than failing to compile, so the
 /// binary still builds everywhere and `auto_upgrade` refuses at runtime with a
 /// message the user can act on.
+///
+/// Windows builds on its own, but fx publishes no Windows archive: the release
+/// and dev-release workflows package only the Linux and macOS targets. Reporting
+/// `windows-x86_64` here would make the updater ask the CDN for an asset that
+/// does not exist, so the honest answer is null until a Windows archive is
+/// actually published.
 pub fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.target.os.tag) {
         .macos => "macos",
         .linux => "linux",
-        .windows => "windows",
         else => null,
     };
     const arch: ?[]const u8 = switch (builtin.target.cpu.arch) {
@@ -453,6 +458,11 @@ test "platform string is valid" {
     const value = platform orelse return error.SkipZigTest;
     try std.testing.expect(value.len > 0);
     try std.testing.expect(std.mem.find(u8, value, "-") != null);
+}
+
+test "no release asset is claimed for Windows" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expect(platform == null);
 }
 
 test "E2E upgrade base accepts only explicit IPv4 loopback origins" {

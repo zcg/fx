@@ -274,6 +274,8 @@ pub const AutoUpgrade = struct {
         SelfExeNotFound,
         InstallFailed,
         Cancelled,
+        /// fx publishes no release archive for this build target.
+        UnsupportedPlatform,
     };
 
     fn downloadAndInstall(
