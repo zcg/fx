@@ -285,6 +285,17 @@ pub fn build(b: *std.Build) void {
     const dir_sync_probe_step = b.step("probe-dir-sync", "Check that a directory handle can be flushed");
     dir_sync_probe_step.dependOn(&run_dir_sync_probe.step);
 
+    // Whether a job object ends the grandchildren a stdio server started.
+    const job_probe = b.addExecutable(.{
+        .name = "job-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("scripts/windows/job_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    job_probe.root_module.addImport("io", b.createModule(.{ .root_source_file = b.path("src/core/shared/io.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    job_probe.root_module.addImport("job", b.createModule(.{ .root_source_file = b.path("src/mcp/io/job.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    const run_job_probe = b.addRunArtifact(job_probe);
+    const job_probe_step = b.step("probe-job", "Check that a job object ends a server's grandchildren");
+    job_probe_step.dependOn(&run_job_probe.step);
+
     // Which step of the skills refresh fails, and with what error.
     const skills_refresh_probe = b.addExecutable(.{
         .name = "skills-refresh-probe",

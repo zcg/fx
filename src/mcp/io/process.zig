@@ -25,6 +25,7 @@ const wire = @import("../protocol/wire.zig");
 const lines = @import("lines.zig");
 const Budget = @import("budget.zig").Budget;
 const trace = @import("trace.zig");
+const job_mod = @import("job.zig");
 const Bell = @import("bell.zig").Bell;
 
 // The MCP engine imports only the standard library, and Zig declares neither
@@ -341,6 +342,11 @@ pub const Process = struct {
     pid_lock: std.Io.Mutex = .init,
     /// Set while the current process is unreaped.
     pid: ?std.posix.pid_t = null,
+    /// The job that owns the current process tree on Windows. Every child of
+    /// the server, including the ones its own wrappers start, is inside it, so
+    /// the tree that `TerminateProcess` alone would leave running is ended with
+    /// the job.
+    job: ?job_mod.Job = null,
     stdin: ?*Stdin = null,
     /// The bytes behind the last `message` or `stderr` returned by `next`.
     held: ?[]u8 = null,
@@ -397,8 +403,15 @@ pub const Process = struct {
         everyone.mutex.unlock(p.io);
         p.pid_lock.lockUncancelable(p.io);
         if (p.pid) |pid| {
-            // The whole group, as `signal` does.
+            // The whole group, as `signal` does. On Windows the job owns the
+            // descendants the server started, so it ends them before the
+            // direct child is terminated.
             if (comptime builtin.target.os.tag == .windows) {
+                if (p.job) |job| {
+                    job.terminate();
+                    job.deinit();
+                    p.job = null;
+                }
                 _ = windows_terminate.TerminateProcess(pid, 1);
                 _ = windows_terminate.WaitForSingleObject(pid, 0xFFFFFFFF);
                 _ = windows_terminate.CloseHandle(pid);
@@ -589,6 +602,14 @@ pub const Process = struct {
         };
         const pid = child.id.?;
         if (comptime builtin.target.os.tag == .windows) _ = windows_terminate.CloseHandle(child.thread_handle);
+        // The server goes into a job before anything else can fail, so the
+        // tree it starts is owned from its first moment.
+        if (comptime builtin.target.os.tag == .windows) {
+            if (job_mod.create()) |job| {
+                _ = job.assign(pid);
+                p.job = job;
+            }
+        }
         p.pid_lock.lockUncancelable(p.io);
         p.pid = pid;
         p.pid_lock.unlock(p.io);
