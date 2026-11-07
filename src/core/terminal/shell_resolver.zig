@@ -139,12 +139,23 @@ pub fn resolve(
 }
 
 /// Windows: the shell to use, from the `shell` setting when it names an
-/// installed one, else the detected default. The first detection is written
-/// back so later calls read a setting instead of probing the disk again.
+/// installed one, else the detected default. A path is used as written, which
+/// is what lets a user pin a shell that detection cannot find. The first
+/// detection is written back so later calls read a setting instead of probing
+/// the disk again.
 fn windowsLoginShellInto(buffer: []u8) ?[]const u8 {
     const alloc = std.heap.c_allocator;
     const preference = configuredShellSetting(alloc);
     defer if (preference) |value| alloc.free(value);
+    // A `shell` setting may name an executable instead of one of the known
+    // kinds, for a bash or pwsh that lives where detection does not look.
+    if (preference) |value| {
+        if (std.Io.Dir.path.isAbsolute(value) and windows_shell.existingShell(value)) {
+            if (value.len > buffer.len) return null;
+            @memcpy(buffer[0..value.len], value);
+            return buffer[0..value.len];
+        }
+    }
     var shell = (windows_shell.detectPreferred(alloc, preference) catch null) orelse return null;
     defer shell.deinit(alloc);
     if (preference == null) cacheShellSetting(shell.kind);
@@ -301,7 +312,15 @@ pub fn capturedInvocation(
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash")) {
+            // `-i` is what produced the job-control complaints on stderr
+            // (`cannot set terminal process group`, `no job control in this
+            // shell`) for a captured command, which has no terminal. A zsh
+            // user login keeps it: its startup files expect an interactive
+            // shell. Bash loses it and gains alias expansion instead, which
+            // `captured_zsh_user_prelude` does not need.
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash") or
+                std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash.exe"))
+            {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");

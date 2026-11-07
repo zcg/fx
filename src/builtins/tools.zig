@@ -74,11 +74,17 @@ const shell_base_description =
     "Run a shell command. Each call starts a new shell with the user's startup files, so cd and export do not carry over. If the command is still running after yield_time_ms, you get a session_id: call again with action=interact to wait for more output, or action=stop to end it. Never rerun it. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use `" ++ detach_command ++ "` and check it is ready in that call. In zsh, quote globs meant for another program.";
 
 /// Windows has two shells, and which one a command belongs in depends on the
-/// command. The description says so, because a model that does not know will
-/// write POSIX syntax for PowerShell or a Windows path for Bash, and either
-/// fails in a way that reads like a broken tool.
+/// command. The description states the default first, because a model that is
+/// left to infer it writes PowerShell syntax for a POSIX tool, or a Windows
+/// path for Bash, and either fails in a way that reads like a broken tool.
+///
+/// Bash is the default on purpose: every POSIX command a model has seen in
+/// training runs there unchanged, and PowerShell is the exception it should
+/// reach for only when the work is Windows-native. The two shell names in the
+/// `shell` argument are resolved through detection, so the model never needs to
+/// know where a package manager installed either one.
 const shell_windows_description =
-    " On Windows this runs PowerShell 7 (pwsh) by default. To run a command in Bash, pass shell={\"kind\":\"executable\",\"path\":\"bash\"} (or \"pwsh\"). Choose by the command, not by habit: Bash for POSIX text tools (sed, awk, grep, find, xargs, make), pipelines of them, and Unix-style build scripts; pwsh for Windows-native work (services, registry, .NET, cmdlets), Windows paths with backslashes, and anything whose output you will read as data. Prefer whichever runs it in one short command, because each call starts a new shell and a translation between the two costs more than picking the right one. Paths differ: Bash takes /c/Users/example/project, pwsh takes C:\\Users\\example\\project. If a retry reports the other shell is not installed, stay in the one that worked: only an installed shell can be chosen. If Bash lacks a tool, retry in pwsh.";
+    " On Windows this runs Git Bash by default, so write the command as POSIX shell and use Unix paths (/d/projects/app). Pass shell={\"kind\":\"executable\",\"path\":\"pwsh\"} when the work is Windows-native and PowerShell does it better: services and processes, the registry, .NET types, cmdlets such as Get-ChildItem, and Windows API or event-log queries. Bash is the right choice for text processing, pipelines, sed, awk, grep, find, xargs, make, most build scripts and command-line tools, and anything you would write on Linux or macOS. Do not translate a command into PowerShell when Bash runs it: a translation is where quoting and path bugs come from. If Bash lacks the tool, retry in pwsh. Once a call reports a shell is not installed, stay in the one that worked.";
 
 fn baseDescription(comptime with_windows: bool) []const u8 {
     return shell_base_description ++ if (with_windows) shell_windows_description else "";

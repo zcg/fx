@@ -2,15 +2,22 @@
 //!
 //! Windows has no POSIX shell. What it has, in the order this module prefers:
 //!
-//! 1. PowerShell 7 (`pwsh.exe`). It is the current one, it is cross-platform,
-//!    and its syntax is stable. Windows PowerShell 5 (`powershell.exe`) is the
-//!    older one with the well-known quoting and encoding problems, so it is
-//!    never chosen when 7 is installed - and the harness never falls back to it,
-//!    because a command that silently ran under the wrong shell would be worse
-//!    than one that reported no shell at all.
-//! 2. Git Bash, when it is installed. Unix commands people already know work
-//!    there unchanged, which is the whole reason it ships with Git for Windows.
+//! 1. Git Bash, when it is installed. Unix commands people already know work
+//!    there unchanged, and every model writes POSIX far more reliably than
+//!    PowerShell, so this is the default the command path and the prompt both
+//!    start from.
+//! 2. PowerShell 7 (`pwsh.exe`). It is cross-platform and its syntax is stable,
+//!    and it is the better tool for Windows-native work: services, the
+//!    registry, .NET types, and cmdlets. Windows PowerShell 5
+//!    (`powershell.exe`) is the older one with the well-known quoting and
+//!    encoding problems, so it is never chosen when 7 is installed - and the
+//!    harness never falls back to it, because a command that silently ran under
+//!    the wrong shell would be worse than one that reported no shell at all.
 //! 3. `cmd.exe`, only when neither of the above exists.
+//!
+//! A `shell` setting overrides the order for the default shell only. The other
+//! installed shells stay reachable through a call's own `shell` argument, which
+//! is why `installed` reports every one of them rather than the winner alone.
 //!
 //! Every path is resolved to an absolute one before use: the shell is spawned
 //! directly, so a bare name would depend on the child's search path rather than
@@ -61,17 +68,53 @@ pub const Shell = struct {
 pub const supported = builtin.target.os.tag == .windows;
 
 /// The kinds a `shell` setting may name, in the order they are offered.
-pub const setting_names = [_][]const u8{ "pwsh", "bash", "cmd" };
+pub const setting_names = [_][]const u8{ "bash", "pwsh", "cmd" };
 
-/// Resolves the shell to use, preferring PowerShell 7, then Git Bash, then cmd.
+/// Resolves the shell to use, preferring Git Bash, then PowerShell 7, then cmd.
 /// Returns null when none of them exists, which the caller reports rather than
 /// guessing a path.
 pub fn detect(alloc: Allocator) !?Shell {
     if (comptime !supported) return null;
-    if (try findPwsh(alloc)) |path| return .{ .kind = .pwsh, .path = path };
     if (try findGitBash(alloc)) |path| return .{ .kind = .git_bash, .path = path };
+    if (try findPwsh(alloc)) |path| return .{ .kind = .pwsh, .path = path };
     if (try findCmd(alloc)) |path| return .{ .kind = .cmd, .path = path };
     return null;
+}
+
+/// Every installed shell, in the order `detect` prefers them. The prompt tells
+/// the model what this returns, because a call may name any of them and the
+/// model cannot guess where a package manager put one.
+pub const Installed = struct {
+    pwsh: ?[]u8 = null,
+    git_bash: ?[]u8 = null,
+    cmd: ?[]u8 = null,
+
+    pub fn deinit(self: *Installed, alloc: Allocator) void {
+        if (self.pwsh) |path| alloc.free(path);
+        if (self.git_bash) |path| alloc.free(path);
+        if (self.cmd) |path| alloc.free(path);
+        self.* = undefined;
+    }
+
+    /// The path for a kind, when that kind is installed.
+    pub fn pathFor(self: Installed, kind: Kind) ?[]const u8 {
+        return switch (kind) {
+            .pwsh => self.pwsh,
+            .git_bash => self.git_bash,
+            .cmd => self.cmd,
+        };
+    }
+};
+
+/// Finds each installed shell once, so a caller that reports them all does not
+/// walk the filesystem three times over.
+pub fn installed(alloc: Allocator) !Installed {
+    if (comptime !supported) return .{};
+    return .{
+        .pwsh = try findPwsh(alloc),
+        .git_bash = try findGitBash(alloc),
+        .cmd = try findCmd(alloc),
+    };
 }
 
 /// Resolves the shell named by a `shell` setting. An unknown or unavailable
@@ -173,6 +216,12 @@ fn isGitBashPath(path: []const u8) bool {
         if (containsIgnoreCase(path, needle)) return true;
     }
     return false;
+}
+
+/// True when the path names a Git for Windows bash rather than the WSL
+/// launcher, which starts a Linux distribution instead of the workspace.
+pub fn isBashPath(path: []const u8) bool {
+    return isGitBashPath(path);
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -361,6 +410,15 @@ fn existingFile(alloc: Allocator, path: []const u8) !?[]u8 {
     var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return null;
     file.close(io_mod.getIo());
     return try alloc.dupe(u8, path);
+}
+
+/// Whether `path` names a file a shell can be started from. A `shell` setting
+/// that holds a path is used as written, so this is the only check it gets.
+pub fn existingShell(path: []const u8) bool {
+    if (path.len == 0) return false;
+    var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return false;
+    file.close(io_mod.getIo());
+    return true;
 }
 
 /// Looks a bare executable name up on PATH, honoring PATHEXT.

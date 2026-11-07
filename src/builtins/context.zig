@@ -29,6 +29,8 @@ const TransientContextInput = context_contract.TransientContextInput;
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 const shell_resolver = @import("../core/terminal/shell_resolver.zig");
+const windows_shell = @import("../core/shared/windows_shell.zig");
+const builtin = @import("builtin");
 
 pub const gateway_system_prompt = @embedFile("system_prompt.md");
 
@@ -2607,6 +2609,13 @@ fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]con
     try out.writer.writeAll("shell_path: ");
     try model_context_encoding.writeScalar(&out.writer, shell);
     try out.writer.writeByte('\n');
+    if (alternateShellPath(arena, shell)) |other| {
+        // Named as the `shell` argument value, because that is what a call
+        // passes to move the command into the other shell.
+        try out.writer.writeAll("alternate_shell: ");
+        try model_context_encoding.writeScalar(&out.writer, other);
+        try out.writer.writeByte('\n');
+    }
     try out.writer.print("date_utc: {s}\n", .{date_text});
     try out.writer.writeAll("home_directory: ");
     try model_context_encoding.writeScalar(&out.writer, home);
@@ -2675,6 +2684,22 @@ fn shellPath(arena: Allocator) ?[]const u8 {
         }
     } else |_| {}
     return io_mod.getenv("SHELL") orelse io_mod.getenv("COMSPEC");
+}
+
+/// The other shell a Windows command may be moved to, when it is installed.
+/// The prompt names it because the model cannot guess where a package manager
+/// put it, and a command written for the wrong shell fails in a way that reads
+/// like a broken tool. Other platforms have one shell and nothing to report.
+fn alternateShellPath(arena: Allocator, current: []const u8) ?[]const u8 {
+    if (comptime builtin.target.os.tag != .windows) return null;
+    var found = (windows_shell.installed(arena) catch return null);
+    defer found.deinit(arena);
+    const current_is_bash = windows_shell.isBashPath(current);
+    // Bash is the default on Windows, so the alternate is pwsh and back.
+    const alternate = if (current_is_bash) found.pwsh else found.git_bash;
+    const path = alternate orelse return null;
+    if (path.len == 0) return null;
+    return path;
 }
 
 fn homeDir() ?[]const u8 {
