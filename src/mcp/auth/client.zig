@@ -350,9 +350,13 @@ pub const Auth = struct {
         if (!discovery.secureOrLoopback(redirect_uri)) return error.InvalidRedirect;
         if (a.flow.phase == .idle) {
             if (a.stage == .probe) return;
+            // Allocate before the reset. A reset first would leave
+            // `redirect_uri` pointing at freed arena bytes when this
+            // allocation fails, and every later sign-in step reads it.
+            const owned_redirect = try a.flow_arena.allocator().dupe(u8, redirect_uri);
             _ = a.flow_arena.reset(.retain_capacity);
             a.token_error = null;
-            a.redirect_uri = try a.flow_arena.allocator().dupe(u8, redirect_uri);
+            a.redirect_uri = owned_redirect;
             // With no challenge seen, one request without a token asks the
             // server where its metadata is and what scope it wants, so the
             // sign-in starts knowing both.
@@ -755,17 +759,26 @@ pub const Auth = struct {
 
     /// What a refresh needs comes from the sign-in that brought the tokens.
     fn keepCredential(a: *Auth, token: oauth.Token) Error!void {
-        _ = a.cred_arena.reset(.retain_capacity);
-        const ca = a.cred_arena.allocator();
         const reg = a.registrations[a.flow.flow_issuer - 1].?;
         const meta = a.meta.?;
+        // The reset frees every string `a.cred` held, so it is cleared first.
+        // If one of the duplications below fails, the auth is left with no
+        // credential rather than one whose fields point at freed bytes.
+        _ = a.cred_arena.reset(.retain_capacity);
+        a.cred = null;
+        const ca = a.cred_arena.allocator();
+        const token_endpoint = try ca.dupe(u8, meta.token_endpoint);
+        const revocation_endpoint = if (meta.revocation_endpoint) |r| try ca.dupe(u8, r) else null;
+        const resource = try ca.dupe(u8, a.tokenResource());
+        const client_id = try ca.dupe(u8, reg.client_id);
+        const client_secret = if (reg.client_secret) |s| try ca.dupe(u8, s) else null;
         a.cred = .{
-            .token_endpoint = try ca.dupe(u8, meta.token_endpoint),
-            .revocation_endpoint = if (meta.revocation_endpoint) |r| try ca.dupe(u8, r) else null,
-            .resource = try ca.dupe(u8, a.tokenResource()),
+            .token_endpoint = token_endpoint,
+            .revocation_endpoint = revocation_endpoint,
+            .resource = resource,
             .client = .{
-                .id = try ca.dupe(u8, reg.client_id),
-                .secret = if (reg.client_secret) |s| try ca.dupe(u8, s) else null,
+                .id = client_id,
+                .secret = client_secret,
                 .method = oauth.chooseMethod(reg.method, reg.client_secret != null, meta.auth_methods),
             },
         };

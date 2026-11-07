@@ -29,6 +29,12 @@ const frozen_prefix = @import("frozen_prefix.zig");
 const full_transcript_worker = @import("full_transcript_worker.zig");
 const tool_group_projection = @import("tool_group_projection.zig");
 const transcript_store = @import("store.zig");
+
+/// How many `max_transcript_bytes` budgets the transcript window may keep in
+/// structured entries between compactions. The byte cache itself is capped at
+/// one budget; the entries kept for the window are allowed several so a long
+/// session's scrollback stays readable, while the total still has a ceiling.
+const transcript_window_retention_windows = 4;
 const full_transcript_screen = @import("../full_transcript_screen.zig");
 const transcript_viewport_runtime = @import("viewport_runtime.zig");
 const transcript_writer = @import("writer.zig");
@@ -7223,6 +7229,37 @@ pub const TranscriptRuntime = struct {
         defer drops.deinit(alloc);
         try window.sync(alloc, self.notebook.entries.items, &drops);
         try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+        try self.enforceTranscriptWindowRetention(alloc);
+    }
+
+    /// The window drops a finished cycle only at a turn end the log holds, so
+    /// between compactions the entries it keeps grow with the session. This
+    /// bounds them: past the byte budget, the oldest entries still in memory
+    /// leave. Entries on screen and pinned ones stay, so the window's promise
+    /// (an entry goes when it scrolls away) still holds, and a long session
+    /// cannot retain the whole transcript between compactions.
+    fn enforceTranscriptWindowRetention(self: *TranscriptRuntime, alloc: Allocator) !void {
+        const budget = self.notebook.max_transcript_bytes * transcript_window_retention_windows;
+        if (transcript_store.retainedStructuredBytes(self) <= budget) return;
+        var hold = try self.transcriptWindowDropHold(alloc);
+        defer hold.deinit(alloc);
+        // Oldest first: the entry ids rise in transcript order.
+        var evict: std.ArrayList(u32) = .empty;
+        defer evict.deinit(alloc);
+        var retained = transcript_store.retainedStructuredBytes(self);
+        for (self.notebook.entries.items) |entry| {
+            if (retained <= budget) break;
+            const id = entry.id();
+            if (hold.holds(id)) continue;
+            try evict.append(alloc, id);
+            retained -|= transcript_store.entryRetainedBytes(entry);
+        }
+        if (evict.items.len == 0) return;
+        // `dropEntriesAtomic` keeps a pinned entry, so the budget can stay
+        // above the target for one cycle; the next sync tries again.
+        debug_trace.logf("transcript_window", "retention evicting entries={d} budget={d}", .{ evict.items.len, budget });
+        self.discardTranscriptArchive();
+        _ = try transcript_store.dropEntriesAtomic(self, alloc, evict.items);
     }
 
     /// Sets whether the session writes a session log, enabling the window

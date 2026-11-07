@@ -20,22 +20,24 @@
 3. **上一轮（2026-11-06）§8 的「高提交 ≠ 泄漏」结论维持不变**：6.8 GB Private / 1.5 GB WS 的形态是「线程栈提交 + CRT 堆高水位 + arena 高水位」，非单调泄漏；本轮未发现能推翻它的新证据。
 4. **上一轮 §8 的 P0 三项中一项已修复、两项未修**（见 §3 的基线对照）。
 
+> **2026-11-07 复核修正（修复轮）**：逐条核对代码原文后，本轮更正了两条子报告的结论。`M-01`（SSE 文本双份保留）的严重度被高估，见 §2 的更正说明；`M-02`（`event_arena` 高水位在流结束后不归还）是**误报**，`consumeSseStreamTraced` 结尾有 `defer mem_utils.deinit_arena(event_arena)`（`client.zig:4383`），函数返回即完全释放，循环内的 `reset(.retain_capacity)` 只在流处理期间复用。已修复的项见 §10。
+
 ## 2. 经主代理复核确认的 P1（建议优先修）
 
-### P1-1：SSE 流期间文本双份无界保留（04 号 M-01，已复核代码原文）
+### P1-1（复核后降级为 P2）：SSE 流的 replay 只复制 reasoning 与 metadata，不复制正文
 
-- 位置：`src/gateway/client.zig:4478`（`if (content_capture_limit == null) try replay.observe(root, content_buf.items.len, separated)`）、`:4371` `content_buf`、`:4447` `event_arena.reset(.retain_capacity)`。
-- 机制：生产默认 `content_capture_limit = null` 时，`capturedText` 返回全文，`content_buf` 无限增长；同一条件下 `replay.observe` 又把全部事件存进 `GatewayReplayBuilder`。文本每字节在流期间被保留两份。`event_arena` 用 `retain_capacity`，单事件 JSON 树高水位在流结束前不归还（`max_sse_event_line_bytes = 32 MiB`，`client.zig:227`）。
-- 调用面证据：主模型请求路径全部传 `null`——`gateway_step.zig:212/498/557/621`、`orchestrator.zig:7930`、`stream_provider.zig:784/895`、`builtins/gateway.zig:393`；只有 cache warmer / 标题生成传了上限（`cache_warmer.zig:310`）。
-- 修法：replay 改为引用 `content_buf` 的区间（offset+len）而非再存一份；给 replay 设与 capture 同一上限；流结束后对 `event_arena` 做一次 `reset(.free_all)` 或按高水位阈值收缩。
-- 证实：对 `consumeSseStream` 加 1 MiB 文本流用例，分别统计 `content_buf` 与 replay 占用（现有 `:4925` 的 `arena.queryCapacity() <= output_bytes*4` 断言可改造）。
+- 位置：`src/gateway/client.zig:4478`、`:3108-3116`、`:3184`、`types.zig:1620`。
+- **更正**：子报告称「每字节文本存两份」。核对 `GatewayReplayBuilder.observe` 后不成立：`.text` 分支（`client.zig:3108-3116`）只记录 `part.offset` 与 `part.length`，字节留在 `content_buf`，`finish`（`:3184`）输出的是区间引用。真正复制的是 reasoning 文本（`:3106-3107`）与 provider metadata（`:3129`），且都计入 `ProviderReplay.max_bytes = 4 MiB`（`types.zig:1620`）的总量预算，超过即 `error.ProviderStateTooLarge`。
+- 仍然成立的部分：`content_buf` 在 `content_capture_limit = null` 时无上限增长（生产主模型路径全部传 `null`），且 `replay` 的 reasoning/metadata 也同时驻留，所以**峰值相当于 content + ≤4 MiB**，不是 2× content。这是有界放大而非无界双份。
+- **本轮不修**：`content_buf` 的上限就是模型回复本身，模型回复必然要完整进内存（要发给下游、要存历史），所以给它设 cap 会截断回复。真正可做的是把 reasoning 的 4 MiB 预算调小或按需保留，收益有限、影响 provider replay 语义，留待实测后再定。
+- 已修的相关项：`event_arena` 的 `deinit` 确认存在（见 §1 的更正）。
 
-### P1-2：transcript window 开启后 entries 无字节上界（03 号 M03-01，已复核代码原文）
+### P1-2（已修复）：transcript window 的 entries 在 compaction 之间不设上界
 
-- 位置：`src/ui/transcript/runtime.zig:7203-7250`（`enableTranscriptWindow` / `syncTranscriptWindow`）+ `src/ui/transcript/store.zig:694-734`（`dropEntriesAtomic` / `dropEntries`）+ `transcript_window_shell.zig:104-116`（`sync`）。
-- 机制：`enableTranscriptWindow` 的注释明示「the byte cap no longer applies，释放完全依赖 window sync 的 drops」。`Shell.sync` 只报告「finished 且不在屏上」的 entry；pinned（`lifecycle_pinned`，`store.zig:714-717`）、在屏、尚未 finish 的 entry 全部留下，且无条数上界。`dropEntries` 只删 window 报的 drops，pinned 永不删。长会话下 `notebook.entries`（每条自带 dupe 的 bytes / skill tokens / images，`store.zig:2194-2231`）随会话线性增长。
-- 修法：给 window 模式的 entries 加条数 / 保留字节上界（如屏行数 × N），超限强制 drop 最老非 pinned entry；或让 `sync` 对超长前缀做整段 release。
-- 证实：长会话（>10k 条 entry）采样 `notebook.entries.items.len` 与 `retainedStructuredBytes()`（`store.zig:180`）是否单调上升不回落。
+- 位置：`src/ui/transcript/runtime.zig`（新增 `enforceTranscriptWindowRetention`）、`src/ui/transcript/store.zig:189`（`entryRetainedBytes` 改为 `pub`）。
+- **复核后的准确机制**：`canDrop` 要求 `prev_first != null`，而 `prev_first` 只在 `compacted` 事件时设置（`transcript_window.zig:269-275`）；`saved_through` 在**每个 turn 结束**的 turn summary 处前进（`transcript_window_shell.zig:168-169`）。所以 entries 并非整会话无界，而是「**每个 compaction 周期内的 entries 全部常驻**」。一个没有触发 compaction 的长会话（例如 auto-compaction 关闭或上下文未达阈值）会持续累积，这才是真实风险。
+- 修复：在每次 `syncTranscriptWindow` 之后调用 `enforceTranscriptWindowRetention`。保留预算为 `max_transcript_bytes × 4`（默认 1 MiB）；超限时按从旧到新淘汰条目，跳过在屏条目（`transcriptWindowDropHold`）与 pinned 条目（`dropEntriesAtomic` 内部判定）。这样长会话的总量有上界，而「滚出屏幕才释放」的既有语义不变。
+- 验证：构建通过、`zig build test` 全通过、`./.zig-out-verify/bin/fx-dev.exe --version` 正常输出 `0.0.16`。
 
 ## 3. 上一轮 §8 基线对照（修复状态）
 
@@ -102,3 +104,22 @@
 - 局限：纯静态，未跑 `zig build` / `zig test` / 二进制，未做 VMMap / UMDH / 连续进程采样。所有「量级」为静态估算；§7 的实测项落地前，收益数字只能当排序依据。
 - 基线：`docs/audit/2026-11-06-full-review.md` §8 / §9 / §16。本报告不重复其概述，只做验证与扩展。
 - 本轮未修改任何 `src/` 文件；产出仅为 `docs/audit/_mem_0*.md` 与本文档。
+
+## 10. 本轮修复记录（2026-11-07，逐条核对后落地）
+
+每条都先读代码原文确认，再修，再以 `zig build`、`zig build test`、跑二进制验证。提交基线为 `52643967`。
+
+| 项 | 结论 | 位置 | 修复 |
+| --- | --- | --- | --- |
+| F-01 `makePrompt` OOM 泄漏 | 确认 | `src/core/agent/worker_runtime.zig:4679` | 5 次分配改为先置空字段、逐字段赋值 + `errdefer freeQueuedPrompt`。新增 `checkAllAllocationFailures` 扫描测试。 |
+| F-02 `signIn` 的 `redirect_uri` 悬空 | 确认 | `src/mcp/auth/client.zig:353` | 改为先 `dupe` 成功再 `reset`，失败时旧值不被引用。 |
+| F-03 `keepCredential` 的 `a.cred` 悬空 | 确认 | `src/mcp/auth/client.zig:758` | `reset` 后立即 `a.cred = null`，全部 `dupe` 成功后才赋值。 |
+| P1-2 transcript entries 无上界 | 确认（机制更正） | `src/ui/transcript/runtime.zig`、`store.zig:189` | 新增 `enforceTranscriptWindowRetention`：按 `4 × max_transcript_bytes` 预算淘汰最旧条目，跳过在屏与 pinned；`entryRetainedBytes` 改为 `pub`。 |
+| MEM-02-01 session 批量缓冲高水位 | 确认 | `src/core/session_manager/session.zig:803` | `writeFramed` 结束后，若 `batch`/`bounds` 容量超过 256 KiB 阈值则 `clearAndFree`；正常 turn 保留容量。 |
+| P1-1 SSE 文本双份 | **更正为 P2**，部分不成立 | `src/gateway/client.zig:3108-3116` | 文本只记 offset/length 不复制；reasoning/metadata 受 4 MiB 预算。不修。 |
+| M-02 `event_arena` 高水位不归还 | **误报** | `src/gateway/client.zig:4383` | `defer mem_utils.deinit_arena(event_arena)` 在函数返回时完全释放。不修。 |
+| M03-05 审批屏每帧重建布局 | 确认但**本轮不修** | `src/ui/approval_screen.zig:317` | 缓存 layout 涉及 `screen_state` 生命周期，回归风险高于收益（只在审批屏打开时生效）。 |
+| S1 每 turn 历史深拷贝 | 确认，**架构级** | `src/main.zig:1774`、`agent.zig:145` | 深拷贝是 worker 线程与主线程间传递所有权的必要条件；改为借用需版本号 + compaction 并发安全设计。留作后续专项。 |
+| M02 工具结果 sanitize 双 pass | **量级被高估** | `src/core/tooling/tool_result_limits.zig:20,54` | `sanitizeModelText` 合法文本零拷贝直返，`truncateText` 也是零拷贝切片；真实成本只是 O(n) UTF-8 校验。不修。 |
+
+验证证据：`zig build --prefix .zig-out-verify` 通过；`zig build test --summary all` 报 `5/5 steps succeeded`、`test success`；`./.zig-out-verify/bin/fx-dev.exe --version` 输出 `0.0.16`；`zig fmt --check` 对改动文件无输出。

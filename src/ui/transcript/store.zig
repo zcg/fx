@@ -186,7 +186,7 @@ pub fn retainedStructuredBytes(self: anytype) usize {
     return total;
 }
 
-fn entryRetainedBytes(entry: TranscriptEntry) usize {
+pub fn entryRetainedBytes(entry: TranscriptEntry) usize {
     return switch (entry) {
         .raw_bytes => |e| e.bytes.len,
         .semantic_notice => |e| e.topic.len + e.body.len,

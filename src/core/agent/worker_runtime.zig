@@ -4677,15 +4677,25 @@ fn freeToolResultMemory(
 }
 
 fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
-    return .{
-        .prompt = try alloc.dupe(u8, text),
+    // Built field by field so a later allocation that fails frees the earlier
+    // ones. `freeQueuedPrompt` reads every field, so each one starts empty and
+    // is filled only after its allocation succeeds.
+    var prompt: QueuedPrompt = .{
+        .prompt = &.{},
         .images = &.{},
-        .model = try alloc.dupe(u8, model),
-        .api_key = try alloc.dupe(u8, "key"),
+        .model = &.{},
+        .api_key = &.{},
         .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
+        .history = &.{},
+        .grants = &.{},
     };
+    errdefer freeQueuedPrompt(alloc, prompt);
+    prompt.prompt = try alloc.dupe(u8, text);
+    prompt.model = try alloc.dupe(u8, model);
+    prompt.api_key = try alloc.dupe(u8, "key");
+    prompt.history = try alloc.alloc(types.HistoryTurn, 0);
+    prompt.grants = try alloc.alloc(types.PermissionGrant, 0);
+    return prompt;
 }
 
 fn makeImagePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
@@ -4728,6 +4738,21 @@ test "direct steering applies at the boundary without cancellation and seals bef
     defer freeQueuedPrompt(alloc, late);
     try std.testing.expect(!try runtime.admitActiveSteering(alloc, late));
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "makePrompt frees everything it allocated when a later allocation fails" {
+    // Every allocation after the first can fail, so each index is swept. The
+    // testing allocator reports a leak if errdefer misses one.
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        struct {
+            fn run(alloc: std.mem.Allocator) !void {
+                const prompt = try makePrompt(alloc, "queued", "model");
+                freeQueuedPrompt(alloc, prompt);
+            }
+        }.run,
+        .{},
+    );
 }
 
 test "direct steering output allocation failure preserves feedback and cancellation discards it" {

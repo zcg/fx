@@ -800,23 +800,41 @@ pub const Session = struct {
         session.written_seq.store(session.env.s.io, session.state.last_seq);
     }
 
+    /// How large a framed batch may stay before the session hands it back.
+    /// One normal turn's lines fit well inside this, so an ordinary append
+    /// keeps its capacity and an exceptional one does not pin it.
+    const framed_scratch_keep_bytes: usize = 256 * 1024;
+    const framed_bounds_keep: usize = 256 * 1024;
+
     /// Writes `session.batch` (lines ending at `session.bounds`) in one
     /// append, observed or not, so traced runs and crash matrices see the
     /// write pattern production has. An observer then sees each line; a
     /// tracer reading the disk bounds its view by the line's seq.
     fn writeFramed(session: *Session, log: *Log, first_seq: u64, cause: Cause) log_mod.AppendError!void {
         try log.append(session.batch.items, session.bounds.items.len);
-        if (!session.observing()) return;
-        var start: usize = 0;
-        for (session.bounds.items, 0..) |end, i| {
-            const line = session.batch.items[start..end];
-            const header = log_mod.checkLine(line) catch return error.Io;
-            // In a publish only line 1 is the header; the held and batch
-            // lines after it come from the host.
-            const line_cause: Cause = if (cause != .header) cause else if (i == 0) .header else .host;
-            session.observe(.{ .wrote_line = .{ .seq = first_seq + i, .kind = header.kind.?, .cause = line_cause } });
-            start = end;
+        if (session.observing()) {
+            var start: usize = 0;
+            for (session.bounds.items, 0..) |end, i| {
+                const line = session.batch.items[start..end];
+                const header = log_mod.checkLine(line) catch return error.Io;
+                // In a publish only line 1 is the header; the held and batch
+                // lines after it come from the host.
+                const line_cause: Cause = if (cause != .header) cause else if (i == 0) .header else .host;
+                session.observe(.{ .wrote_line = .{ .seq = first_seq + i, .kind = header.kind.?, .cause = line_cause } });
+                start = end;
+            }
         }
+        releaseFramedScratch(session);
+    }
+
+    /// A batch can carry a whole turn, so these scratch buffers grow past what
+    /// a later one needs. Handing an oversized one back keeps a single large
+    /// append from setting the session's footprint for the rest of its life,
+    /// while one that still fits a normal turn keeps its capacity.
+    fn releaseFramedScratch(session: *Session) void {
+        const gpa = session.env.gpa;
+        if (session.batch.capacity > framed_scratch_keep_bytes) session.batch.clearAndFree(gpa);
+        if (session.bounds.capacity > framed_bounds_keep / @sizeOf(usize)) session.bounds.clearAndFree(gpa);
     }
 
     fn maybeSnapshot(session: *Session, live: *Live, bodies: []const schema.Body, ts: u64) AppendError!void {
