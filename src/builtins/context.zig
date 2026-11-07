@@ -2609,7 +2609,7 @@ fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]con
     try out.writer.writeAll("shell_path: ");
     try model_context_encoding.writeScalar(&out.writer, shell);
     try out.writer.writeByte('\n');
-    if (alternateShellPath(arena, shell)) |other| {
+    if (try alternateShellPath(arena, shell)) |other| {
         // Named as the `shell` argument value, because that is what a call
         // passes to move the command into the other shell.
         try out.writer.writeAll("alternate_shell: ");
@@ -2690,7 +2690,7 @@ fn shellPath(arena: Allocator) ?[]const u8 {
 /// The prompt names it because the model cannot guess where a package manager
 /// put it, and a command written for the wrong shell fails in a way that reads
 /// like a broken tool. Other platforms have one shell and nothing to report.
-fn alternateShellPath(arena: Allocator, current: []const u8) ?[]const u8 {
+fn alternateShellPath(arena: Allocator, current: []const u8) !?[]const u8 {
     if (comptime builtin.target.os.tag != .windows) return null;
     var found = (windows_shell.installed(arena) catch return null);
     defer found.deinit(arena);
@@ -2699,7 +2699,9 @@ fn alternateShellPath(arena: Allocator, current: []const u8) ?[]const u8 {
     const alternate = if (current_is_bash) found.pwsh else found.git_bash;
     const path = alternate orelse return null;
     if (path.len == 0) return null;
-    return path;
+    // `found` owns `path` and the deferred deinit frees it before this
+    // returns, so the caller gets its own copy in the same arena.
+    return try arena.dupe(u8, path);
 }
 
 fn homeDir() ?[]const u8 {
