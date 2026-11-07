@@ -201,6 +201,30 @@ fn heldFor(c: *const McpServerConfig) ?Held {
 /// these, then its config's `env`. Never fx's credentials or the rest.
 const inherited_names = [_][]const u8{ "HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER" };
 
+/// The variables a Windows child process needs that the POSIX list does not
+/// name. A process started without `SystemRoot` cannot load its own DLLs, and
+/// `ComSpec` and `PATHEXT` are what make `npx`, `uvx`, and the `.cmd` wrappers
+/// around them resolve, so a stdio server started with only the POSIX names
+/// exits before it can answer.
+const inherited_names_windows = [_][]const u8{
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "SystemRoot",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+};
+
 /// The engine's transport, or null when the server must be held back (and
 /// `s` says why).
 fn transportFor(
@@ -222,6 +246,11 @@ fn transportFor(
                 // An exported shell function isn't passed on.
                 if (!std.mem.startsWith(u8, value, "()")) try map.put(name, value);
             };
+            if (comptime @import("builtin").target.os.tag == .windows) {
+                for (inherited_names_windows) |name| if (inherited.get(name)) |value| {
+                    try map.put(name, value);
+                };
+            }
             for (c.env) |e| try map.put(e.key, e.value);
             return .{ .stdio = .{ .argv = argv, .environ_map = map, .cwd = cwd } };
         },
@@ -271,6 +300,35 @@ test "an approved .mcp.json server keeps its login under its own workspace, neve
     try testing.expectEqual(@as(?[]const u8, null), r.servers[0].credentialKey().workspace);
     try testing.expectEqualStrings("/Users/example/repo", r.servers[1].workspace.?);
     try testing.expectEqualStrings("/Users/example/repo", r.servers[1].credentialKey().workspace.?);
+}
+
+test "a Windows stdio server inherits the variables a child process needs" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var inherited: std.process.Environ.Map = .init(testing.allocator);
+    defer inherited.deinit();
+    try inherited.put("PATH", "C:\\Windows\\system32");
+    // Present in the parent, and needed by a Windows child to start at all.
+    try inherited.put("SystemRoot", "C:\\Windows");
+    try inherited.put("ComSpec", "C:\\Windows\\system32\\cmd.exe");
+    try inherited.put("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    // A secret the allowlist must still keep out.
+    try inherited.put("SECRET_TOKEN", "placeholder-secret");
+
+    const configs = [_]McpServerConfig{
+        .{ .name = "fs", .command = "npx", .args = &.{ "-y", "server-filesystem" } },
+    };
+    const r = try resolve(arena, &configs, &inherited, "C:\\work");
+    const environ = r.engine[0].stdio.environ_map;
+
+    try testing.expectEqualStrings("C:\\Windows\\system32", environ.get("PATH").?);
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        try testing.expectEqualStrings("C:\\Windows", environ.get("SystemRoot").?);
+        try testing.expectEqualStrings("C:\\Windows\\system32\\cmd.exe", environ.get("ComSpec").?);
+        try testing.expectEqualStrings(".COM;.EXE;.BAT;.CMD", environ.get("PATHEXT").?);
+    }
+    try testing.expect(environ.get("SECRET_TOKEN") == null);
 }
 
 test "a server's startup and operation timeouts become its engine limits" {
