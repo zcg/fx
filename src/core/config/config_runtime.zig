@@ -14,6 +14,7 @@ const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const session_store_paths = @import("../session/session_store_paths.zig");
 pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -450,7 +451,7 @@ pub fn loadProjectMcpChoicesFromHome(
     const workspaces = parsed.value.object.get("workspaces") orelse return .{};
     if (workspaces != .object) return error.InvalidSettingsFormat;
     const normalized_root = normalizeWorkspaceRoot(workspace_root);
-    const workspace = workspaces.object.get(normalized_root) orelse return .{};
+    const workspace = session_store_paths.workspaceOverride(workspaces.object, normalized_root) orelse return .{};
 
     var result: ProjectMcpChoiceLoad = .{};
     errdefer result.deinit(alloc);
@@ -642,7 +643,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         if (workspaces) |workspaces_value| {
             if (workspaces_value != .object) {
                 try diagnostics.append(alloc, .{ .layer = .user, .cause = .malformed_settings });
-            } else if (workspaces_value.object.get(workspace_root)) |workspace_value| {
+            } else if (session_store_paths.workspaceOverride(workspaces_value.object, workspace_root)) |workspace_value| {
                 if (workspace_value != .object) {
                     try diagnostics.append(alloc, .{ .layer = .user, .cause = .malformed_settings });
                 } else {
@@ -1379,7 +1380,7 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     const workspaces_val = root_value.object.get("workspaces") orelse return;
     if (workspaces_val != .object) return;
 
-    const override_val = workspaces_val.object.get(workspace_root) orelse return;
+    const override_val = session_store_paths.workspaceOverride(workspaces_val.object, workspace_root) orelse return;
     if (override_val != .object) return;
 
     var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile_workspace, true, false);
@@ -2253,11 +2254,7 @@ fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
 }
 
 fn normalizeWorkspaceRoot(workspace_root: []const u8) []const u8 {
-    var end = workspace_root.len;
-    while (end > 1 and workspace_root[end - 1] == '/') {
-        end -= 1;
-    }
-    return workspace_root[0..end];
+    return session_store_paths.normalizeWorkspaceRoot(workspace_root);
 }
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {

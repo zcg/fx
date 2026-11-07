@@ -4,6 +4,7 @@
 const std = @import("std");
 const env_settings = @import("env_settings.zig");
 const settings_keys = @import("settings_keys.zig");
+const session_store_paths = @import("../session/session_store_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -128,9 +129,9 @@ fn overriddenLater(rest: []const Entry, key: []const u8) bool {
 fn workspaceOverride(profile: std.json.ObjectMap, workspace_root: []const u8) ?std.json.ObjectMap {
     const workspaces = profile.get("workspaces") orelse return null;
     if (workspaces != .object) return null;
-    const override = workspaces.object.get(workspace_root) orelse return null;
-    if (override != .object) return null;
-    return override.object;
+    const value = session_store_paths.workspaceOverride(workspaces.object, workspace_root) orelse return null;
+    if (value != .object) return null;
+    return value.object;
 }
 
 fn appendSettings(alloc: Allocator, list: *std.ArrayList(Entry), object: std.json.ObjectMap, origin: Origin) !void {

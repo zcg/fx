@@ -15,6 +15,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const settings_keys = @import("settings_keys.zig");
+const session_store_paths = @import("../session/session_store_paths.zig");
 const theme_mod = @import("../shared/theme.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1764,9 +1765,10 @@ fn appendUniqueWorkspaceIdentity(
 fn removeWorkspaceIfEmpty(root: *std.json.Value, workspace_root: []const u8) void {
     const workspaces = root.object.getPtr("workspaces") orelse return;
     if (workspaces.* != .object) return;
-    const workspace = workspaces.object.get(workspace_root) orelse return;
+    const key = session_store_paths.findWorkspaceKey(workspaces.object, workspace_root) orelse return;
+    const workspace = workspaces.object.get(key) orelse return;
     if (workspace != .object or workspace.object.count() != 0) return;
-    _ = workspaces.object.orderedRemove(workspace_root);
+    _ = workspaces.object.orderedRemove(key);
     if (workspaces.object.count() == 0) _ = root.object.orderedRemove("workspaces");
 }
 
@@ -1788,7 +1790,7 @@ fn applyProjectMcpMutationToRoot(
     mutation: ProjectMcpMutation,
 ) !PatchApplication {
     const existing_workspace = if (root.object.get("workspaces")) |workspaces|
-        if (workspaces == .object) workspaces.object.get(mutation.workspace_root) else null
+        if (workspaces == .object) session_store_paths.workspaceOverride(workspaces.object, mutation.workspace_root) else null
     else
         null;
     var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
@@ -1847,11 +1849,13 @@ fn workspaceObject(
         try root.object.put(arena, "workspaces", .{ .object = .empty });
         break :blk root.object.getPtr("workspaces").?;
     };
-    const workspace = if (workspaces.object.getPtr(workspace_root)) |value| blk: {
+    const normalized_root = session_store_paths.normalizeWorkspaceRoot(workspace_root);
+    const workspace = if (session_store_paths.findWorkspaceKey(workspaces.object, normalized_root)) |existing_key| blk: {
+        const value = workspaces.object.getPtr(existing_key).?;
         if (value.* != .object) return error.InvalidSettingsFormat;
         break :blk value;
     } else blk: {
-        const owned_root = try arena.dupe(u8, workspace_root);
+        const owned_root = try arena.dupe(u8, normalized_root);
         try workspaces.object.put(arena, owned_root, .{ .object = .empty });
         break :blk workspaces.object.getPtr(owned_root).?;
     };
@@ -2300,7 +2304,7 @@ fn validateCandidate(
         return error.InvalidSettingsFormat;
     };
     if (workspaces != .object) return error.InvalidSettingsFormat;
-    const workspace = workspaces.object.get(workspace_root) orelse {
+    const workspace = session_store_paths.workspaceOverride(workspaces.object, workspace_root) orelse {
         if (workspace_may_be_absent) return;
         return error.InvalidSettingsFormat;
     };
