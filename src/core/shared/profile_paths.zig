@@ -59,6 +59,27 @@ pub fn fxHomeActive() bool {
     return fx_home != null;
 }
 
+/// The home directory to build profile paths from, reading the environment
+/// through `getenv`.
+///
+/// The `HOME` variable alone is not the home directory on Windows, which sets
+/// `USERPROFILE` and usually leaves `HOME` unset; reading only `HOME` there
+/// makes `fx status`, `fx usage`, and `fx mcp` stop with "HOME isn't set" on an
+/// ordinary profile. `HOME` still wins when it is set, because a user who sets
+/// it means it. `getenv` is a parameter so a command that reads its
+/// environment through a seam keeps using that seam.
+pub fn homeFromEnvironment(getenv: anytype, ctx: anytype) ?[]const u8 {
+    if (getenv(ctx, "HOME")) |home| {
+        if (home.len != 0) return home;
+    }
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        if (getenv(ctx, "USERPROFILE")) |profile| {
+            if (profile.len != 0) return profile;
+        }
+    }
+    return fxHomeParent();
+}
+
 const display_default = "~/" ++ root_dir_name;
 const display_moved = "$FX_HOME";
 
@@ -279,6 +300,34 @@ test "profile path helpers preserve current default locations" {
     const recordings = try recordingsDir(alloc, "/tmp/fake-home");
     defer alloc.free(recordings);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/recordings", recordings);
+}
+
+test "homeFromEnvironment reads HOME, then USERPROFILE on Windows" {
+    const Env = struct {
+        home: ?[]const u8 = null,
+        user_profile: ?[]const u8 = null,
+
+        fn get(self: *const @This(), _: *const @This(), name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "HOME")) return self.home;
+            if (std.mem.eql(u8, name, "USERPROFILE")) return self.user_profile;
+            return null;
+        }
+    };
+
+    var env = Env{ .home = "/home/me", .user_profile = "C:\\Users\\me" };
+    // HOME wins wherever it is set.
+    try std.testing.expectEqualStrings("/home/me", homeFromEnvironment(Env.get, &env).?);
+
+    // An empty HOME counts as unset, as it does in io.homeDir.
+    env = .{ .home = "", .user_profile = "C:\\Users\\me" };
+    const fallback = homeFromEnvironment(Env.get, &env);
+    if (comptime @import("builtin").target.os.tag == .windows) {
+        try std.testing.expectEqualStrings("C:\\Users\\me", fallback.?);
+    } else {
+        // USERPROFILE is not a home directory off Windows, so only FX_HOME's
+        // parent can name one here.
+        try std.testing.expectEqual(fxHomeParent() != null, fallback != null);
+    }
 }
 
 test "FX_HOME moves every profile path and how messages name it" {

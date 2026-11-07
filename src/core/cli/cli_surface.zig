@@ -1879,7 +1879,7 @@ fn runNonInteractiveWithDeps(
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
             snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
-            const fx_home = try profile_paths.activeRoot(alloc, io_mod.getenv("HOME"));
+            const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
             defer if (fx_home) |path| alloc.free(path);
             snapshot.fx_home = fx_home;
             if (opts.format == .json) {
@@ -2222,9 +2222,10 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return usage_failure;
             };
-            // A relative $HOME counts as unset, as everywhere else in fx, and
-            // with HOME unset FX_HOME's parent serves.
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse "";
+            // The home directory is `HOME` where it is set, and on Windows
+            // `USERPROFILE` where it is not. With neither, FX_HOME's parent
+            // serves.
+            const home = profile_paths.homeFromEnvironment(deps.getenv, deps.env_ctx) orelse "";
             if (!std.Io.Dir.path.isAbsolute(home)) {
                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
@@ -2828,8 +2829,9 @@ fn runTopLevelMcp(
 
 /// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
-    const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse {
+    // `HOME` where it is set, `USERPROFILE` on Windows where it is not, and
+    // FX_HOME's parent when neither names a home.
+    const home = profile_paths.homeFromEnvironment(deps.getenv, deps.env_ctx) orelse {
         try writeStderr(deps, "fx mcp: HOME isn't set\n");
         return .handled_failure;
     };
