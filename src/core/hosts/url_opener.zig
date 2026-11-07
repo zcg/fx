@@ -52,11 +52,20 @@ fn launchUrl(
     os_tag: std.Target.Os.Tag,
     launcher: Launcher,
 ) LaunchOutcome {
+    // Windows has no launcher executable: `start` is a cmd.exe builtin. Its
+    // first quoted argument is the window title, so an empty title keeps the
+    // URL from being read as one, and the URL itself is still split by cmd on
+    // `&`, `^`, and `|`, so those are escaped before it is handed over.
+    const windows_url = escapeForCmdStart(alloc, url) catch return .failed;
+    defer alloc.free(windows_url);
+    var windows_argv = [_][]const u8{ "cmd.exe", "/c", "start", "", windows_url };
+
     var macos_argv = [_][]const u8{ "open", url };
     var linux_argv = [_][]const u8{ "xdg-open", url };
     const argv: []const []const u8 = switch (os_tag) {
         .macos => &macos_argv,
         .linux => &linux_argv,
+        .windows => &windows_argv,
         else => return .unsupported,
     };
 
@@ -71,6 +80,26 @@ fn launchUrl(
 
     logUnsuccessfulTerm(result.term);
     return .failed;
+}
+
+/// Escapes a URL for the `cmd.exe /c start` argv.
+///
+/// cmd reads `&`, `^`, `|`, `<`, and `>` as operators even inside an argument,
+/// so a URL carrying a query string (`?a=1&b=2`) would be cut at the `&` and
+/// the rest run as a second command. Each one is prefixed with `^`, which is
+/// cmd's own escape. A percent sign is left alone: `start` passes the URL to
+/// the shell's URL handler, not back through cmd.
+fn escapeForCmdStart(alloc: Allocator, url: []const u8) Allocator.Error![]u8 {
+    var escaped: std.ArrayList(u8) = .empty;
+    errdefer escaped.deinit(alloc);
+    for (url) |byte| {
+        switch (byte) {
+            '&', '^', '|', '<', '>', '(', ')', '"' => try escaped.append(alloc, '^'),
+            else => {},
+        }
+        try escaped.append(alloc, byte);
+    }
+    return escaped.toOwnedSlice(alloc);
 }
 
 fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
@@ -116,13 +145,33 @@ test "url opener selects the platform launcher argv" {
     defer linux.deinit(alloc);
     try std.testing.expectEqual(LaunchOutcome.opened, launchUrl(alloc, "http://localhost:3000", .linux, linux.launcher()));
     try std.testing.expectEqualStrings("xdg-open http://localhost:3000", linux.argv_joined.items);
+
+    var windows = MockLauncher{};
+    defer windows.deinit(alloc);
+    try std.testing.expectEqual(LaunchOutcome.opened, launchUrl(alloc, "http://localhost:3000", .windows, windows.launcher()));
+    try std.testing.expectEqualStrings("cmd.exe /c start  http://localhost:3000", windows.argv_joined.items);
+}
+
+test "the Windows launcher escapes cmd operators in the URL" {
+    const alloc = std.testing.allocator;
+    var mock = MockLauncher{};
+    defer mock.deinit(alloc);
+    try std.testing.expectEqual(
+        LaunchOutcome.opened,
+        launchUrl(alloc, "http://localhost:3000/cb?a=1&b=2", .windows, mock.launcher()),
+    );
+    // The `&` is escaped, so cmd cannot read the rest as a second command.
+    try std.testing.expectEqualStrings(
+        "cmd.exe /c start  http://localhost:3000/cb?a=1^&b=2",
+        mock.argv_joined.items,
+    );
 }
 
 test "url opener reports unsupported platforms without launching" {
     const alloc = std.testing.allocator;
     var mock = MockLauncher{};
     defer mock.deinit(alloc);
-    try std.testing.expectEqual(LaunchOutcome.unsupported, launchUrl(alloc, "http://x", .windows, mock.launcher()));
+    try std.testing.expectEqual(LaunchOutcome.unsupported, launchUrl(alloc, "http://x", .wasi, mock.launcher()));
     try std.testing.expectEqualStrings("", mock.argv_joined.items);
 }
 
