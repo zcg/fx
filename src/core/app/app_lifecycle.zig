@@ -202,6 +202,9 @@ pub const StartupState = struct {
     yolo_acknowledged: bool = false,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize,
+    /// The bound a subagent turn gets. A configured `max_agent_steps` wins;
+    /// otherwise children stay finite even though main does not.
+    subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
     /// How many subagents main may run at once, 1 to 16; a subagent never
     /// starts one of its own (`subagent.max_subagent_depth`).
     subagent_max_children: usize = agent_steps.default_subagent_max_children,
@@ -232,6 +235,9 @@ pub const StartupState = struct {
     /// Resolved review-model override for automatic permission review. Owned;
     /// empty keeps the reviewer's compiled default.
     review_model: []u8 = &.{},
+    /// The level the review model is asked for; `.auto` leaves it to that
+    /// model.
+    review_effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -263,7 +269,11 @@ pub const StartupState = struct {
             alloc.free(self.config_diagnostics);
         }
         if (self.theme) |value| alloc.free(value);
-        self.* = .{ .agent_step_limit = self.agent_step_limit, .subagent_max_children = self.subagent_max_children };
+        self.* = .{
+            .agent_step_limit = self.agent_step_limit,
+            .subagent_agent_step_limit = self.subagent_agent_step_limit,
+            .subagent_max_children = self.subagent_max_children,
+        };
     }
 
     pub fn takeWorkspaceRoot(self: *StartupState) []u8 {
@@ -413,6 +423,9 @@ pub const StartupStatus = struct {
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
     agent_step_limit: usize,
+    /// The bound a subagent turn gets. A configured `max_agent_steps` wins;
+    /// otherwise children stay finite even though main does not.
+    subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
     /// How many subagents a session may run at once; a subagent never starts
     /// one of its own.
     subagent_max_children: usize = agent_steps.default_subagent_max_children,
@@ -691,6 +704,7 @@ pub fn loadStartupStatusWithAuthMode(
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
+        .subagent_agent_step_limit = loadSubagentAgentStepLimit(settings.subagent_max_agent_steps),
         .subagent_max_children = agent_steps.resolveSubagentMaxChildren(settings.subagent_max_children),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
@@ -908,6 +922,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
     state.agent_step_limit = loadAgentStepLimit(state.agent_step_limit, settings.max_agent_steps);
+    state.subagent_agent_step_limit = loadSubagentAgentStepLimit(settings.subagent_max_agent_steps);
     state.subagent_max_children = agent_steps.resolveSubagentMaxChildrenWithOverride(settings.subagent_max_children);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
@@ -935,6 +950,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
+    state.review_effort = settings.review_effort orelse .auto;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.provider_strict = settings.provider_strict orelse false;
     if (settings.provider_order) |order| {
@@ -1757,6 +1773,15 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
         fallback,
         io_mod.getenv("FX_MAX_AGENT_STEPS"),
     );
+}
+
+/// A subagent run's own bound, separate from main's `max_agent_steps` and
+/// from `FX_MAX_AGENT_STEPS`. A child exists to be stopped, inspected, and
+/// continued by its parent, so its bound is its own setting; main's step
+/// setting never narrows or widens it.
+fn loadSubagentAgentStepLimit(configured: ?usize) usize {
+    return agent_steps.parseMaxAgentSteps(io_mod.getenv("FX_SUBAGENT_MAX_AGENT_STEPS")) orelse
+        agent_steps.resolveSubagentMaxAgentSteps(configured);
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {

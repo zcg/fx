@@ -357,6 +357,10 @@ pub const ProviderInput = struct {
     /// Resolved review-model override (`review_model` setting or
     /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
     reviewer_model: []const u8 = "",
+    /// Reasoning effort for the reviewer (`review_effort` setting or
+    /// FX_REVIEW_EFFORT). `.auto` leaves the level to the reviewer's model, so
+    /// a deployment that never sets it sends exactly what it sent before.
+    reviewer_effort: types.ReasoningEffort = .auto,
     cancel_flag: ?*std.atomic.Value(bool) = null,
 };
 

@@ -46,10 +46,34 @@ pub const Kind = union(enum) {
     one_off,
     persistent: PersistentIdentity,
 };
-pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
+pub const Phase = enum {
+    idle,
+    running,
+    awaiting_approval,
+    interrupted,
+    finished,
+
+    /// Whether a child in this phase holds one of main's slots. A child that
+    /// is idle, interrupted, or finished holds none: it has no running turn
+    /// and can start one later without a new admission. Only a turn in flight
+    /// counts against `subagent_max_children`, so a session that stopped
+    /// several children can start new ones.
+    pub fn isActive(self: Phase) bool {
+        return switch (self) {
+            .running, .awaiting_approval => true,
+            .idle, .interrupted, .finished => false,
+        };
+    }
+};
 /// `lost`: the work never reached the child's log before a crash; only a
 /// v2 parent's reopen repair records it (D33).
-pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
+///
+/// `paused`: the turn stopped with work left to do, not because it failed.
+/// Its step budget ran out, so the child's session is intact and its next
+/// turn continues the same work. A parent reads this outcome to tell
+/// "stopped for budget" from "broke", and `reports.reportable` treats it as
+/// worth reporting so that decision can be made.
+pub const Outcome = enum { completed, failed, cancelled, interrupted, lost, paused };
 
 /// Why a work ended cancelled, when fx knows: the user stopped its turn,
 /// or fx quit while it ran.
@@ -258,6 +282,17 @@ pub const Registry = struct {
             if (std.mem.eql(u8, child.id, child_id)) return child;
         }
         return null;
+    }
+
+    /// How many children hold one of main's slots: those whose phase is
+    /// active. A stopped, finished, or idle child holds none, so main can
+    /// start another one after stopping a child that is done working.
+    pub fn activeCount(self: Registry) usize {
+        var count: usize = 0;
+        for (self.children) |child| {
+            if (child.phase.isActive()) count += 1;
+        }
+        return count;
     }
 
     /// Records the profile a new child started in. A child keeps it for life.
@@ -838,7 +873,9 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         .kind = kind,
         .profile = profile,
         .phase = switch (last_outcome) {
-            .interrupted, .lost => .interrupted,
+            // A paused child keeps its session, so it reads as interrupted:
+            // its next turn can continue the work the budget cut short.
+            .interrupted, .lost, .paused => .interrupted,
             .completed, .failed, .cancelled => switch (kind) {
                 .one_off => .finished,
                 .persistent => .idle,
@@ -912,7 +949,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
             .completed => .ok,
             .failed => .failed,
             .cancelled => .cancelled,
-            .interrupted, .lost => .interrupted,
+            .interrupted, .lost, .paused => .interrupted,
         };
         const failure = if (outcome == .failed) if (child.last_failure) |value| value.view() else null else null;
         try lines.append(arena, .{ .spawned = .{
@@ -963,7 +1000,11 @@ fn v2Outcome(outcome: Outcome) !session_adapter.ChildOutcome {
         .completed => .ok,
         .failed => .failed,
         .cancelled => .cancelled,
-        .interrupted => .interrupted,
+        // The session log's own vocabulary has no `paused`; a child that ran
+        // out of budget is recorded as interrupted, which is also the phase
+        // that lets its parent continue it. The in-memory outcome and the
+        // parent's report keep the exact reason.
+        .interrupted, .paused => .interrupted,
         .lost => error.InvalidState,
     };
 }

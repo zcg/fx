@@ -1612,6 +1612,9 @@ pub fn Runtime(comptime App: type) type {
             // its feedback, and the reviewer judges it against the root
             // user's requests.
             const parent_run: ?*agents.ChildRun = if (child_run) |run| (if (run.startedByParent()) run else null) else null;
+            // A child's own run stays bounded even when main's is not: nobody
+            // watches its screen, so `subagent_max_agent_steps` caps it.
+            const step_limit: usize = if (child_run != null) app.subagent_agent_step_limit else app.agent_step_limit;
             return .{
                 .system_prompt = if (child_run) |run|
                     if (run.system_prompt.len > 0) run.system_prompt else prompt_policy.system_prompt
@@ -1639,7 +1642,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,
-                .agent_step_limit = app.agent_step_limit,
+                .agent_step_limit = step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &agent.worker.worker_cancel_requested,

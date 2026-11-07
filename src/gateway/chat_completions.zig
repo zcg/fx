@@ -153,6 +153,16 @@ fn build_responses_request(
         try writer.writeAll(",\"max_output_tokens\":");
         try writer.print("{d}", .{max});
     }
+    // A chosen reasoning level is part of the request, not only of the status
+    // line: without this field the endpoint reasons at its own default and the
+    // level the user picked never reaches the provider.
+    if (request.provider_options.reasoning) |effort| {
+        if (!effort.isDefault()) {
+            try writer.writeAll(",\"reasoning\":{\"effort\":");
+            try std.json.Stringify.value(effort.label(), .{}, writer);
+            try writer.writeByte('}');
+        }
+    }
     try writer.writeAll("}");
     return out.toOwnedSlice();
 }
@@ -377,6 +387,43 @@ const configured_stream_limits = responses.StreamLimits{
     .provider_state_bytes = types.ProviderReplay.max_bytes,
     .omit_conflicting_reasoning = true,
 };
+
+test "configured Responses sends the chosen reasoning level" {
+    const alloc = std.testing.allocator;
+    const definition = definitions.Definition{
+        .id = "local",
+        .protocol = .@"openai-responses",
+        .base_url = "http://localhost:1234/v1",
+        .auth = .none,
+    };
+
+    const automatic = try build_for(&definition, alloc, .{
+        .model = "test-model",
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+        .tool_choice = .auto,
+        .provider_options = .{ .reasoning = .auto },
+    });
+    defer alloc.free(automatic);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, automatic, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("reasoning") == null);
+    }
+
+    const chosen = try build_for(&definition, alloc, .{
+        .model = "test-model",
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+        .tool_choice = .auto,
+        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") },
+    });
+    defer alloc.free(chosen);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, chosen, .{});
+        defer parsed.deinit();
+        const reasoning = parsed.value.object.get("reasoning").?;
+        try std.testing.expectEqualStrings("high", reasoning.object.get("effort").?.string);
+    }
+}
 
 test "configured Responses replays tool arguments larger than 256 KiB and omits disabled tools" {
     const alloc = std.testing.allocator;

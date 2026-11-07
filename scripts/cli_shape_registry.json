@@ -17,6 +17,10 @@
       "job": "diagnostics",
       "stability": "internal"
     },
+    "FX_BOOT_LOG": {
+      "job": "diagnostics",
+      "stability": "internal"
+    },
     "FX_CONFIGURED_PROVIDERS": {
       "job": "setting-override",
       "stability": "internal"
@@ -105,7 +109,19 @@
       "job": "diagnostics",
       "stability": "stable"
     },
+    "FX_REVIEW_EFFORT": {
+      "job": "setting-override",
+      "stability": "stable"
+    },
     "FX_REVIEW_MODEL": {
+      "job": "setting-override",
+      "stability": "stable"
+    },
+    "FX_SUBAGENT_MAX_CHILDREN": {
+      "job": "setting-override",
+      "stability": "stable"
+    },
+    "FX_SUBAGENT_MAX_AGENT_STEPS": {
       "job": "setting-override",
       "stability": "stable"
     },
@@ -355,6 +371,8 @@
     "HERDR_PANE_ID",
     "HERDR_SOCKET_PATH",
     "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
     "LANG",
     "NO_COLOR",
     "PATH",

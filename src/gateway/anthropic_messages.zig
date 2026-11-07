@@ -172,11 +172,37 @@ fn append_function(
     });
 }
 
+/// The thinking token budget Anthropic needs for a chosen level, or null when
+/// the level is the model default. Anthropic has no `reasoning_effort` field:
+/// a request either enables extended thinking with a budget or leaves it off.
+fn thinkingBudget(effort: types.ReasoningEffort) ?u32 {
+    if (effort.isDefault()) return null;
+    const label = effort.label();
+    if (std.mem.eql(u8, label, "none")) return null;
+    if (std.mem.eql(u8, label, "minimal")) return 1024;
+    if (std.mem.eql(u8, label, "low")) return 2048;
+    if (std.mem.eql(u8, label, "medium")) return 8192;
+    // high, xhigh, max, and any tier this build does not know reason hardest.
+    return 16384;
+}
+
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: streams.RequestData, functions: []const Function, options: Options) !void {
-    const max_tokens = @min(request.max_output_tokens orelse default_max_tokens, max_tokens_ceiling);
+    const thinking_budget = thinkingBudget(request.provider_options.reasoning orelse .auto);
+    // Extended thinking counts against max_tokens, so the cap has to leave room
+    // for the budget plus the answer.
+    const requested_max = request.max_output_tokens orelse default_max_tokens;
+    const max_tokens = @min(
+        if (thinking_budget) |budget| @max(requested_max, budget + default_max_tokens) else requested_max,
+        max_tokens_ceiling,
+    );
     try writer.writeAll("{\"model\":");
     try writeJsonString(writer, request.model);
     try writer.print(",\"max_tokens\":{d}", .{max_tokens});
+    if (thinking_budget) |budget| {
+        try writer.writeAll(",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
+        try writer.print("{d}", .{@min(budget, max_tokens_ceiling -| 1)});
+        try writer.writeAll("}");
+    }
 
     // The system prompt is a top-level field and is kept out of the turn list.
     if (request.instructions.len > 0) {

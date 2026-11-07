@@ -239,12 +239,18 @@ pub const Owner = struct {
 
     /// Whether one more child would still be within `max_running`. Admission
     /// asks before it records a new child, so a refused call leaves no child
-    /// behind that never ran.
+    /// behind that never ran. Only slots still working count: a finished
+    /// slot that waits to be reaped holds no permit, so a session that
+    /// stopped its children can start new ones.
     pub fn hasCapacity(self: *Owner) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.closed) return false;
-        return self.slots.items.len < self.max_running;
+        var running: usize = 0;
+        for (self.slots.items) |slot| {
+            if (slot.completion == .running) running += 1;
+        }
+        return running < self.max_running;
     }
 
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
@@ -281,8 +287,14 @@ pub const Owner = struct {
                 }
                 // New child: this slot is the permit. A session that already
                 // runs `max_running` children starts none more, so the thread
-                // count follows the setting and not the calls.
-                if (self.slots.items.len >= self.max_running) return error.TooManyChildren;
+                // count follows the setting and not the calls. Only slots
+                // still working hold a permit; a finished slot waits for its
+                // own reap and never blocks a new child.
+                var running: usize = 0;
+                for (self.slots.items) |slot| {
+                    if (slot.completion == .running) running += 1;
+                }
+                if (running >= self.max_running) return error.TooManyChildren;
                 const slot = try self.alloc.create(Slot);
                 errdefer self.alloc.destroy(slot);
                 slot.* = .{
@@ -425,6 +437,27 @@ pub const Owner = struct {
             return true;
         }
         return false;
+    }
+
+    /// Removes a child whose slot already finished, so its next work starts a
+    /// fresh slot instead of reusing the retired one, and its thread is
+    /// joined now rather than at shutdown. Returns whether a slot was
+    /// removed; one still running, or one a caller is waiting on, is left
+    /// for its own reap.
+    pub fn reapSlot(self: *Owner, child_id: []const u8) bool {
+        const slot = blk: {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            for (self.slots.items, 0..) |candidate, index| {
+                if (!std.mem.eql(u8, candidate.child_id, child_id)) continue;
+                if (candidate.completion == .running) return false;
+                if (candidate.waiters != 0) return false;
+                break :blk self.slots.swapRemove(index);
+            }
+            return false;
+        };
+        destroySlot(self, slot);
+        return true;
     }
 
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
@@ -837,7 +870,11 @@ fn runOne(slot: *Slot) OneOutcome {
         .work_id = work_id,
         .outcome = switch (result) {
             .completed => .completed,
-            .awaiting_approval, .paused => .interrupted,
+            // A turn that paused keeps its work; a failure inside it must not
+            // read as "the turn is still running". The child's parent decides
+            // whether to continue it, so it is reported as paused.
+            .paused => .paused,
+            .awaiting_approval => .interrupted,
         },
     };
 }

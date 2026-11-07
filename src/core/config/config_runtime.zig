@@ -54,6 +54,9 @@ pub const Settings = struct {
     /// How many subagents main may run at once, 1 to 16. Profile-only: how
     /// much fan-out a machine affords is the user's, not a project's.
     subagent_max_children: ?usize = null,
+    /// Most steps in one subagent run. Profile-only, and separate from
+    /// `max_agent_steps`, which bounds only a turn the user typed.
+    subagent_max_agent_steps: ?usize = null,
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
@@ -78,6 +81,9 @@ pub const Settings = struct {
     /// Optional review-model override for automatic permission review. Owned by
     /// this Settings; freed in deinit. Null keeps the provider's default.
     review_model: ?[]const u8 = null,
+    /// Reasoning effort for the review model. Null leaves its level alone, so
+    /// an existing profile sends exactly what it sent before this existed.
+    review_effort: ?types.ReasoningEffort = null,
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
@@ -1707,6 +1713,21 @@ fn parseProfileOnlyFields(
     parse_workspace_statusline: bool,
 ) !void {
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
+    if (root.object.get("subagent_max_agent_steps")) |value| {
+        if (value != .integer) return error.InvalidSubagentMaxAgentStepsType;
+        if (value.integer < 0) return error.InvalidSubagentMaxAgentStepsValue;
+        settings.subagent_max_agent_steps = std.math.cast(usize, value.integer) orelse return error.InvalidSubagentMaxAgentStepsValue;
+    }
+    // How much fan-out a machine affords is the user's choice, not a
+    // project's: a committed file must not raise it.
+    if (root.object.get("subagent_max_children")) |value| {
+        if (value != .integer) return error.InvalidSubagentMaxChildrenType;
+        const steps = std.math.cast(usize, value.integer) orelse return error.InvalidSubagentMaxChildrenValue;
+        if (steps < agent_steps.min_subagent_max_children or steps > agent_steps.max_subagent_max_children) {
+            return error.InvalidSubagentMaxChildrenValue;
+        }
+        settings.subagent_max_children = steps;
+    }
     if (root.object.get("auto_compact_percent")) |value| {
         if (value != .integer) return error.InvalidAutoCompactPercentType;
         if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
@@ -1804,6 +1825,18 @@ fn parseProfileOnlyFields(
                 return error.InvalidReviewModelValue;
             };
             settings.review_model = try alloc.dupe(u8, trimmed);
+        }
+    }
+
+    if (root.object.get("review_effort")) |review_effort_value| {
+        const value = review_effort_value;
+        if (value != .string) return error.InvalidReviewEffortType;
+        const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
+        if (trimmed.len > 0) {
+            settings.review_effort = types.ReasoningEffort.parseDisplayLabel(trimmed) orelse {
+                debug_trace.logf("core", "ignoring invalid review_effort value", .{});
+                return error.InvalidReviewEffortValue;
+            };
         }
     }
 
@@ -2028,16 +2061,6 @@ fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.
         settings.provider_strict = strict_value.bool;
     }
 
-    if (root.object.get("subagent_max_children")) |subagent_max_children_value| {
-        const value = subagent_max_children_value;
-        if (value != .integer) return error.InvalidSubagentMaxChildrenType;
-        const steps = std.math.cast(usize, value.integer) orelse return error.InvalidSubagentMaxChildrenValue;
-        if (steps < agent_steps.min_subagent_max_children or steps > agent_steps.max_subagent_max_children) {
-            return error.InvalidSubagentMaxChildrenValue;
-        }
-        settings.subagent_max_children = steps;
-    }
-
     if (root.object.get("max_agent_steps")) |max_agent_steps_value| {
         const value = max_agent_steps_value;
         if (value != .integer) return error.InvalidMaxAgentStepsType;
@@ -2073,6 +2096,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     if (incoming.subagent_max_children) |value| target.subagent_max_children = value;
+    if (incoming.subagent_max_agent_steps) |value| target.subagent_max_agent_steps = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
@@ -2113,6 +2137,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         target.review_model = value;
         incoming.review_model = null;
     }
+    if (incoming.review_effort) |value| target.review_effort = value;
 
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;

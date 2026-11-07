@@ -1003,7 +1003,9 @@ pub fn Commands(comptime App: type) type {
         }
 
         /// Names the effort now in use, as `/model` names the model it
-        /// switched to. A running turn keeps the effort it started with.
+        /// switched to. A running turn keeps the effort it started with, so
+        /// the notice says the next turn uses the new level rather than
+        /// promising something this turn will not do.
         fn announceEffortSelection(app: *App, agent: *AppAgent) !void {
             const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
             const prefix: []const u8 = if (active_response) "Next turn will use reasoning effort " else "Reasoning effort set to ";

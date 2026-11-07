@@ -280,8 +280,15 @@ pub fn reasoningEffortAtIndex(capabilities: Capabilities, index: usize) types.Re
 
 pub fn reasoningEffortLabelAtIndex(capabilities: *const Capabilities, index: usize) []const u8 {
     if (index == 0) return "default";
-    const levels = effectiveReasoningEfforts(capabilities.*);
-    return levels.values[(index - 1) % levels.len].displayLabel();
+    // Borrow from storage the caller can keep, never from the temporary
+    // `ReasoningEffortOptions` a by-value call returns: `displayLabel` slices
+    // into the level itself, so a temporary's label dangles on return.
+    if (capabilities.reasoning_efforts.len > 0) {
+        const levels = &capabilities.reasoning_efforts;
+        return levels.values[(index - 1) % levels.len].displayLabel();
+    }
+    const fallbacks: []const types.ReasoningEffort = &standard_reasoning_efforts;
+    return fallbacks[(index - 1) % fallbacks.len].displayLabel();
 }
 
 pub fn reasoningEffortOptionCount(capabilities: Capabilities) usize {

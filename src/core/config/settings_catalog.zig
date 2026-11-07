@@ -35,6 +35,7 @@ pub const SettingId = enum {
     fast_mode,
     ultrafast_mode,
     permission_mode,
+    max_subagents,
     sound_level,
     startup_scrollback,
     prompt_history,
@@ -56,6 +57,9 @@ pub const Snapshot = struct {
     ultrafast_mode: bool = false,
     supports_ultrafast_mode: bool = false,
     permission_mode: []const u8 = "ask",
+    /// The configured `subagent_max_children`, 0 to 16. The menu shows it as
+    /// a number through `maxSubagentsLabel`.
+    max_subagents: u8 = 4,
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
@@ -73,6 +77,7 @@ pub const Snapshot = struct {
             .fast_mode => onOff(self.fast_mode),
             .ultrafast_mode => onOff(self.ultrafast_mode),
             .permission_mode => if (std.mem.eql(u8, self.permission_mode, "yolo")) "full access" else self.permission_mode,
+            .max_subagents => maxSubagentsLabel(self.max_subagents),
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
@@ -270,6 +275,7 @@ const specs = [_]Spec{
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
     .{ .id = .ultrafast_mode, .category = .agent, .label = "Ultra mode", .description = "Request the highest-speed mode when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
+    .{ .id = .max_subagents, .category = .agent, .label = "Max subagents", .description = "How many subagents may work at once; 0 turns subagents off" },
     .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
@@ -279,6 +285,23 @@ const specs = [_]Spec{
 const on_off_options = [_][]const u8{ "off", "on" };
 const permission_options = [_][]const u8{ "ask", "auto", "full access" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
+const subagent_options = [_][]const u8{
+    "0", "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
+    "9", "10", "11", "12", "13", "14", "15", "16",
+};
+
+/// One `subagent_max_children` label, from a value in 0 to 16.
+fn maxSubagentsLabel(value: u8) []const u8 {
+    return subagent_options[@min(value, subagent_options.len - 1)];
+}
+
+/// Parses a `subagent_max_children` label back into its number.
+pub fn parseMaxSubagents(value: []const u8) ?u8 {
+    for (subagent_options, 0..) |option, index| {
+        if (std.mem.eql(u8, option, value)) return @intCast(index);
+    }
+    return null;
+}
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
     return settingsFilter(snapshot, category, query).count();
@@ -306,10 +329,22 @@ pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
 
 pub fn optionAt(snapshot: *const Snapshot, id: SettingId, index: usize) ?[]const u8 {
     if (id == .effort) {
-        if (index >= optionCount(snapshot, id)) return null;
+        const count = optionCount(snapshot, id);
+        if (index >= count) return null;
         if (index == 0) return "default";
-        const levels = model_capabilities.effectiveReasoningEfforts(.{ .reasoning_efforts = snapshot.reasoning_efforts });
-        return levels.values[index - 1].displayLabel();
+        // The label borrows from the snapshot or from the comptime constant,
+        // never from a temporary `ReasoningEffortOptions`: `displayLabel` hands
+        // back a slice into the level it is called on, and a temporary dies
+        // when `optionAt` returns, leaving the caller a dangling slice.
+        const standard_offset = index - 1;
+        if (standard_offset < snapshot.reasoning_efforts.len) {
+            const level: *const types.ReasoningEffort = &snapshot.reasoning_efforts.values[standard_offset];
+            return level.displayLabel();
+        }
+        const fallback_offset = standard_offset - snapshot.reasoning_efforts.len;
+        if (fallback_offset >= model_capabilities.standard_reasoning_efforts.len) return null;
+        const fallback: *const types.ReasoningEffort = &model_capabilities.standard_reasoning_efforts[fallback_offset];
+        return fallback.displayLabel();
     }
     if (index >= optionCount(snapshot, id)) return null;
     const options = staticOptionsFor(id);
@@ -361,6 +396,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         => &on_off_options,
         .sound_level => &sound_level_options,
         .permission_mode => &permission_options,
+        .max_subagents => &subagent_options,
     };
 }
 
@@ -534,6 +570,56 @@ test "settings menu navigates rows and changes selected values inline" {
 
     menu.openWithStartupScrollback(false);
     try std.testing.expect(!menu.startup_scrollback);
+}
+
+test "effort options survive the menu that reads them" {
+    const declared = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("none"),
+        types.ReasoningEffort.literal("minimal"),
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("medium"),
+        types.ReasoningEffort.literal("high"),
+    };
+
+    // A model that declares its own levels labels them from the declaration.
+    const declared_snapshot: Snapshot = .{
+        .model = "auto/deepseek-v4.1-flash",
+        .effort = "high",
+        .reasoning_efforts = .fromSlice(&declared),
+    };
+    var menu: Menu = .{};
+    menu.open();
+    menu.category = .agent;
+
+    const declared_count = optionCount(&declared_snapshot, .effort);
+    try std.testing.expectEqual(@as(usize, 6), declared_count);
+    var index: usize = 0;
+    while (index < declared_count) : (index += 1) {
+        const option = optionAt(&declared_snapshot, .effort, index).?;
+        try std.testing.expectEqualStrings(
+            if (index == 0) "default" else declared[index - 1].label(),
+            option,
+        );
+        // The value a menu row shows is also the value the menu applies, so a
+        // label that cannot be read back would silently refuse the change.
+        try std.testing.expect(types.ReasoningEffort.parseDisplayLabel(option) != null);
+    }
+    try std.testing.expectEqualStrings("high", optionAt(&declared_snapshot, .effort, 5).?);
+
+    // A model that declares no levels still offers the standard set, byte for
+    // byte, which is what a caller may keep after `optionAt` returns.
+    const standard_snapshot: Snapshot = .{ .model = "auto/deepseek-v4.1-flash" };
+    const standard_count = optionCount(&standard_snapshot, .effort);
+    try std.testing.expectEqual(model_capabilities.standard_reasoning_efforts.len + 1, standard_count);
+    const first_standard = optionAt(&standard_snapshot, .effort, 1).?;
+    try std.testing.expectEqualStrings("none", first_standard);
+    var copy: [8]u8 = undefined;
+    @memcpy(copy[0..first_standard.len], first_standard);
+    try std.testing.expectEqualStrings("none", copy[0..first_standard.len]);
+    try std.testing.expectEqualStrings(
+        "max",
+        optionAt(&standard_snapshot, .effort, standard_count - 1).?,
+    );
 }
 
 test "notification level keeps the existing off on and max policy" {

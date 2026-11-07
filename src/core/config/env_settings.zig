@@ -81,6 +81,14 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
             } else |_| {}
         }
     }
+    if (getenv("FX_REVIEW_EFFORT")) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (types.ReasoningEffort.parseDisplayLabel(trimmed)) |effort| {
+                try list.append(arena, .{ .variable = "FX_REVIEW_EFFORT", .key = "review_effort", .value = .{ .string = effort.label() } });
+            }
+        }
+    }
     if (getenv("FX_PROVIDER_ORDER")) |raw| {
         switch (config_runtime.parseProviderOrderList(arena, raw)) {
             .ok => |maybe_order| if (maybe_order) |order| {

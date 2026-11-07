@@ -9288,6 +9288,7 @@ fn processQueuedPromptLoop(
                     stop_state,
                     &finish_trace,
                     try emptyReplyNotice(arena, provider_reason, empty_reply_follow_up),
+                    .failed,
                     "empty_reply",
                 );
                 return;
@@ -12018,6 +12019,7 @@ fn processQueuedPromptLoop(
                 stop_state,
                 &finish_trace,
                 repeated_malformed_arguments_notice,
+                .failed,
                 "repeated_malformed_tool_arguments",
             );
             return;
@@ -12040,6 +12042,7 @@ fn processQueuedPromptLoop(
                 stop_state,
                 &finish_trace,
                 repeated_terminal_validation_notice,
+                .failed,
                 "terminal_validation_retry",
             );
             return;
@@ -12069,6 +12072,7 @@ fn processQueuedPromptLoop(
                 stop_state,
                 &finish_trace,
                 repeated_shell_execution_failure_notice,
+                .failed,
                 "repeated_shell_execution_failure",
             );
             return;
@@ -12237,6 +12241,10 @@ fn processQueuedPromptLoop(
         stop_state,
         &finish_trace,
         config.step_limit_notice,
+        // An exhausted step budget is not a failure: the work it finished is
+        // intact and its session can take another turn. A parent reads
+        // `paused` and decides whether to continue the child.
+        .paused,
         "step_limit",
     );
 }
@@ -12251,6 +12259,7 @@ fn finishFailedTurnWithNotice(
     stop_state: *CommonStopState,
     finish_trace: *PromptFinishTrace,
     notice: []const u8,
+    outcome: types.TurnPresentationOutcome,
     trace_outcome: []const u8,
 ) !void {
     try deps.push_text(deps.ctx, .{ .operational = notice });
@@ -12270,7 +12279,7 @@ fn finishFailedTurnWithNotice(
             current_turn_messages,
             summary_accumulator,
             assistant_text,
-            .failed,
+            outcome,
             null,
             finish_trace,
             trace_outcome,
@@ -12290,7 +12299,7 @@ fn finishFailedTurnWithNotice(
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
-    try finalization.finish(.failed, null, .{
+    try finalization.finish(outcome, null, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
         .summary = completed_summary,
     });

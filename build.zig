@@ -91,18 +91,17 @@ pub fn build(b: *std.Build) void {
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
     session_manager.sanitize_thread = sanitize_thread;
 
-    // On Windows a running `fx.exe` cannot be replaced. The name this build
-    // always writes is `fx-dev.exe`, which a running `fx.exe` never holds, so
+    // On Windows a running `fx.exe` cannot be replaced, so a development
+    // build writes `fx-dev.exe`, which a running `fx.exe` never holds, and
     // the develop-run-rebuild loop keeps working
-    // (docs/audit/2026-11-06-full-review.md section 5.2). `fx.exe` is refreshed
-    // only as a convenience for a fresh checkout; a build while fx is open
-    // keeps the running copy and still succeeds.
-    if (target.result.os.tag == .windows) {
+    // (docs/audit/2026-11-06-full-review.md section 5.2). A release build has
+    // no running dev copy to protect, so it writes `fx.exe` like every other
+    // platform: the suffix marks a development build, and a release never
+    // carries it.
+    if (target.result.os.tag == .windows and optimize == .debug) {
         exe.name = "fx-dev";
-        b.installArtifact(exe);
-    } else {
-        b.installArtifact(exe);
     }
+    b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

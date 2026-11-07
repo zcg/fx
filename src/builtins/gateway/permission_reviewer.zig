@@ -37,6 +37,8 @@ const GatewayConfig = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     stream_ctx: *anyopaque = @ptrCast(&default_stream_ctx),
     stream_fn: StreamFn = streamGatewayReviewer,
+    /// The level `buildGatewayReview` asks the reviewer's model to reason at.
+    effort: types.ReasoningEffort = .auto,
 };
 
 pub const provider = permission_auto_classifier.Provider{ .review_fn = reviewGateway };
@@ -63,6 +65,7 @@ fn reviewGateway(
         .team = input.tenant,
         .chat_url = input.endpoint,
         .cancel_flag = input.cancel_flag,
+        .effort = input.reviewer_effort,
     }, alloc, request, selected);
 }
 
@@ -86,7 +89,7 @@ fn reviewGatewayConfig(
 }
 
 fn buildGatewayReview(
-    _: *anyopaque,
+    raw: *anyopaque,
     alloc: Allocator,
     model: []const u8,
     tools_json: []const u8,
@@ -96,6 +99,7 @@ fn buildGatewayReview(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
+    const config: *const GatewayConfig = @ptrCast(@alignCast(raw));
     // No later request shares a review's prefix: the review data sits inside
     // the policy instructions. A cache write would only add its premium.
     return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
@@ -105,6 +109,7 @@ fn buildGatewayReview(
         messages,
         target_call_id,
         .{
+            .reasoning = if (config.effort.isDefault()) null else config.effort,
             .skip_cache_writes = vercel_model_policy.takesPromptCacheOptions(model),
             .single_system_message = vercel_model_policy.singleSystemMessage(model),
         },

@@ -37,6 +37,7 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
+const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const info_panel = @import("../input/info_panel.zig");
 const usage = @import("../../usage/usage.zig");
 const usage_host = @import("usage_host.zig");
@@ -3474,6 +3475,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
         snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app)).mode);
+    if (comptime @hasField(App, "subagent_max_children")) snapshot.max_subagents = @intCast(@min(app.subagent_max_children, 16));
     if (comptime @hasField(App, "input_runtime")) {
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
@@ -3622,6 +3624,41 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             }
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, agents.screenAgentOf(app), change.value),
+        .max_subagents => {
+            const children = settings_catalog.parseMaxSubagents(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .subagent_max_children = children });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| try session_commands.reportUserSettingsFailure(
+                    app,
+                    "max subagents",
+                    failure.err,
+                    failure.cleanup,
+                    false,
+                ),
+                .outcome => {},
+            }
+            const runtime_changed = children != app.subagent_max_children;
+            if (runtime_changed) {
+                app.subagent_max_children = children;
+                const ChangeApp = @TypeOf(app.*);
+                if (comptime agents.hasAgentField(ChangeApp, "session_persistence")) {
+                    if (app_session_runtime.Runtime(ChangeApp).ownSubagentHost(agents.screenAgentOf(app))) |subagent_host| {
+                        subagent_host.setMaxChildren(children);
+                    }
+                }
+                // Main's prompt says how many it may run, so it is rebuilt
+                // from the same number the tool enforces.
+                if (comptime @hasField(ChangeApp, "subagent_prompt_guidance")) {
+                    app.subagent_prompt_guidance = subagent_agent_adapter.mainSubagentGuidance(
+                        app.alloc,
+                        .{ .max_children = children },
+                    ) catch app.subagent_prompt_guidance;
+                }
+                app.shell.render_requests.request(.footer);
+            }
+        },
         .sound_level => try handleNotificationsCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;

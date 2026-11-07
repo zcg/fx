@@ -2952,16 +2952,20 @@ fn runReportTurns(
                 debug_trace.logf("acp", "report update not sent call_id={s} err={s}", .{ call.call_id, @errorName(err) });
             };
             // A hook client learns how the work ended, as it learned it began.
-            if (ctx.observer) |observer| if (call.outcome) |outcome| observer.emit(.{ .delegation = .{
-                .call_id = call.call_id,
-                .child_id = call.child_id,
-                .work_id = call.work_id,
-                .phase = switch (outcome) {
-                    .completed => .completed,
-                    .cancelled => .cancelled,
-                    .failed, .interrupted, .lost => .failed,
+            if (ctx.observer) |observer| if (call.outcome) |outcome| observer.emit(.{
+                .delegation = .{
+                    .call_id = call.call_id,
+                    .child_id = call.child_id,
+                    .work_id = call.work_id,
+                    .phase = switch (outcome) {
+                        .completed => .completed,
+                        .cancelled => .cancelled,
+                        // A paused child may still take another turn, but the hook
+                        // contract has no such phase, so it reads as not finished.
+                        .failed, .interrupted, .lost, .paused => .failed,
+                    },
                 },
-            } });
+            });
         };
         if (session.journal) |*journal| {
             session.session_write_mutex.lockUncancelable(io_mod.getIo());

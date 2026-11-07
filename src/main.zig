@@ -576,6 +576,9 @@ const App = struct {
     permission_engine: PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
+    /// The bound a subagent turn gets, resolved once from
+    /// `max_agent_steps`. Main's own turns follow `agent_step_limit`.
+    subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
     /// How many subagents main may run at once (1 to 16), and the paragraph
     /// its prompt adds so it plans within that limit. A subagent never starts
     /// one of its own.
@@ -648,6 +651,9 @@ const App = struct {
     /// (`review_model` setting or FX_REVIEW_MODEL). Owned; empty keeps the
     /// reviewer's compiled default.
     review_model: []u8 = &.{},
+    /// The level the review model is asked for (`review_effort` setting or
+    /// FX_REVIEW_EFFORT). `.auto` leaves the level to that model.
+    review_effort: ReasoningEffort = .auto,
 
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -2082,7 +2088,10 @@ const App = struct {
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
     ) !tool_projection.EffectiveToolProjection {
-        const subagent_available = agent.session_persistence.subagent_host != null;
+        // `subagent_max_children` of 0 turns subagents off: main keeps no
+        // tool to start one, instead of being told no after a wasted call.
+        const subagent_available = agent.session_persistence.subagent_host != null and
+            self.subagent_max_children > 0;
         // Listed fresh for each turn, so a profile saved during the session shows.
         var profile_arena = std.heap.ArenaAllocator.init(alloc);
         defer profile_arena.deinit();

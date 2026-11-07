@@ -167,26 +167,59 @@ fn parseEntries(alloc: Allocator, value: std.json.Value, shape: Shape) ParseErro
 /// The thinking levels a listing entry names for its model, in the order it
 /// names them.
 ///
-/// Endpoints disagree on the shape, so both forms a model list uses are read:
-/// a plain array of names (`"reasoning_efforts":["low","high"]`), and an
-/// options array shaped like AI Gateway's
-/// (`"reasoning_options":[{"type":"effort","values":[...]}]`). A level fx does
-/// not know is skipped, so a vendor adding one degrades to the levels fx can
-/// still offer rather than losing the model.
+/// Endpoints disagree on the shape, so every form a model list uses is read:
+/// a plain array of names (`"reasoning_efforts":["low","high"]`), an options
+/// array shaped like AI Gateway's
+/// (`"reasoning_options":[{"type":"effort","values":[...]}]`), and the
+/// `reasoning_levels` names or `supported_reasoning_levels` objects that a
+/// self-hosted gateway names (`[{"effort":"high"}]`). A level fx does not know
+/// is skipped, so a vendor adding one degrades to the levels fx can still
+/// offer rather than losing the model.
 fn parseReasoningEffortList(alloc: Allocator, object: std.json.ObjectMap) Allocator.Error![]const std_types.ReasoningEffort {
     if (object.get("reasoning_efforts")) |value| {
         return appendEffortNames(alloc, value);
     }
-    const options = object.get("reasoning_options") orelse return &.{};
-    if (options != .array) return &.{};
-    for (options.array.items) |option| {
-        if (option != .object) continue;
-        const kind = option.object.get("type") orelse continue;
-        if (kind != .string or !std.mem.eql(u8, kind.string, "effort")) continue;
-        const values = option.object.get("values") orelse continue;
-        return appendEffortNames(alloc, values);
+    if (object.get("reasoning_options")) |options| {
+        if (options != .array) return &.{};
+        for (options.array.items) |option| {
+            if (option != .object) continue;
+            const kind = option.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "effort")) continue;
+            const values = option.object.get("values") orelse continue;
+            return appendEffortNames(alloc, values);
+        }
+        return &.{};
     }
+    // A gateway that names the levels directly. The object form carries the
+    // same level in an `effort` field, next to display text fx does not read.
+    if (object.get("supported_reasoning_levels")) |levels| {
+        return appendReasoningLevelObjects(alloc, levels);
+    }
+    if (object.get("reasoning_levels")) |levels| return appendEffortNames(alloc, levels);
     return &.{};
+}
+
+fn appendReasoningLevelObjects(alloc: Allocator, value: std.json.Value) Allocator.Error![]const std_types.ReasoningEffort {
+    if (value != .array) return &.{};
+    var efforts: std.ArrayList(std_types.ReasoningEffort) = .empty;
+    errdefer efforts.deinit(alloc);
+    for (value.array.items) |raw| {
+        if (efforts.items.len >= std_types.ReasoningEffort.max_options) break;
+        // An entry may name its level as a bare string or as an object.
+        const name = switch (raw) {
+            .string => |text| text,
+            .object => |entry| blk: {
+                const effort_value = entry.get("effort") orelse continue;
+                if (effort_value != .string) continue;
+                break :blk effort_value.string;
+            },
+            else => continue,
+        };
+        const effort = std_types.ReasoningEffort.parse(name) orelse continue;
+        if (effort.isDefault()) continue;
+        try efforts.append(alloc, effort);
+    }
+    return efforts.toOwnedSlice(alloc);
 }
 
 fn appendEffortNames(alloc: Allocator, value: std.json.Value) Allocator.Error![]const std_types.ReasoningEffort {
@@ -205,6 +238,39 @@ fn appendEffortNames(alloc: Allocator, value: std.json.Value) Allocator.Error![]
 
 fn effortDefault(effort: std_types.ReasoningEffort) bool {
     return effort.isDefault();
+}
+
+test "listing reads the reasoning level names a self-hosted gateway sends" {
+    const alloc = std.testing.allocator;
+    // The shape a local gateway lists: names in `reasoning_levels`, and the
+    // same levels as objects in `supported_reasoning_levels`.
+    var names = try parse(alloc,
+        \\{"data":[{"id":"auto/deepseek-v4.1-flash","reasoning":true,"reasoning_levels":["none","low","high","max"]}]}
+    );
+    defer names.deinit();
+    try std.testing.expectEqual(@as(usize, 1), names.entries.len);
+    const from_names = names.entries[0].reasoning_efforts;
+    try std.testing.expectEqual(@as(usize, 4), from_names.len);
+    try std.testing.expectEqualStrings("none", from_names[0].label());
+    try std.testing.expectEqualStrings("max", from_names[3].label());
+
+    var objects = try parse(alloc,
+        \\{"data":[{"id":"auto/deepseek-v4.1-flash","reasoning":true,"supported_reasoning_levels":[{"effort":"none"},{"effort":"low"},{"effort":"high"},{"effort":"max"}]}]}
+    );
+    defer objects.deinit();
+    const from_objects = objects.entries[0].reasoning_efforts;
+    try std.testing.expectEqual(@as(usize, 4), from_objects.len);
+    try std.testing.expectEqualStrings("high", from_objects[2].label());
+
+    // The object form wins over the plain names when both are present, and
+    // entries without either still list no levels.
+    var both = try parse(alloc,
+        \\{"data":[{"id":"a","reasoning_levels":["low"],"supported_reasoning_levels":[{"effort":"minimal"},{"effort":"xhigh"}]},{"id":"b"}]}
+    );
+    defer both.deinit();
+    try std.testing.expectEqual(@as(usize, 2), both.entries[0].reasoning_efforts.len);
+    try std.testing.expectEqualStrings("xhigh", both.entries[0].reasoning_efforts[1].label());
+    try std.testing.expectEqual(@as(usize, 0), both.entries[1].reasoning_efforts.len);
 }
 
 test "compatible model listings retain native capabilities and ignore invalid model IDs" {

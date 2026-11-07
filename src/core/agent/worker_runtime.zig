@@ -2299,6 +2299,11 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.agent_turn_settings.effort = effort;
         for (self.queued_prompts.items) |*prompt| prompt.agent_settings.effort = effort;
+        // A running turn keeps the effort it started with. Its config was
+        // copied when the turn began, so changing the level here deliberately
+        // does not reach it: one turn reasons at one level, which keeps its
+        // trajectory coherent and its prefix cacheable. The next turn reads
+        // `agent_turn_settings` and picks the new level up.
     }
 
     pub fn setActiveAgentTurnSettings(self: *WorkerRuntime, settings: AgentTurnSettings) void {

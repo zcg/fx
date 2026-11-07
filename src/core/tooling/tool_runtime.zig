@@ -155,6 +155,10 @@ pub const Context = struct {
     /// Resolved review-model override for automatic permission review. Empty
     /// keeps the reviewer provider's compiled default.
     reviewer_model: []const u8 = "",
+    /// Reasoning effort the reviewer asks its own model for. `.auto` leaves
+    /// the level to that model, which is what a profile that never sets
+    /// `review_effort` sends.
+    reviewer_effort: types.ReasoningEffort = .auto,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
     root_user_messages: []const []const u8 = &.{},
@@ -344,6 +348,7 @@ pub const Context = struct {
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
             .reviewer_model = self.reviewer_model,
+            .reviewer_effort = self.reviewer_effort,
             .cancel_flag = self.cancel_flag,
         });
     }
@@ -2884,6 +2889,7 @@ const TestRuntime = struct {
             .provider_capabilities = self.provider_capabilities,
             .model = self.model,
             .reviewer_model = self.reviewer_model,
+            .reviewer_effort = self.reviewer_effort,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
             .agent_step_limit = 0,

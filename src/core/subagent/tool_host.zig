@@ -1002,6 +1002,14 @@ pub const Runtime = struct {
             .cancelled => withPartial(a, cancelledSentence(end.end.cause), text),
             .interrupted => withPartial(a, "fx stopped before it finished.", text),
             .lost => lost_result,
+            // A paused child still holds its session and everything it has
+            // done. Says so plainly, with the one action that continues it, so
+            // the parent can judge the work instead of guessing at a failure.
+            .paused => withPartial(
+                a,
+                "It used its step budget before finishing, and its session is intact: send it another message to continue from where it stopped.",
+                text,
+            ),
         };
     }
 
@@ -1326,6 +1334,10 @@ pub const Runtime = struct {
             break :blk .{ dropped, self.managed.stop(child_id) or self.stopTurnWorkLocked(child_id) };
         };
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
+        // The stop answers for the work, so its slot is done: reap it so the
+        // child releases its place and its thread instead of sitting retired
+        // until shutdown. A slot still working is left to its own reap.
+        const reaped = self.managed.reapSlot(child_id);
         const dropped_text = switch (dropped) {
             0 => "",
             1 => "the message waiting for it was dropped",
@@ -1333,6 +1345,8 @@ pub const Runtime = struct {
         };
         const text = if (stopped)
             try a.print("Stopped {s}: its turn ended{s}{s}.", .{ agent, if (dropped > 0) ", and " else "", dropped_text })
+        else if (reaped)
+            try a.print("{s} was not working; its finished slot was released{s}{s}.", .{ agent, if (dropped > 0) "; " else "", dropped_text })
         else
             try a.print("{s} was not working{s}{s}.", .{ agent, if (dropped > 0) "; " else "", dropped_text });
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
@@ -1680,21 +1694,25 @@ pub const Runtime = struct {
                 }
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
-                // A new child counts against `max_children`. Both limits hold:
-                // the registry's names, and the owner's live slot threads, so a
-                // child stopped and restarted never runs past the permit.
-                if (registry.children.len >= self.max_children or !self.managed.hasCapacity()) {
+                // A new child counts against `max_children`, which bounds the
+                // children working right now. A child that finished, was
+                // interrupted, or sits idle holds no slot, so stopping one
+                // frees its place for the next. The owner's live slot threads
+                // are the second bound, so a child stopped and restarted never
+                // runs past the permit either.
+                const working = registry.activeCount();
+                if (working >= self.max_children or !self.managed.hasCapacity()) {
                     debug_trace.logf(
                         "subagent",
-                        "admission rejected operation={s} code=subagent_children_exceeded children={d} limit={d}",
-                        .{ operation_id, registry.children.len, self.max_children },
+                        "admission rejected operation={s} code=subagent_children_exceeded active={d} limit={d}",
+                        .{ operation_id, working, self.max_children },
                     );
                     return .{ .rejected = .{
                         .code = "subagent_children_exceeded",
                         .advice = try alloc.print(
-                            "{d} subagents already run under this session (limit {d}, set by subagent_max_children). " ++
+                            "{d} subagents are working under this session (limit {d}, set by subagent_max_children). " ++
                                 "Wait for a report or stop one with action \"stop\".",
-                            .{ registry.children.len, self.max_children },
+                            .{ working, self.max_children },
                         ),
                     } };
                 }

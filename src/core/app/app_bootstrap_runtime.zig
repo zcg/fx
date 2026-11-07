@@ -578,6 +578,7 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initMode(app, agent, permission_mode);
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
+            app.subagent_agent_step_limit = startup.subagent_agent_step_limit;
             app.subagent_max_children = startup.subagent_max_children;
             // Main's prompt says how many subagents it may run, and that they
             // cannot split further, so it plans within the same limit the tool
@@ -604,6 +605,7 @@ pub fn Runtime(comptime App: type) type {
             agent.effort = startup.effort;
             if (comptime @hasField(App, "instances")) try app.instances.seed.captureAgent(app.alloc, agent, permission_mode);
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
+            if (comptime @hasField(App, "review_effort")) app.review_effort = startup.review_effort;
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );

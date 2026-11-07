@@ -616,6 +616,9 @@ const AskContext = struct {
     /// Resolved review-model override borrowed from the startup state for the
     /// duration of the run. Empty keeps the reviewer's compiled default.
     reviewer_model: []const u8 = "",
+    /// The level the reviewer asks its model for; `.auto` leaves it to the
+    /// model.
+    reviewer_effort: types.ReasoningEffort = .auto,
     agent_step_limit: usize = 0,
     /// How many subagents this run may start at once (1 to 16).
     subagent_max_children: usize = agent_steps.default_subagent_max_children,
@@ -1084,6 +1087,7 @@ const AskContext = struct {
             .secret_store = self.cfg.secret_store,
             .model = self.model,
             .reviewer_model = self.reviewer_model,
+            .reviewer_effort = self.reviewer_effort,
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
             .gateway_models_path = self.cfg.gateway_models_path,
@@ -1172,6 +1176,7 @@ const AskContext = struct {
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
             .reviewer_model = self.reviewer_model,
+            .reviewer_effort = self.reviewer_effort,
             .cancel_flag = self.cancelFlag(),
         });
     }
@@ -1658,6 +1663,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
     ctx.reviewer_model = startup.review_model;
+    ctx.reviewer_effort = startup.review_effort;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;

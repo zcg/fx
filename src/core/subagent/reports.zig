@@ -35,10 +35,14 @@ pub const StartedBy = enum {
 /// Whether a child's turn that ended with `outcome` owes its parent a
 /// report. A stop the parent made itself never reports: the parent's stop
 /// call already answers it.
+///
+/// `paused` always reports, whatever the child's rule: the parent is the one
+/// that decides whether the work continues, and it cannot decide that from a
+/// screen it never watched.
 pub fn reportable(rule: Rule, started_by: StartedBy, outcome: child_state.Outcome, stopped_by_parent: bool) bool {
     if (stopped_by_parent) return false;
     return switch (outcome) {
-        .failed, .interrupted, .lost => true,
+        .failed, .interrupted, .lost, .paused => true,
         .completed, .cancelled => switch (started_by) {
             .parent, .child => rule != .never,
             .user => rule == .every_turn,
