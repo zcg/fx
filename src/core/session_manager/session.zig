@@ -15,6 +15,7 @@
 //! `Session.sync_mutex` (one fsync at a time). Hosts never lock anything.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
@@ -628,19 +629,37 @@ pub const Session = struct {
     }
 
     /// Makes and opens `.tmp/{id}`, clearing a crashed attempt's leftover.
+    ///
+    /// A leftover is cleared only when its owner is gone. Two fx processes can
+    /// work under the same id (an import while the original is open, or two
+    /// runs of the same script), and deleting the folder unconditionally would
+    /// pull the staging area out from under the other process mid-append. The
+    /// folder therefore carries an `owner` file naming the process that made
+    /// it; a leftover is reused when its owner is still alive, and cleared when
+    /// it is not.
     fn makeStaging(session: *Session, tmp: storage.Dir) AppendError!storage.Dir {
         const s = session.env.s;
         const id_ = session.identity.id;
         s.makeDir(tmp, id_) catch |err| switch (err) {
-            // A leftover from a crashed attempt with the same id (an import).
             error.AlreadyExists => {
+                if (stagingOwnerIsAlive(s, tmp, id_)) {
+                    // Another live fx owns this staging area; use it as it is.
+                    session.observe(.made_tmp);
+                    return s.openDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+                }
+                // A leftover from a crashed attempt with the same id (an import).
                 s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
                 s.makeDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
             },
             else => |io_err| return storage.ioFault(io_err),
         };
         session.observe(.made_tmp);
-        return s.openDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+        const dir = s.openDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+        writeStagingOwner(s, dir) catch {
+            s.closeDir(dir);
+            return storage.ioFault(error.InputOutput);
+        };
+        return dir;
     }
 
     /// Import only, under `mutex`: the staged folder's `blobs`, made with
@@ -4106,3 +4125,115 @@ const session_model_tests = struct {
 test {
     if (@import("storage.zig").hooks) _ = session_model_tests;
 }
+
+test "the staging owner file names a live process, and a leftover names a dead one" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const s: storage.Storage = .{ .io = std.testing.io };
+    const root: storage.Dir = .{ .handle = tmp.dir };
+
+    // A folder this process owns is in use, not a leftover.
+    try s.makeDir(root, "owned");
+    {
+        const dir = try s.openDir(root, "owned");
+        defer s.closeDir(dir);
+        try writeStagingOwner(s, dir);
+    }
+    try std.testing.expect(stagingOwnerIsAlive(s, root, "owned"));
+
+    // No owner file: a run that crashed before it could write one.
+    try s.makeDir(root, "unowned");
+    try std.testing.expect(!stagingOwnerIsAlive(s, root, "unowned"));
+
+    // An id that cannot be a live session owner is a leftover.
+    try s.makeDir(root, "dead");
+    {
+        const dir = try s.openDir(root, "dead");
+        defer s.closeDir(dir);
+        const file = try s.createFile(dir, staging_owner_name);
+        defer s.closeFile(file);
+        try s.writeAt(file, "0\n", 0);
+    }
+    try std.testing.expect(!stagingOwnerIsAlive(s, root, "dead"));
+}
+
+/// The name of the file that records which process owns a staging folder.
+const staging_owner_name = "owner";
+
+/// Records this process in a fresh staging folder, so a later run can tell
+/// whether the folder it found was left by a crash or is still in use.
+fn writeStagingOwner(s: storage.Storage, dir: storage.Dir) !void {
+    var buffer: [16]u8 = undefined;
+    const text = try std.mem.print(&buffer, "{d}\n", .{stagingOwnerId()});
+    const file = try s.createFile(dir, staging_owner_name);
+    defer s.closeFile(file);
+    try s.writeAt(file, text, 0);
+}
+
+/// Whether the process that made a staging folder still runs.
+///
+/// A missing or unreadable owner file counts as dead: it can only come from a
+/// run that crashed before writing one, so clearing it is the right recovery.
+fn stagingOwnerIsAlive(s: storage.Storage, tmp: storage.Dir, folder: []const u8) bool {
+    const dir = s.openDir(tmp, folder) catch return false;
+    defer s.closeDir(dir);
+    const file = s.openFile(dir, staging_owner_name, .read_only) catch return false;
+    defer s.closeFile(file);
+    var buffer: [16]u8 = undefined;
+    const n = s.readAt(file, &buffer, 0) catch return false;
+    const text = std.mem.trim(u8, buffer[0..n], " \t\r\n");
+    const owner = std.fmt.parseInt(u32, text, 10) catch return false;
+    if (owner == stagingOwnerId()) return true;
+    return processIsAlive(owner);
+}
+
+/// The id this process records in a staging folder.
+const stagingOwnerId = switch (builtin.target.os.tag) {
+    .windows => windowsCurrentProcessId,
+    else => posixCurrentPid,
+};
+
+fn windowsCurrentProcessId() u32 {
+    return kernel32.GetCurrentProcessId();
+}
+
+fn posixCurrentPid() u32 {
+    return @intCast(std.c.getpid());
+}
+
+/// Whether a process id still names a running process.
+///
+/// The check is deliberately conservative: a process this call cannot open is
+/// treated as gone, because a leftover staging folder is recoverable while one
+/// deleted under a live owner is not.
+const processIsAlive = switch (builtin.target.os.tag) {
+    // A Windows process is a handle with an exit code, not a signal target:
+    // `OpenProcess` with query rights answers the question directly.
+    .windows => windowsProcessIsAlive,
+    else => posixProcessIsAlive,
+};
+
+fn windowsProcessIsAlive(pid: u32) bool {
+    const handle = kernel32.OpenProcess(kernel32.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse
+        return false;
+    defer _ = kernel32.CloseHandle(handle);
+    var code: u32 = 0;
+    if (kernel32.GetExitCodeProcess(handle, &code) == 0) return false;
+    return code == kernel32.STILL_ACTIVE;
+}
+
+fn posixProcessIsAlive(pid: u32) bool {
+    // Signal 0 asks whether the process exists without delivering anything.
+    std.posix.kill(@intCast(pid), 0) catch |err| return err != error.ProcessNotFound;
+    return true;
+}
+
+const kernel32 = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn OpenProcess(desired_access: u32, inherit: c_int, process_id: u32) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetExitCodeProcess(process: HANDLE, exit_code: *u32) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: HANDLE) callconv(.winapi) c_int;
+};
