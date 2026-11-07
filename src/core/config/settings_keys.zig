@@ -172,6 +172,43 @@ pub fn find(name: []const u8) ?Key {
     return null;
 }
 
+/// Whether a settings path holds a credential that `fx config` must not print.
+///
+/// Provider connections store their bearer token at `providers.<name>.auth.key`
+/// and their extra request headers at `providers.<name>.headers`, so any path
+/// inside `providers` that ends in one of those leaves is a secret. The check
+/// is by path shape rather than by the named provider, because a connection is
+/// free-form: the same leaf under any name is the same credential.
+pub fn isSecretPath(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "providers.")) return false;
+    var rest = path["providers.".len..];
+    const dot = std.mem.findScalar(u8, rest, '.') orelse return false;
+    rest = rest[dot + 1 ..];
+    return secretLeaf(rest);
+}
+
+/// A leaf inside one provider connection that carries a credential. `auth.key`
+/// is the bearer token; `headers` is the map of extra request headers, which
+/// carries whatever the user put there.
+fn secretLeaf(leaf: []const u8) bool {
+    return std.mem.eql(u8, leaf, "auth.key") or
+        std.mem.eql(u8, leaf, "headers") or
+        std.mem.startsWith(u8, leaf, "headers.");
+}
+
+test "a provider credential path is a secret" {
+    try @import("std").testing.expect(isSecretPath("providers.example.auth.key"));
+    try @import("std").testing.expect(isSecretPath("providers.example.headers"));
+    try @import("std").testing.expect(isSecretPath("providers.example.headers.x-api-key"));
+    // The provider name and the rest of its connection are not secret.
+    try @import("std").testing.expect(!isSecretPath("providers.example.auth.type"));
+    try @import("std").testing.expect(!isSecretPath("providers.example.base_url"));
+    try @import("std").testing.expect(!isSecretPath("providers.example"));
+    // A lookalike outside `providers` is not a credential.
+    try @import("std").testing.expect(!isSecretPath("auth.key"));
+    try @import("std").testing.expect(!isSecretPath("model"));
+}
+
 /// True when a project `.fx.json` that sets `name` is ignored and the user
 /// should be told: a known setting that only the profile may set.
 pub fn ignoredInProject(name: []const u8) bool {

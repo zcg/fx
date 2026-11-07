@@ -478,7 +478,7 @@ pub const ConfigSnapshot = struct {
                 try writeTerminalSafe(&out.writer, alloc, entry.key);
                 try out.writer.writeByte('=');
             }
-            try writeConfigValue(&out.writer, alloc, entry.value);
+            try writeConfigEntryValue(&out.writer, alloc, entry);
             try out.writer.writeByte('\n');
         }
         return try out.toOwnedSlice();
@@ -493,7 +493,7 @@ pub const ConfigSnapshot = struct {
             try out.writer.writeAll("{\"key\":");
             try std.json.Stringify.value(entry.key, .{}, &out.writer);
             try out.writer.writeAll(",\"value\":");
-            try std.json.Stringify.value(entry.value, .{}, &out.writer);
+            try writeConfigEntryJson(&out.writer, entry);
             try out.writer.print(",\"origin\":\"{s}\"", .{@tagName(entry.origin)});
             if (entry.origin == .env) {
                 try out.writer.writeAll(",\"variable\":");
@@ -547,7 +547,7 @@ pub const ConfigChangeSnapshot = struct {
                     try out.writer.writeAll(if (self.changed) profile_paths.displayText(" removed from ~/.fx/settings.json.\n") else profile_paths.displayText(" isn't set in ~/.fx/settings.json.\n"));
                 } else {
                     try out.writer.writeAll(if (self.changed) " set to " else " is already ");
-                    try writeConfigValue(&out.writer, alloc, self.value orelse .null);
+                    try writeConfigChangeValue(&out.writer, alloc, self);
                     try out.writer.writeAll(if (self.changed) profile_paths.displayText(" in ~/.fx/settings.json.\n") else ".\n");
                 }
             },
@@ -555,7 +555,7 @@ pub const ConfigChangeSnapshot = struct {
                 try out.writer.print("{{\"kind\":\"config\",\"action\":\"{s}\",\"key\":", .{if (self.unset) "unset" else "set"});
                 try std.json.Stringify.value(self.key, .{}, &out.writer);
                 try out.writer.writeAll(",\"value\":");
-                try std.json.Stringify.value(self.value orelse .null, .{}, &out.writer);
+                try writeConfigChangeJson(&out.writer, self);
                 try out.writer.print(",\"changed\":{},\"file\":", .{self.changed});
                 try std.json.Stringify.value(profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
                 try out.writer.writeByte('}');
@@ -564,6 +564,50 @@ pub const ConfigChangeSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
+
+/// The text `fx config` prints for a credential instead of its value.
+const redacted_value = "[redacted]";
+
+/// A config entry's value in text form. A credential the profile stores for a
+/// provider connection prints as `[redacted]`: `fx config` reports what is set,
+/// and a shared terminal, a screen recording, or a copied log must not leak the
+/// key itself.
+fn writeConfigEntryValue(writer: *std.Io.Writer, alloc: Allocator, entry: settings_entries.Entry) !void {
+    if (settings_keys.isSecretPath(entry.key)) {
+        try writer.writeAll(redacted_value);
+        return;
+    }
+    try writeConfigValue(writer, alloc, entry.value);
+}
+
+/// A config entry's value in JSON form, redacted on the same rule as the text
+/// form.
+fn writeConfigEntryJson(writer: *std.Io.Writer, entry: settings_entries.Entry) !void {
+    if (settings_keys.isSecretPath(entry.key)) {
+        try std.json.Stringify.value(redacted_value, .{}, writer);
+        return;
+    }
+    try std.json.Stringify.value(entry.value, .{}, writer);
+}
+
+/// `fx config set` echoes the value it saved. A credential prints redacted, so
+/// the confirmation cannot become the leak the store was meant to prevent.
+fn writeConfigChangeValue(writer: *std.Io.Writer, alloc: Allocator, change: ConfigChangeSnapshot) !void {
+    if (settings_keys.isSecretPath(change.key)) {
+        try writer.writeAll(redacted_value);
+        return;
+    }
+    try writeConfigValue(writer, alloc, change.value orelse .null);
+}
+
+/// The JSON form of `fx config set`'s echoed value, redacted on the same rule.
+fn writeConfigChangeJson(writer: *std.Io.Writer, change: ConfigChangeSnapshot) !void {
+    if (settings_keys.isSecretPath(change.key)) {
+        try std.json.Stringify.value(redacted_value, .{}, writer);
+        return;
+    }
+    try std.json.Stringify.value(change.value orelse .null, .{}, writer);
+}
 
 /// A settings value as `fx config` prints it: text and numbers as they are,
 /// lists and objects as compact JSON.
@@ -2690,6 +2734,54 @@ test "status JSON lists the session modes after the permission mode" {
     const plain = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "\"modes\"") == null);
+}
+
+test "config output redacts provider credentials in text and JSON" {
+    const alloc = std.testing.allocator;
+    const entries = [_]settings_entries.Entry{
+        .{ .key = "providers.example.auth.key", .value = .{ .string = "placeholder-credential" }, .origin = .global },
+        .{ .key = "providers.example.auth.type", .value = .{ .string = "bearer" }, .origin = .global },
+        .{ .key = "providers.example.headers", .value = .{ .string = "placeholder-header" }, .origin = .global },
+        .{ .key = "model", .value = .{ .string = "shown/model" }, .origin = .global },
+    };
+    const snapshot: ConfigSnapshot = .{ .entries = &entries, .workspace_root = "/w" };
+
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "placeholder-credential") == null);
+    try std.testing.expect(std.mem.find(u8, text, "placeholder-header") == null);
+    try std.testing.expect(std.mem.find(u8, text, "providers.example.auth.key=[redacted]\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "providers.example.headers=[redacted]\n") != null);
+    // A non-credential sibling still shows its value.
+    try std.testing.expect(std.mem.find(u8, text, "providers.example.auth.type=bearer\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "model=shown/model\n") != null);
+
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "placeholder-credential") == null);
+    try std.testing.expect(std.mem.find(u8, json, "placeholder-header") == null);
+    try std.testing.expect(std.mem.find(u8, json, "\"key\":\"providers.example.auth.key\",\"value\":\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"key\":\"model\",\"value\":\"shown/model\"") != null);
+}
+
+test "config set confirmation redacts a provider credential" {
+    const alloc = std.testing.allocator;
+    const change: ConfigChangeSnapshot = .{
+        .unset = false,
+        .key = "providers.example.auth.key",
+        .value = .{ .string = "placeholder-credential" },
+        .changed = true,
+    };
+
+    const text = try change.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "placeholder-credential") == null);
+    try std.testing.expect(std.mem.find(u8, text, " set to [redacted] ") != null);
+
+    const json = try change.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "placeholder-credential") == null);
+    try std.testing.expect(std.mem.find(u8, json, "\"value\":\"[redacted]\"") != null);
 }
 
 test "config entries from the environment name their variable" {
