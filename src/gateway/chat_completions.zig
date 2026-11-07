@@ -228,9 +228,14 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     return post(alloc, definition, request, token, payload) catch |err| {
-        request.attempt_evidence.network_failure = client_mod.networkFailureEvidence(err, request.delivery.load());
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        // The caller's deadline decides first. A request whose deadline passed
+        // failed because of that deadline, so it must not be registered as
+        // recoverable transport evidence: the watcher ended the connection,
+        // and the error the interrupted read surfaced is that ending, not a
+        // fault worth resending.
         if (request.deadline) |deadline| if (expired(deadline)) return error.Timeout;
+        request.attempt_evidence.network_failure = client_mod.networkFailureEvidence(err, request.delivery.load());
         return err;
     };
 }

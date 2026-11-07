@@ -174,6 +174,11 @@ fn streamCompletion(
     else
         operation.run()) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+        // A request whose caller deadline passed failed because of that
+        // deadline. The watcher ended the connection, so the error the
+        // interrupted read surfaced describes that ending, not a fault worth
+        // resending.
+        if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
     };
@@ -188,6 +193,14 @@ const PreparedStreamOperation = struct {
         return streamPrepared(self.alloc, self.request, self.payload);
     }
 };
+
+/// Whether the caller's own deadline has passed, which decides the failure
+/// before any transport error the deadline itself produced.
+fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
+    const deadline = request.deadline orelse return false;
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
+}
 
 /// True for the credentials a Codex request may use: a ChatGPT subscription,
 /// or a host that authorizes the request itself.

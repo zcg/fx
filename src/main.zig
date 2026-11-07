@@ -3,6 +3,19 @@ const agents = @import("core/agents/agents.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+
+/// std reaches `error.Unexpected` from operating-system statuses it has no
+/// case for, and in Debug builds it prints that status and a full stack trace
+/// to stderr first. For a socket those statuses are ordinary transport
+/// events: a Windows AFD read completes with `STATUS_PIPE_DISCONNECTED` once
+/// fx shuts the connection down to end a stalled or cancelled request. The
+/// trace would land in the middle of the terminal instead of in a log, and
+/// fx already records the real cause through `debug_trace`. Tests keep it so
+/// a failing unit test still names the status it saw.
+pub const std_options: std.Options = .{
+    .unexpected_error_tracing = builtin.is_test,
+};
+
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");

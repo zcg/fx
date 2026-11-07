@@ -217,6 +217,20 @@ fn sendGatewayReview(
     } };
 }
 
+/// A transport failure that may clear on its own. Every transport error that
+/// is not clearly permanent is retried once with a fresh deadline, because a
+/// single dropped connection must not discard a completed review. `Unexpected`
+/// belongs here: std reports an operating-system status it has no mapping for
+/// as that, and on Windows an AFD read that ends because the connection closed
+/// under it produces exactly that status, so treating it as permanent turns an
+/// ordinary disconnect into a wasted review.
+pub fn isTransientTransportError(err: anyerror) bool {
+    return gateway_client.isRetryableGatewayError(err) or
+        err == error.Unexpected or
+        err == error.InputOutput or
+        err == error.SystemResources;
+}
+
 fn mapTransportError(
     err: anyerror,
     cancel_flag: *std.atomic.Value(bool),
@@ -227,7 +241,7 @@ fn mapTransportError(
             .cancelled
         else if (err == error.Timeout)
             .timed_out
-        else if (gateway_client.isRetryableGatewayError(err))
+        else if (isTransientTransportError(err))
             .transient_failure
         else
             .permanent_failure;
@@ -280,6 +294,7 @@ const FakeOutcome = enum {
     valid,
     malformed,
     transient_error,
+    unexpected_error,
     permanent_error,
     ambiguous_error,
     timeout,
@@ -322,6 +337,7 @@ const FakeStream = struct {
             .valid => validStream(alloc),
             .malformed => malformedStream(alloc),
             .transient_error => error.ConnectionResetByPeer,
+            .unexpected_error => error.Unexpected,
             .permanent_error => error.AccessDenied,
             .ambiguous_error => {
                 delivery.markPossiblySent();
@@ -603,6 +619,19 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
         permanent.invalid,
     );
     try std.testing.expectEqual(@as(usize, 1), permanent_fake.calls);
+
+    // std reports an unmapped operating-system status as `error.Unexpected`,
+    // which is what a dropped connection produces. Treating it as permanent
+    // would discard the review over a single transient disconnect, so it is
+    // retried once like any other transport failure.
+    var unexpected_fake = FakeStream{ .outcomes = &.{ .unexpected_error, .valid } };
+    const unexpected_config = testConfig(&unexpected_fake, null);
+    const recovered = try reviewGatewayConfig(unexpected_config, std.testing.allocator, testRequest(), reviewer_model);
+    try std.testing.expectEqual(
+        std.meta.Tag(permission_auto_classifier.ParseOutcome).clear,
+        std.meta.activeTag(recovered),
+    );
+    try std.testing.expectEqual(@as(usize, 2), unexpected_fake.calls);
 
     var cancelled_fake = FakeStream{ .outcomes = &.{.cancelled} };
     const cancelled_config = testConfig(&cancelled_fake, null);

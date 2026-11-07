@@ -23,7 +23,13 @@ pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
         err == error.ConnectionTimedOut or
-        err == error.LocalAddressGone;
+        err == error.LocalAddressGone or
+        // A read or write that failed after the connection was up. On Windows
+        // a socket read completes with an unmapped AFD status once fx itself
+        // shuts the connection down, which std reports as `ReadFailed`, and
+        // every stream adapter reports a broken body the same way.
+        err == error.ReadFailed or
+        err == error.WriteFailed;
 }
 
 pub fn networkFailureEvidence(
@@ -111,6 +117,8 @@ test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
     try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
+    try std.testing.expect(isRetryableGatewayError(error.ReadFailed));
+    try std.testing.expect(isRetryableGatewayError(error.WriteFailed));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
 }
 
@@ -1138,6 +1146,30 @@ const ConnectedRequestWatch = struct {
             .seq_cst,
             .seq_cst,
         ) == null;
+    }
+
+    /// Wins `.timed_out` from any active phase. The caller deadline can pass
+    /// before the head arrives or mid-stream, and in both cases the watcher
+    /// ends the connection itself. Recording why it did so is what lets
+    /// `finish_error` report the caller's own deadline instead of whatever
+    /// error the interrupted read happens to surface: a Windows AFD read that
+    /// a local shutdown ends completes with `STATUS_PIPE_DISCONNECTED`, which
+    /// std does not map and reports as `error.Unexpected`.
+    fn win_deadline(self: *ConnectedRequestWatch) bool {
+        var current = self.phase.load(.seq_cst);
+        while (is_active(current)) {
+            if (self.phase.cmpxchgWeak(
+                current,
+                .timed_out,
+                .seq_cst,
+                .seq_cst,
+            )) |observed| {
+                current = observed;
+                continue;
+            }
+            return true;
+        }
+        return false;
     }
 
     fn markStreamProgress(self: *ConnectedRequestWatch) void {
@@ -2374,7 +2406,12 @@ const GatewayCancelWatcher = struct {
             if (deadline) |limit| {
                 const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
                 if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) {
-                    stream.shutdown(io_mod.getIo(), .both) catch {};
+                    // The caller's deadline ends the connection, so record
+                    // that cause before the read it interrupts fails with
+                    // whatever status the OS happens to report.
+                    if (connected_watch == null or connected_watch.?.win_deadline()) {
+                        stream.shutdown(io_mod.getIo(), .both) catch {};
+                    }
                     return;
                 }
             }
@@ -2830,6 +2867,42 @@ test "connected request watch keeps the first terminal winner" {
     var ordinary = ConnectedRequestWatch.init(.{});
     try std.testing.expect(ordinary.finish() == null);
     try std.testing.expect(!ordinary.win(.cancelled));
+}
+
+// A Windows AFD read that the watcher's own shutdown ends completes with
+// STATUS_PIPE_DISCONNECTED, which std reports as `error.Unexpected` because it
+// has no mapping for the status. The failure the caller sees must be the
+// watcher's own reason, never that substituted transport error.
+test "a deadline that ends the connection reports the deadline, not the read error" {
+    var streaming = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(streaming.commit_response_head() == null);
+    try std.testing.expect(streaming.win_deadline());
+    try std.testing.expectEqual(
+        error.Timeout,
+        streaming.finish_error(error.Unexpected),
+    );
+
+    // The head wait can outlast the deadline too.
+    var awaiting = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(awaiting.arm_response_head() == null);
+    try std.testing.expect(awaiting.win_deadline());
+    try std.testing.expectEqual(
+        error.Timeout,
+        awaiting.finish_error(error.Unexpected),
+    );
+
+    // A real failure with no watcher reason still reaches the caller, and a
+    // deadline never overrides a cause that already won.
+    var untouched = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(untouched.commit_response_head() == null);
+    try std.testing.expectEqual(
+        error.ConnectionResetByPeer,
+        untouched.finish_error(error.ConnectionResetByPeer),
+    );
+    var cancelled = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(cancelled.win(.cancelled));
+    try std.testing.expect(!cancelled.win_deadline());
+    try std.testing.expectEqual(error.Cancelled, cancelled.finish().?);
 }
 
 test "connected request watch disarms timeout at response head" {
