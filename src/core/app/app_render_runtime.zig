@@ -2363,11 +2363,12 @@ fn buildImageOverlay(
     }
     overlay.highest_id = highest;
 
-    // Which image is shown follows the pointer: hover a badge to see its
-    // image, move away to drop the preview. A terminal that does not report
-    // motion cannot drive that, so a click pins the preview for it instead:
-    // click a badge to show the image, click it again or click anywhere else
-    // to drop it.
+    // Which image is shown is click-driven everywhere: click a badge to see
+    // its image, click it again or click anywhere else to drop the preview.
+    // Motion was tried here and lost -- this terminal repaints text over the
+    // picture layer faster than a hover-driven preview could win, so the
+    // pointer's position no longer picks the image. The hover position is
+    // still recorded for the composer and the diagnostic stream.
     const motion = preview_diag.motionReported();
     const hover = if (comptime @hasField(App, "hover_position")) app.hover_position else null;
     preview_diag.log("overlay eval images={d} motion={} hover_row={d} hover_col={d} pinned={d}", .{
@@ -2378,7 +2379,7 @@ fn buildImageOverlay(
         if (comptime @hasField(App, "preview_pinned_id")) (if (app.preview_pinned_id) |p| p else 0) else 0,
     });
 
-    if (!motion and comptime @hasField(App, "pointer_click")) {
+    if (comptime @hasField(App, "pointer_click")) {
         if (app.pointer_click) |click| {
             if (click.seq != app.preview_click_seq_seen) {
                 app.preview_click_seq_seen = click.seq;
@@ -2408,36 +2409,19 @@ fn buildImageOverlay(
 
     const pinned: ?usize = if (comptime @hasField(App, "preview_pinned_id")) app.preview_pinned_id else null;
 
-    // Where the preview currently sits, from the frame before this one. The
-    // hit region is the badge plus the preview itself: the whole point of
-    // hovering is to look at the picture, and the picture sits right next to
-    // the badge, so the pointer has to be allowed to travel into it without
-    // the preview vanishing underneath the cursor.
-    const shown_rect = preview_shown_rect;
-
+    // A click picks the image, and the preview stays up until the next click
+    // takes it away. The pointer's position is not consulted here: a preview
+    // driven by motion means the pixels have to outrun the text repaint that
+    // covers them on this terminal, and that race never won.
     for (images) |image| {
         const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse {
             preview_diag.log("no anchor id={d}", .{image.id});
             continue;
         };
-        const over_badge = motion and hover != null and
-            hover.?.row >= anchor.row and
-            hover.?.row < anchor.row + ui_image_strip.hover_band_rows and
-            hover.?.column >= anchor.column -| 2 and
-            hover.?.column < anchor.column + anchor.width + 2;
-        var inside_preview = false;
-        if (motion and shown_rect != null and preview_shown_id == image.id) {
-            const rect = shown_rect.?;
-            inside_preview = hover != null and
-                hover.?.row >= rect.row and
-                hover.?.row < rect.row + rect.rows and
-                hover.?.column >= rect.column and
-                hover.?.column < rect.column + rect.columns;
-        }
-        const pinned_to = !motion and pinned != null and pinned.? == image.id;
-        if (!over_badge and !inside_preview and !pinned_to) continue;
+        const pinned_to = pinned != null and pinned.? == image.id;
+        if (!pinned_to) continue;
 
-        var rect = ui_image_strip.previewRect(
+        const rect = ui_image_strip.previewRect(
             anchor,
             .{ .rows = layout.rows, .cols = layout.cols },
             .{ .columns = ui_image_strip.preview_columns, .rows = ui_image_strip.preview_rows },
@@ -2445,12 +2429,6 @@ fn buildImageOverlay(
             preview_diag.log("no rect id={d}", .{image.id});
             continue;
         };
-        // Holding still inside the preview must not move it: reuse the rect
-        // the pointer walked into, so the fingerprint stays put and the same
-        // pixels are not resent on every cell of drift.
-        if (inside_preview and shown_rect != null and preview_shown_id == image.id) {
-            rect = shown_rect.?;
-        }
 
         const png = previewPngFor(app.alloc, image.id, image.path) orelse {
             preview_diag.log("decode failed path={s}", .{image.path});
@@ -2472,20 +2450,9 @@ fn buildImageOverlay(
             .image_id = @intCast(image.id),
             .png = png,
         });
-        preview_shown_id = image.id;
-        preview_shown_rect = rect;
-    }
-    if (placements.items.len == 0) {
-        preview_shown_id = null;
-        preview_shown_rect = null;
     }
     overlay.placements = placements.items;
 }
-
-/// The preview the last frame drew, so the pointer can travel from the badge
-/// into the picture without it vanishing under the cursor.
-var preview_shown_id: ?usize = null;
-var preview_shown_rect: ?ui_image_strip.PreviewRect = null;
 
 /// The PNG bytes the preview is showing, decoded once per image.
 ///

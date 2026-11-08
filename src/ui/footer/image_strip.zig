@@ -253,9 +253,6 @@ pub fn previewRect(
     };
 }
 
-/// Rows around a badge that count as hovering it.
-pub const hover_band_rows: u16 = 1;
-
 /// A preview rectangle, in 1-based terminal cells.
 pub const PreviewRect = Rect;
 
