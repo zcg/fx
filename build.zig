@@ -296,6 +296,27 @@ pub fn build(b: *std.Build) void {
     const job_probe_step = b.step("probe-job", "Check that a job object ends a server's grandchildren");
     job_probe_step.dependOn(&run_job_probe.step);
 
+    // Which inline image protocol this terminal speaks, and one test image.
+    const image_protocol_probe = b.addExecutable(.{
+        .name = "image-protocol-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("scripts/windows/image_protocol_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    image_protocol_probe.root_module.addImport("terminal_image", b.createModule(.{ .root_source_file = b.path("src/core/shared/terminal_image.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    image_protocol_probe.root_module.addImport("terminal_image_render", b.createModule(.{ .root_source_file = b.path("src/core/shared/terminal_image_render.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    const run_image_protocol_probe = b.addRunArtifact(image_protocol_probe);
+    const image_protocol_probe_step = b.step("probe-image-protocol", "Report the inline image protocol this terminal speaks");
+    image_protocol_probe_step.dependOn(&run_image_protocol_probe.step);
+
+    // Whether the terminal answers the Kitty graphics protocol query.
+    const image_query_probe = b.addExecutable(.{
+        .name = "image-query-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("scripts/windows/image_protocol_query.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    image_query_probe.root_module.addImport("io", b.createModule(.{ .root_source_file = b.path("src/core/shared/io.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    const run_image_query_probe = b.addRunArtifact(image_query_probe);
+    const image_query_probe_step = b.step("probe-image-query", "Ask the terminal whether it draws Kitty graphics");
+    image_query_probe_step.dependOn(&run_image_query_probe.step);
+
     // Which step of the skills refresh fails, and with what error.
     const skills_refresh_probe = b.addExecutable(.{
         .name = "skills-refresh-probe",
