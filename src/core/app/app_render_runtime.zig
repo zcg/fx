@@ -41,7 +41,7 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const ui_surface_frame = @import("../../ui/footer/surface_frame.zig");
 const ui_image_strip = @import("../../ui/footer/image_strip.zig");
 const terminal_image = @import("../shared/terminal_image.zig");
-const gdiplus_decode = @import("../images/gdiplus_decode.zig");
+const system_decode = @import("../images/system_decode.zig");
 const preview_diag = @import("../shared/preview_diag.zig");
 const Allocator = std.mem.Allocator;
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
@@ -2363,19 +2363,15 @@ fn buildImageOverlay(
     }
     overlay.highest_id = highest;
 
-    // Which image is shown follows the pointer. A terminal that reports
-    // motion drives the preview from the badge under the pointer; one that
-    // does not (this run's did not send a single motion event) pins it with a
-    // click: click a badge to see its image, click it again or click away to
-    // drop the preview.
-    const motion = preview_diag.motionReported();
+    // Which image is shown is click-driven everywhere: click a badge to show
+    // its image, click it again or click anywhere else to drop the preview.
+    // Pointer motion is recorded but deliberately drives nothing — a preview
+    // that follows the cursor is a different feature, and this one was asked
+    // to be click-pinned.
     const hover = if (comptime @hasField(App, "hover_position")) app.hover_position else null;
-    preview_diag.log("overlay eval images={d} motion={} hover_set={} hover_row={d} hover_col={d}", .{
+    preview_diag.log("overlay eval images={d} hover_set={}", .{
         images.len,
-        motion,
         hover != null,
-        if (hover) |h| h.row else 0,
-        if (hover) |h| h.column else 0,
     });
 
     if (comptime @hasField(App, "pointer_click")) {
@@ -2414,12 +2410,8 @@ fn buildImageOverlay(
             preview_diag.log("no anchor id={d}", .{image.id});
             continue;
         };
-        const over_badge = motion and hover != null and
-            hover.?.row == anchor.row and
-            hover.?.column >= anchor.column and
-            hover.?.column < anchor.column + anchor.width;
-        const pinned_to = !motion and pinned != null and pinned.? == image.id;
-        if (!over_badge and !pinned_to) continue;
+        const pinned_to = pinned != null and pinned.? == image.id;
+        if (!pinned_to) continue;
 
         const rect = ui_image_strip.previewRect(
             anchor,
@@ -2476,7 +2468,7 @@ fn previewPngFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]u8 {
     // the transfer stays small. Off Windows there is no system decoder wired
     // up yet: a PNG file passes through as-is, and other formats skip the
     // preview until one is added.
-    if (gdiplus_decode.decodeToPreviewPng(
+    if (system_decode.decodeToPreviewPng(
         alloc,
         path,
         ui_image_strip.preview_columns,
