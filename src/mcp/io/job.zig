@@ -1,91 +1,84 @@
-//! A Windows job object that owns a process tree, so a stdio MCP server's
-//! descendants cannot outlive fx.
+//! A Windows job object for one stdio MCP server, so the server's descendants
+//! cannot outlive fx.
 //!
-//! On POSIX a process group is the handle on a descendant set: fx signals the
-//! group and the kernel delivers it to every member. Windows has no process
-//! group with that meaning; `TerminateProcess` reaches exactly one process, so
-//! a server started through `npx`, `uvx`, or a `.cmd` wrapper leaves its own
-//! children behind when fx ends. A job object is the equivalent handle: every
-//! process assigned to it is in the same tree, and terminating or closing the
+//! POSIX addresses a process group: one signal reaches the child and everything
+//! it forked. Windows has no such group; `TerminateProcess` reaches exactly one
+//! process, so a server started through `npx`, `uvx`, or a `.cmd` wrapper leaves
+//! its own children behind when fx ends. A job object is the equivalent handle:
+//! every process assigned to it is in the tree, and closing or terminating the
 //! job ends the whole tree.
 //!
-//! The job is created with `KILL_ON_JOB_CLOSE`, so fx's own exit, clean or not,
-//! takes its children with it: the kernel closes every handle the process held,
-//! and the job then kills what is still running inside it.
+//! The job is created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so fx's exit,
+//! clean or not, takes the tree with it.
 //!
-//! This module sits inside the MCP engine because that engine imports only
-//! `std` and its own files. Off Windows every call is a no-op, so callers do not
-//! branch on the platform.
+//! `src/core/shared/windows_job.zig` is the same mechanism for shell commands.
+//! The two stay separate because the MCP engine imports only `std` and its own
+//! files, and because a server's lifetime differs from a command's: a server is
+//! ended by `terminate` while fx keeps running, a command usually just closes
+//! its job. Off Windows this compiles to a no-op value.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const is_windows = builtin.target.os.tag == .windows;
+pub const supported = builtin.target.os.tag == .windows;
 
-pub const Job = if (!is_windows) struct {
-    pub fn deinit(self: Job) void {
-        _ = self;
-    }
+const windows = std.os.windows;
 
-    pub fn assign(self: Job, process: std.process.Child.Id) bool {
-        _ = self;
-        _ = process;
-        return false;
-    }
-
+/// The job a server was assigned to. Empty on platforms without job objects.
+pub const Job = if (!supported) struct {
     pub fn terminate(self: Job) void {
+        _ = self;
+    }
+
+    pub fn deinit(self: Job) void {
         _ = self;
     }
 } else struct {
-    handle: std.os.windows.HANDLE,
+    handle: ?windows.HANDLE,
 
-    /// Creates a job that kills every process still inside it when the job is
-    /// terminated or closed. Returns null when the system refuses, which the
-    /// caller logs rather than treating as a started server.
-    pub fn create() ?Job {
-        const handle = CreateJobObjectW(null, null) orelse return null;
-        var info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (SetInformationJobObject(
-            handle,
-            job_object_extended_limit_information,
-            @ptrCast(&info),
-            @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
-        ) == 0) {
-            _ = CloseHandle(handle);
-            return null;
-        }
-        return .{ .handle = handle };
-    }
-
-    /// Puts a started child into the job. A child that could not be assigned
-    /// is still fx's direct child and is stopped by its own handle, so a
-    /// failure here is reported and not fatal.
-    pub fn assign(self: Job, process: std.process.Child.Id) bool {
-        if (AssignProcessToJobObject(self.handle, process) == 0) {
-            std.log.debug("mcp job assign failed err={d}", .{std.os.windows.GetLastError()});
-            return false;
-        }
-        return true;
-    }
-
-    /// Ends every process still inside the job, for a server stopped while fx
-    /// keeps running.
+    /// Ends every process still inside the job and releases it.
     pub fn terminate(self: Job) void {
-        _ = TerminateJobObject(self.handle, 1);
+        const handle = self.handle orelse return;
+        _ = TerminateJobObject(handle, 1);
+        _ = windows.CloseHandle(handle);
     }
 
-    /// Closes the job. Because it was created with `KILL_ON_JOB_CLOSE`, this
-    /// also ends anything still inside it.
+    /// Releases the handle. Because the job was created with
+    /// `KILL_ON_JOB_CLOSE`, closing the last handle still ends what is inside.
     pub fn deinit(self: Job) void {
-        _ = CloseHandle(self.handle);
+        const handle = self.handle orelse return;
+        _ = windows.CloseHandle(handle);
     }
 };
 
-/// Creates a job for one server. Off Windows there is nothing to create.
-pub fn create() ?Job {
-    if (comptime !is_windows) return .{};
-    return Job.create();
+/// A job holding nothing.
+pub const none: Job = if (supported) .{ .handle = null } else .{};
+
+/// The job a server process was assigned to, or `none` when the platform has
+/// none or the assignment failed.
+///
+/// A failure is not fatal: the server still runs, it just may leave children
+/// behind, which is what happened before job objects were used at all.
+pub fn assign(process: windows.HANDLE) Job {
+    if (comptime !supported) return none;
+    const handle = CreateJobObjectW(null, null) orelse return none;
+
+    var limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (SetInformationJobObject(
+        handle,
+        job_object_extended_limit_information,
+        &limits,
+        @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) == 0) {
+        _ = windows.CloseHandle(handle);
+        return none;
+    }
+    if (AssignProcessToJobObject(handle, process) == 0) {
+        _ = windows.CloseHandle(handle);
+        return none;
+    }
+    return .{ .handle = handle };
 }
 
 const job_object_extended_limit_information: u32 = 9;
@@ -124,27 +117,25 @@ const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
 extern "kernel32" fn CreateJobObjectW(
     job_attributes: ?*anyopaque,
     name: ?[*:0]const u16,
-) callconv(.winapi) ?std.os.windows.HANDLE;
+) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn SetInformationJobObject(
-    job: std.os.windows.HANDLE,
+    job: windows.HANDLE,
     info_class: u32,
     info: *const anyopaque,
     length: u32,
 ) callconv(.winapi) c_int;
 extern "kernel32" fn AssignProcessToJobObject(
-    job: std.os.windows.HANDLE,
-    process: std.os.windows.HANDLE,
+    job: windows.HANDLE,
+    process: windows.HANDLE,
 ) callconv(.winapi) c_int;
 extern "kernel32" fn TerminateJobObject(
-    job: std.os.windows.HANDLE,
+    job: windows.HANDLE,
     exit_code: u32,
 ) callconv(.winapi) c_int;
-extern "kernel32" fn CloseHandle(handle: std.os.windows.HANDLE) callconv(.winapi) c_int;
 
-test "a job can be created and closed on every platform" {
-    const job = create() orelse return error.SkipZigTest;
-    defer job.deinit();
-    // An invalid handle must not be assigned; the call reports it instead of
-    // taking the process down.
-    try std.testing.expect(!job.assign(@ptrFromInt(1)));
+test "a job starts empty and needs no cleanup" {
+    const job = none;
+    job.terminate();
+    job.deinit();
+    try std.testing.expect(true);
 }

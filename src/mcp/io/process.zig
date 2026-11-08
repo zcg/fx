@@ -409,7 +409,6 @@ pub const Process = struct {
             if (comptime builtin.target.os.tag == .windows) {
                 if (p.job) |job| {
                     job.terminate();
-                    job.deinit();
                     p.job = null;
                 }
                 _ = windows_terminate.TerminateProcess(pid, 1);
@@ -605,10 +604,7 @@ pub const Process = struct {
         // The server goes into a job before anything else can fail, so the
         // tree it starts is owned from its first moment.
         if (comptime builtin.target.os.tag == .windows) {
-            if (job_mod.create()) |job| {
-                _ = job.assign(pid);
-                p.job = job;
-            }
+            p.job = job_mod.assign(pid);
         }
         p.pid_lock.lockUncancelable(p.io);
         p.pid = pid;

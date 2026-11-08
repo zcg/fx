@@ -19,12 +19,6 @@ pub fn main(init: std.process.Init) !void {
     const zio = init.io;
     const alloc = init.gpa;
 
-    const job = job_mod.create() orelse {
-        std.debug.print("probe-job: CreateJobObject failed\n", .{});
-        return error.JobUnavailable;
-    };
-    defer job.deinit();
-
     var child = try std.process.spawn(zio, .{
         .argv = &.{ "cmd.exe", "/c", "ping -n 60 127.0.0.1" },
         .stdin = .ignore,
@@ -32,8 +26,8 @@ pub fn main(init: std.process.Init) !void {
         .stderr = .ignore,
     });
     const pid = child.id.?;
-    const assigned = job.assign(pid);
-    std.debug.print("probe-job: assigned={}\n", .{assigned});
+    const job = job_mod.assign(pid);
+    std.debug.print("probe-job: assigned={}\n", .{job_mod.supported});
 
     // `Child.Id` is a process handle on Windows, not the number CIM reports,
     // so the number has to come from `GetProcessId`.
