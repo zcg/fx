@@ -456,11 +456,20 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     const previous_for_diff = movement.post_movement;
     const changed_cells = countChangedCells(previous_for_diff, target, repaint_window);
     const full_repaint = input.surface.plan.reset_terminal or dimensions_changed or terminal_scroll_rows > 0 or invalidationRequiresFullRepaint(input.surface.plan.invalidation);
+    // A frame whose cells did not change still has work to do when the picture
+    // layer changed: closing a preview moves no text, and skipping the frame
+    // skipped the delete that takes the picture off the screen, so it stayed up
+    // with no way to dismiss it. The image bytes are the frame's only payload
+    // in that case.
+    const overlay_live = input.image_overlay != null and !input.image_overlay.?.isEmpty();
+    const overlay_leaving = !overlay_live and last_image_overlay.len != 0;
     if (terminal_scroll_bytes.len == 0 and
         terminal_scroll_rows == 0 and
         !full_repaint and
         changed_cells == 0 and
-        cursorMatches(previous_for_diff, target))
+        cursorMatches(previous_for_diff, target) and
+        !overlay_live and
+        !overlay_leaving)
     {
         debug_trace.logf(
             "frame_commit",
@@ -489,7 +498,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         repaint_window,
         full_repaint,
         movement,
-        overlay_up or last_image_overlay.len != 0,
+        overlay_up,
     );
     const prefix_len = layout.prefix_len;
     // The image bytes are written separately, after this text frame is
@@ -733,22 +742,28 @@ fn composeWireFrame(
 
     // The pixels ride inside the same synchronized update as the text.
     //
-    // This terminal covers the picture layer with every text commit, so a frame
-    // that redraws a line of text takes the picture away, and only a resend
-    // brings it back. Two commits in a row -- text, then picture -- are exactly
-    // one flash, which is what an activity spinner turning next to a preview
-    // showed. Sent inside the block, the terminal composites text and pixels
-    // once, so the picture stays put however often the frame is rebuilt.
+    // The pixel write and the cell write are two commits, and this terminal
+    // shows the cell commit alone for a moment, which covers the picture. Sent
+    // inside one synchronized block, the terminal composites them together, so
+    // a redraw no longer flashes the picture. Pixels are resent only when the
+    // picture changes, so an activity spinner turning next to a preview does
+    // not resend them for every tick.
     //
-    // A placement that is gone, or that moved, has its id deleted first; the id
-    // this frame draws is never deleted, because this terminal drops a same-id
-    // delete-then-redraw pair.
-    if (input.image_overlay) |overlay| {
-        if (!overlay.isEmpty()) {
-            for (last_image_overlay) |previous| {
-                if (overlayWants(previous.id, input.image_overlay, previous)) continue;
-                image_overlay_module.writeDelete(&wire_frame.writer, previous.id) catch {};
-            }
+    // Deletions are unconditional: a placement that is gone or moved has to be
+    // removed now, even on the frame where the overlay becomes empty. Only that
+    // path takes a closed preview off the screen.
+    const wanted_fingerprint: u64 = if (input.image_overlay) |overlay|
+        if (overlay.isEmpty()) 0 else overlay.fingerprint()
+    else
+        0;
+    const overlay_resend = wanted_fingerprint != 0 and
+        (full_repaint or last_image_overlay.len == 0 or wanted_fingerprint != last_image_overlay_fingerprint);
+    for (last_image_overlay) |previous| {
+        if (overlayWants(previous.id, input.image_overlay, previous)) continue;
+        image_overlay_module.writeDelete(&wire_frame.writer, previous.id) catch {};
+    }
+    if (overlay_resend) {
+        if (input.image_overlay) |overlay| {
             image_overlay_module.write(&wire_frame.writer, overlay.*) catch {};
         }
     }
