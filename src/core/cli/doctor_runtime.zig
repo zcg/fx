@@ -135,10 +135,80 @@ pub fn collect(
     try appendStateChecks(&checks, alloc);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
+    if (comptime builtin.target.os.tag == .windows) {
+        try appendWindowsChecks(&checks, alloc);
+    }
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
     return snapshot;
 }
+
+/// The checks that only mean something on Windows, where the shell, the console
+/// code page, and credential protection all differ from the POSIX assumptions
+/// the rest of doctor makes.
+fn appendWindowsChecks(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+) !void {
+    // Which shell commands will actually run in. An undetected shell means
+    // every shell tool call fails, so it is a failure rather than a warning.
+    const shell_resolver = @import("../terminal/shell_resolver.zig");
+    var shell_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (shell_resolver.windowsLoginShellInto(&shell_buffer)) |shell_path| {
+        const detail = try alloc.print("shell commands run in {s}", .{shell_path});
+        try appendCheckOwned(checks, alloc, "shell", .ok, detail);
+    } else {
+        try appendCheckOwned(
+            checks,
+            alloc,
+            "shell",
+            .fail,
+            try alloc.dupe(u8, "no PowerShell, Git Bash, or cmd.exe was found; shell commands cannot run"),
+        );
+    }
+
+    // Whether the console can carry fx's UTF-8 output. A console that refuses
+    // the code page shows mojibake for anything outside ASCII.
+    if (consoleCodePageStatus()) |status| {
+        try appendCheckOwned(checks, alloc, "console", status.kind, try alloc.dupe(u8, status.detail));
+    }
+
+    // Where credentials live. On Windows the profile file relies on an
+    // inherited ACL and is not encrypted, so doctor says so instead of implying
+    // the protection macOS gets from the Keychain.
+    try appendCheckOwned(
+        checks,
+        alloc,
+        "credentials",
+        .warn,
+        try alloc.dupe(u8, "stored in the profile file, protected by its folder's ACL and not encrypted; " ++
+            "use a dedicated Windows account if other accounts can read your profile"),
+    );
+}
+
+const ConsoleCodePageStatus = struct {
+    kind: CheckStatus,
+    detail: []const u8,
+};
+
+/// What the console's output code page currently is.
+fn consoleCodePageStatus() ?ConsoleCodePageStatus {
+    if (comptime builtin.target.os.tag != .windows) return null;
+    const code_page = kernel32.GetConsoleOutputCP();
+    if (code_page == 0) {
+        // No console attached: a redirected run, where the code page does not
+        // apply.
+        return .{ .kind = .ok, .detail = "no console attached" };
+    }
+    if (code_page == 65001) {
+        return .{ .kind = .ok, .detail = "output code page is UTF-8 (65001)" };
+    }
+    return .{ .kind = .warn, .detail = "output code page is not UTF-8; fx sets it while it runs, and non-ASCII text in other programs may look wrong" };
+}
+
+const kernel32 = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) u32;
+};
 
 fn appendConfigDiagnosticChecks(
     checks: *std.ArrayList(Check),

@@ -143,7 +143,7 @@ pub fn resolve(
 /// is what lets a user pin a shell that detection cannot find. The first
 /// detection is written back so later calls read a setting instead of probing
 /// the disk again.
-fn windowsLoginShellInto(buffer: []u8) ?[]const u8 {
+pub fn windowsLoginShellInto(buffer: []u8) ?[]const u8 {
     const alloc = std.heap.c_allocator;
     const preference = configuredShellSetting(alloc);
     defer if (preference) |value| alloc.free(value);
