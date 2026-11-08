@@ -2362,10 +2362,14 @@ fn buildImageOverlay(
     if (!terminal_image.current().drawsImages()) return;
 
     // Pointer reporting is armed only while a badge exists, because a badge is
-    // the one thing in the composer that reads a click. Events that arrive
-    // while nothing reads them are handled by scrolling the terminal, so the
-    // wheel keeps working either way.
-    app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, true);
+    // the one thing in the composer that reads a click. The first scroll gives
+    // it back: see the wheel branch in the input runtime.
+    if (comptime @hasField(App, "image_pointer_active")) {
+        if (!app.image_pointer_active) {
+            app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, true);
+            app.image_pointer_active = true;
+        }
+    }
 
     const layout = app.shell.layout;
     var highest: u32 = 0;

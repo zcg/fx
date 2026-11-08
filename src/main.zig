@@ -631,6 +631,13 @@ const App = struct {
     /// The attachment id whose preview is pinned by a click, if any.
     preview_pinned_id: ?usize = null,
     preview_click_seq_seen: u64 = 0,
+    /// Whether pointer reporting is on so a badge can be clicked.
+    ///
+    /// The two things a user wants here cannot both be true at once: a terminal
+    /// that reports mouse events stops scrolling its own history, and no escape
+    /// sequence scrolls that history for it. So the badge owns the pointer
+    /// until the user scrolls, and the first scroll gives the pointer back.
+    image_pointer_active: bool = false,
     /// The main conversation's own state.
     main_agent: agents.Agent = .{},
     /// The agent the main loop is working for. Null means main, so `App` can

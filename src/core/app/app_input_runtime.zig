@@ -29,6 +29,7 @@ const picker_state = @import("../input/picker_state.zig");
 const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
+const app_lifecycle = @import("app_lifecycle.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -1110,7 +1111,23 @@ pub fn Runtime(comptime App: type) type {
                 .page_down,
                 .mouse_wheel,
                 .mouse_pointer,
-                => {},
+                => {
+                    // A terminal that reports mouse events stops scrolling its
+                    // own history, and no escape sequence scrolls that history
+                    // for it: `CSI n S` and `CSI n T` move the visible screen,
+                    // which is why they tore the interface apart. So the badge
+                    // only borrows the pointer. A scroll hands it straight
+                    // back, and the next wheel or page key scrolls the history
+                    // the way the terminal always did.
+                    if (comptime @hasField(App, "image_pointer_active")) {
+                        if (app.image_pointer_active) {
+                            app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, false);
+                            app.image_pointer_active = false;
+                            app.preview_pinned_id = null;
+                            app.shell.render_requests.request(.footer);
+                        }
+                    }
+                },
                 .clear_line => {
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     if (draftHasState(app, agents.screenAgentOf(app))) {
