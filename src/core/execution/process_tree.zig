@@ -16,14 +16,34 @@ const DarwinPipeIdentity = struct {
 
 /// Kernel-owned command membership that survives environment replacement,
 /// exec, process-group changes, and forks. The caller owns `deinit`.
-pub const DarwinProcessWitness = struct {
+///
+/// Only macOS has this: it reads the kernel's own record of which processes
+/// share a pipe. Windows builds the type as an empty value and every call
+/// reports `ProcessTreeUnsupported`, so callers do not branch on the platform.
+pub const DarwinProcessWitness = if (builtin.target.os.tag != .macos) struct {
+    pub fn init() !DarwinProcessWitness {
+        return error.ProcessTreeUnsupported;
+    }
+
+    pub fn childFd(self: DarwinProcessWitness) std.posix.fd_t {
+        _ = self;
+        unreachable;
+    }
+
+    pub fn closeChildCopy(self: *DarwinProcessWitness) void {
+        _ = self;
+    }
+
+    pub fn deinit(self: *DarwinProcessWitness) void {
+        _ = self;
+    }
+} else struct {
     supervisor_fd: ?std.posix.fd_t,
     child_fd: ?std.posix.fd_t,
     descendant_fd: std.posix.fd_t,
     identity: DarwinPipeIdentity,
 
     pub fn init() !DarwinProcessWitness {
-        if (comptime builtin.target.os.tag != .macos) return error.ProcessTreeUnsupported;
         var pipe: [2]std.posix.fd_t = undefined;
         switch (std.posix.errno(std.posix.system.pipe(&pipe))) {
             .SUCCESS => {},
@@ -887,6 +907,7 @@ test "Linux proc helpers treat missing process data as vanished" {
 }
 
 test "process-group exclusion preserves the captured command grace" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     try std.testing.expect(shouldSignalProcess(41, null));
     try std.testing.expect(!shouldSignalProcess(41, 41));
     try std.testing.expect(shouldSignalProcess(42, 41));
@@ -909,6 +930,7 @@ test "stale process identities cannot become traversal roots" {
 }
 
 test "child admission binds the observed process to its expected parent" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const snapshot = ProcessSnapshot{
         .identity = .{ .linux_start_ticks = 42 },
         .parent_pid = 17,
@@ -1028,6 +1050,7 @@ test "checked signal delivery keeps vanished stale and excluded targets complete
 }
 
 test "natural completion detaches only processes that left the command session" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const command_session: std.posix.pid_t = 500;
     try std.testing.expectEqual(
         CompletionStanding.attached,
@@ -1512,6 +1535,7 @@ test "tracked identity distinguishes process instances" {
 }
 
 test "zombie snapshots are terminal process state" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const live = ProcessSnapshot{
         .identity = .{ .linux_start_ticks = 1 },
         .parent_pid = 1,

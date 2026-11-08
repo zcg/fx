@@ -5340,6 +5340,7 @@ test "linked metadata outside authority is rejected before descriptor open" {
 // The FIFO reader stays open until the blocked writer joins, as
 // `tests/tla/session_manager/rollout/pr-1099/PR1099FIFO.tla` models.
 test "linked metadata FIFO is rejected before descriptor open" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const MarkOpen = struct {
         called: bool = false,
 

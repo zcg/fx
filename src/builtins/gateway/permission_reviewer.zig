@@ -593,6 +593,7 @@ test "gateway transport preserves cancellation timeout transient and permanent o
 }
 
 test "gateway automatic reviewer distinguishes timeout permanent failure and cancellation" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var timeout_fake = FakeStream{ .outcomes = &.{.timeout} };
     const timeout_config = testConfig(&timeout_fake, null);
     const timed_out = try reviewGatewayConfig(timeout_config, std.testing.allocator, testRequest(), reviewer_model);

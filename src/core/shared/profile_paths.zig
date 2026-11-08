@@ -68,7 +68,7 @@ pub fn fxHomeActive() bool {
 /// ordinary profile. `HOME` still wins when it is set, because a user who sets
 /// it means it. `getenv` is a parameter so a command that reads its
 /// environment through a seam keeps using that seam.
-pub fn homeFromEnvironment(getenv: anytype, ctx: anytype) ?[]const u8 {
+pub fn homeFromEnvironment(getenv: *const fn (?*anyopaque, []const u8) ?[]const u8, ctx: ?*anyopaque) ?[]const u8 {
     if (getenv(ctx, "HOME")) |home| {
         if (home.len != 0) return home;
     }
@@ -307,7 +307,8 @@ test "homeFromEnvironment reads HOME, then USERPROFILE on Windows" {
         home: ?[]const u8 = null,
         user_profile: ?[]const u8 = null,
 
-        fn get(self: *const @This(), _: *const @This(), name: []const u8) ?[]const u8 {
+        fn get(raw: ?*anyopaque, name: []const u8) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw orelse return null));
             if (std.mem.eql(u8, name, "HOME")) return self.home;
             if (std.mem.eql(u8, name, "USERPROFILE")) return self.user_profile;
             return null;
@@ -316,11 +317,11 @@ test "homeFromEnvironment reads HOME, then USERPROFILE on Windows" {
 
     var env = Env{ .home = "/home/me", .user_profile = "C:\\Users\\me" };
     // HOME wins wherever it is set.
-    try std.testing.expectEqualStrings("/home/me", homeFromEnvironment(Env.get, &env).?);
+    try std.testing.expectEqualStrings("/home/me", homeFromEnvironment(Env.get, @ptrCast(&env)).?);
 
     // An empty HOME counts as unset, as it does in io.homeDir.
     env = .{ .home = "", .user_profile = "C:\\Users\\me" };
-    const fallback = homeFromEnvironment(Env.get, &env);
+    const fallback = homeFromEnvironment(Env.get, @ptrCast(&env));
     if (comptime @import("builtin").target.os.tag == .windows) {
         try std.testing.expectEqualStrings("C:\\Users\\me", fallback.?);
     } else {

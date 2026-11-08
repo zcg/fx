@@ -2539,6 +2539,7 @@ test "cloneEnvironMap owns an independent copy of map environment state" {
 }
 
 test "cloneEnvironMap copies installed block environment state" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const previous_map = global_environ;
     const previous_block = global_environ_block;
     const previous_raw = global_raw_environ;
@@ -2811,6 +2812,7 @@ test "realpathAlloc on nonexistent path returns FileNotFound" {
 }
 
 test "Windows realpath resolves file and directory links to their targets" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -4502,6 +4502,7 @@ test "lightweight local commands do not request early threaded io" {
 }
 
 test "process io connects through a reachable address while fx tasks hold every async slot" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     // This test builds the process Io from processIoOptions instead of using
     // std.testing.io, because those options are what it checks. Only name
     // lookup and the unreachable address are faked. std's HostName.connect,

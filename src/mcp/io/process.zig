@@ -1256,6 +1256,7 @@ test "a stop signals the server's whole process group, so its children stop too"
 }
 
 test "the helper hears each server group that starts and each one that is reaped, in order" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     // The test reads in place of the helper.
     helper.start(testing.io);
     const ends = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });

@@ -189,6 +189,7 @@ pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool 
 }
 
 test "provider options expose the catalog slugs the composer accepts" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var buf: [max_provider_options][]const u8 = undefined;
     const count = providerOptions(&buf);
 

@@ -1,11 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Whether this file's real implementation exists. It reads the kernel's
+/// record of a pipe's peers, which only macOS exposes.
+const is_macos = builtin.target.os.tag == .macos;
+
 var wrapped_vtable: std.Io.VTable = undefined;
 var wrapped_original_vtable: ?*const std.Io.VTable = null;
-const preferred_inherited_fd_target: std.posix.fd_t = 64;
-
+const preferred_inherited_fd_target: std.posix.fd_t = if (is_macos) 64 else undefined;
 pub fn wrap(original: std.Io) std.Io {
+    if (comptime !is_macos) return original;
     if (wrapped_original_vtable) |original_vtable| {
         std.debug.assert(original_vtable == original.vtable);
     } else {
@@ -155,6 +159,7 @@ fn inherited_environment() std.process.Environ {
 }
 
 fn create_pipe(nonblocking: bool) std.process.SpawnError![2]std.posix.fd_t {
+    if (comptime !is_macos) unreachable;
     var pipe: [2]std.posix.fd_t = undefined;
     const result = std.posix.system.pipe(&pipe);
     switch (std.posix.errno(result)) {
@@ -261,6 +266,7 @@ fn add_inherit_or_dup(
 }
 
 pub fn inherited_fd_target(source: std.posix.fd_t) std.posix.fd_t {
+    if (comptime !is_macos) return source;
     return if (source == preferred_inherited_fd_target)
         preferred_inherited_fd_target + 1
     else
@@ -409,12 +415,14 @@ fn reap_new_children(
     before: ChildPidSnapshot,
     after: ChildPidSnapshot,
 ) void {
+    if (comptime !is_macos) return;
     for (after.pids[0..after.len]) |pid| {
         if (!before.contains(pid)) reap_child(io, pid);
     }
 }
 
 fn reap_child(io: std.Io, pid: std.posix.pid_t) void {
+    if (comptime !is_macos) return;
     var status: c_int = undefined;
     for (0..100) |_| {
         const result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
@@ -431,6 +439,7 @@ fn reap_child(io: std.Io, pid: std.posix.pid_t) void {
 const max_tracked_fd = if (builtin.target.os.tag == .macos) std.c.OPEN_MAX else 256;
 
 fn open_fd_snapshot() [max_tracked_fd]bool {
+    if (comptime !is_macos) return @splat(false);
     var result: [max_tracked_fd]bool = @splat(false);
     for (&result, 0..) |*open, fd| {
         const rc = std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0));
@@ -440,6 +449,7 @@ fn open_fd_snapshot() [max_tracked_fd]bool {
 }
 
 fn close_new_fds(before: [max_tracked_fd]bool, after: [max_tracked_fd]bool) void {
+    if (comptime !is_macos) return;
     for (before, after, 0..) |was_open, is_open, fd| {
         if (!was_open and is_open) _ = std.posix.system.close(@intCast(fd));
     }
@@ -678,6 +688,7 @@ test "Darwin spawn reports launch errors and preserves wait and kill" {
 extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
 
 test "Darwin spawn creates and joins a pipeline process group" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const io = try darwin_io();
     const alloc = std.testing.allocator;
     var producer = try std.process.spawn(io, .{

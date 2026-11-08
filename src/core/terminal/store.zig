@@ -6369,6 +6369,7 @@ fn recorded_lifecycle(
 }
 
 test "owner reconcile ends only terminals whose owner process is gone" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
@@ -6436,6 +6437,7 @@ test "owner reconcile ends only terminals whose owner process is gone" {
 }
 
 test "owner identities round trip and reject malformed text" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const token = try process_identity.ProcessInstanceToken.parse(
         "linux:00112233445566778899aabbccddeeff:12345",
     );

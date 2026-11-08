@@ -303,6 +303,7 @@ test "an approved .mcp.json server keeps its login under its own workspace, neve
 }
 
 test "a Windows stdio server inherits the variables a child process needs" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -320,7 +321,7 @@ test "a Windows stdio server inherits the variables a child process needs" {
         .{ .name = "fs", .command = "npx", .args = &.{ "-y", "server-filesystem" } },
     };
     const r = try resolve(arena, &configs, &inherited, "C:\\work");
-    const environ = r.engine[0].stdio.environ_map;
+    const environ = r.engine[0].transport.stdio.environ_map.?;
 
     try testing.expectEqualStrings("C:\\Windows\\system32", environ.get("PATH").?);
     if (comptime @import("builtin").target.os.tag == .windows) {

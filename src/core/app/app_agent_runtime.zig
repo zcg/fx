@@ -1998,6 +1998,9 @@ const FakeApp = struct {
     agent_step_limit: usize = 8,
     fast_mode: bool = true,
     main_agent: struct {
+        /// What this agent is to the one that started it; the root agent has
+        /// no parent, and a subagent names its role so its tool set can differ.
+        role: agents.Role = .root,
         effort: types.ReasoningEffort = types.ReasoningEffort.literal("high"),
         context_snapshot: context_contract.GatheredContextSnapshot,
         change_tracker: change_tracker.ChangeTracker = .{},

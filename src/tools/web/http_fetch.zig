@@ -2822,6 +2822,7 @@ test "web_fetch response parser ignores pending bytes beyond content length" {
 }
 
 test "web_fetch TLS encrypted transport buffers satisfy stdlib minimums" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var reader: TlsDeadlineReader = undefined;
     reader.init(-1, .{});
     try std.testing.expect(reader.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
@@ -3550,6 +3551,7 @@ fn expectAndTraceTlsTruncation(
 }
 
 test "web_fetch transport traces stable stages and redact sensitive values" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3661,6 +3663,7 @@ const ScriptedDialer = struct {
 };
 
 test "web_fetch admitted dialing preserves order and one shared deadline" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
     defer closeFd(fds[1]);
@@ -3688,6 +3691,7 @@ test "web_fetch admitted dialing preserves order and one shared deadline" {
 }
 
 test "web_fetch admitted dialing stops on control and local resource failures" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const addresses = [_]IpAddress{
         try ip("93.184.216.34", 443),
         try ip("93.184.216.35", 443),
@@ -3803,6 +3807,7 @@ const ScriptedPoller = struct {
 };
 
 test "web_fetch poll events preserve requested readiness and hangup semantics" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
     try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.ERR);
     try classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.OUT | posix.POLL.HUP);
@@ -3879,6 +3884,7 @@ const PollSignalStorm = struct {
 };
 
 test "web_fetch poll deadline is not extended by interrupted syscalls" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const action: posix.Sigaction = .{
         .handler = .{ .handler = noOpSignalHandler },
         .mask = posix.sigemptyset(),
@@ -4040,6 +4046,7 @@ test "web_fetch deadline adapters retain invalid descriptor causes" {
 }
 
 test "web_fetch closed peer write returns a cause without terminating process" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var sockets: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
         return error.SocketPairFailed;
