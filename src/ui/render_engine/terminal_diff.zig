@@ -23,7 +23,6 @@ const OverlaySnapshot = struct {
 
 /// The placements the terminal is currently showing.
 var last_image_overlay: []const OverlaySnapshot = &.{};
-var last_image_overlay_fingerprint: u64 = 0;
 
 /// Whether `id` is wanted again with the same cells, so its old placement and
 /// the new one are the same picture in the same place.
@@ -608,28 +607,27 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     // payload has no cells to check. This is exactly the order a terminal
     // needs -- text first, then pixels anchored to absolute cells.
     //
-    // Pixels go out when the overlay changes, and again on a full repaint,
-    // which is the one frame where the terminal may have discarded its image
-    // layer. Kitty keeps a placement until it is deleted, so a placement that
-    // is gone, or that moved, has its id deleted before the new copy is drawn;
-    // a placement that is still there with the same cells is left alone. A
-    // terminal that answers a same-id delete-then-redraw pair by dropping the
-    // redraw is exactly why the delete skips what is being drawn.
-    const wanted_fingerprint: u64 = if (input.image_overlay) |overlay|
-        if (overlay.isEmpty()) 0 else overlay.fingerprint()
-    else
-        0;
-    const overlay_changed = wanted_fingerprint != last_image_overlay_fingerprint;
-    const overlay_resend = wanted_fingerprint != 0 and full_repaint;
-    if (overlay_changed or overlay_resend) {
+    // The pixels are resent on every frame the overlay is up, not only when
+    // the overlay changes: this terminal repaints text over the picture layer,
+    // so a frame that only redraws a line of text still covers the preview,
+    // and a change-gated cache left the user staring at a badge. A placement
+    // that is gone, or that moved, has its id deleted before the new copy is
+    // drawn; a placement that is still there with the same cells is left
+    // alone, because a same-id delete-then-redraw pair is exactly what this
+    // terminal's graphics layer drops.
+    if ((input.image_overlay != null and !input.image_overlay.?.isEmpty()) or
+        last_image_overlay.len != 0)
+    {
         var image_bytes: std.Io.Writer.Allocating = .init(alloc);
         defer image_bytes.deinit();
         for (last_image_overlay) |previous| {
             if (overlayWants(previous.id, input.image_overlay, previous)) continue;
             image_overlay_module.writeDelete(&image_bytes.writer, previous.id) catch {};
         }
-        if (wanted_fingerprint != 0) {
-            image_overlay_module.write(&image_bytes.writer, input.image_overlay.?.*) catch {};
+        if (input.image_overlay) |overlay| {
+            if (!overlay.isEmpty()) {
+                image_overlay_module.write(&image_bytes.writer, overlay.*) catch {};
+            }
         }
         if (image_bytes.written().len != 0) {
             // Unconditional diagnostic: a preview that never reaches the
@@ -640,7 +638,6 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
             });
             _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
         }
-        last_image_overlay_fingerprint = wanted_fingerprint;
         if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
         if (input.image_overlay) |overlay| {
             const snapshots = try alloc.alloc(OverlaySnapshot, overlay.placements.len);
