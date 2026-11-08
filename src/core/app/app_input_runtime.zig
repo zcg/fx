@@ -1109,16 +1109,18 @@ pub fn Runtime(comptime App: type) type {
                 => unreachable,
                 .page_up,
                 .page_down,
-                .mouse_wheel,
                 .mouse_pointer,
-                => {
+                => {},
+                .mouse_wheel => {
                     // A terminal that reports mouse events stops scrolling its
                     // own history, and no escape sequence scrolls that history
                     // for it: `CSI n S` and `CSI n T` move the visible screen,
                     // which is why they tore the interface apart. So the badge
-                    // only borrows the pointer. A scroll hands it straight
-                    // back, and the next wheel or page key scrolls the history
-                    // the way the terminal always did.
+                    // only borrows the pointer. A wheel hands it straight back,
+                    // and from then on the terminal scrolls the way it always
+                    // did. The page keys stay out of this: they are the
+                    // composer's own, and a scroll is what gives the pointer
+                    // back.
                     if (comptime @hasField(App, "image_pointer_active")) {
                         if (app.image_pointer_active) {
                             app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, false);

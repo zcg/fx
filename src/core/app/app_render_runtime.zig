@@ -2353,6 +2353,11 @@ fn buildImageOverlay(
     placements: *std.ArrayList(render_engine.image_overlay.Placement),
 ) !void {
     if (comptime !@hasField(App, "main_agent")) return;
+    // A full transcript or a modal owns the screen and the layout drops the
+    // picture rows for the duration, so a preview drawn against those rows
+    // lands on cells that no longer exist. Drawing one there is how the full
+    // transcript came up as an empty screen with a lone cursor.
+    if (app.terminal.alternate_screen_owner != .none) return;
     const images = app.main_agent.pending_images.items;
     if (images.len == 0) {
         // Nothing left to preview. Pointer reporting is never armed for the
