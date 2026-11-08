@@ -42,6 +42,7 @@ const ui_surface_frame = @import("../../ui/footer/surface_frame.zig");
 const ui_image_strip = @import("../../ui/footer/image_strip.zig");
 const terminal_image = @import("../shared/terminal_image.zig");
 const gdiplus_decode = @import("../images/gdiplus_decode.zig");
+const preview_diag = @import("../shared/preview_diag.zig");
 const Allocator = std.mem.Allocator;
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
@@ -2362,30 +2363,55 @@ fn buildImageOverlay(
     }
     overlay.highest_id = highest;
 
-    // The preview belongs to the badge the pointer is on: hover shows it,
-    // moving away drops it. A keyboard-only session never sets a hover
-    // position, so its composer simply has no preview, which is what every
-    // terminal can show anyway.
+    // Which image is shown follows the pointer: the badge it rests on. A
+    // terminal that never reports motion cannot drive a hover, so the newest
+    // attachment is previewed instead — the paste just happened, and that is
+    // the image the user is looking for.
+    const motion = preview_diag.motionReported();
     const hover = if (comptime @hasField(App, "hover_position")) app.hover_position else null;
-    if (hover == null) return;
+    preview_diag.log("overlay eval images={d} motion={} hover_set={} hover_row={d} hover_col={d}", .{
+        images.len,
+        motion,
+        hover != null,
+        if (hover) |h| h.row else 0,
+        if (hover) |h| h.column else 0,
+    });
+
     for (images) |image| {
-        const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse continue;
-        const over_badge = hover.?.row == anchor.row and
+        const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse {
+            preview_diag.log("no anchor id={d}", .{image.id});
+            continue;
+        };
+        const over_badge = hover != null and motion and
+            hover.?.row == anchor.row and
             hover.?.column >= anchor.column and
             hover.?.column < anchor.column + anchor.width;
-        if (!over_badge) continue;
+        const newest = !motion and image.id == images[images.len - 1].id;
+        preview_diag.log("badge id={d} anchor={d},{d} w={d} over={} newest={}", .{
+            image.id,
+            anchor.row,
+            anchor.column,
+            anchor.width,
+            over_badge,
+            newest,
+        });
+        if (!over_badge and !newest) continue;
 
         const rect = ui_image_strip.previewRect(
             anchor,
             .{ .rows = layout.rows, .cols = layout.cols },
             .{ .columns = ui_image_strip.preview_columns, .rows = ui_image_strip.preview_rows },
-        ) orelse continue;
-
-        const png = previewPngFor(app.alloc, image.id, image.path) orelse {
-            debug_trace.logf("images", "overlay decode failed path={s}", .{image.path});
+        ) orelse {
+            preview_diag.log("no rect id={d}", .{image.id});
             continue;
         };
-        debug_trace.logf("images", "overlay png bytes={d} rect={d},{d} {d}x{d}", .{
+
+        const png = previewPngFor(app.alloc, image.id, image.path) orelse {
+            preview_diag.log("decode failed path={s}", .{image.path});
+            continue;
+        };
+        preview_diag.log("draw id={d} bytes={d} rect={d},{d} {d}x{d}", .{
+            image.id,
             png.len,
             rect.row,
             rect.column,

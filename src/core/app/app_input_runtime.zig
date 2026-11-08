@@ -24,6 +24,7 @@ const transcript_presentation = @import("../output/transcript_presentation.zig")
 const core_input_runtime = @import("../input/runtime.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const input_reset = @import("../input/input_reset.zig");
+const preview_diag = @import("../shared/preview_diag.zig");
 const picker_state = @import("../input/picker_state.zig");
 const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
@@ -1015,6 +1016,8 @@ pub fn Runtime(comptime App: type) type {
                 // badge under the pointer, and a move that changes the
                 // hovered cell redraws the frame the preview lives in.
                 const pointer = resolved.mouse_pointer;
+                preview_diag.noteMotion();
+                preview_diag.log("hover row={d} col={d}", .{ pointer.row, pointer.column });
                 const previous = app.hover_position;
                 const changed = previous == null or
                     previous.?.row != pointer.row or previous.?.column != pointer.column;

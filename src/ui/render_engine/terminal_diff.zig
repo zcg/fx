@@ -7,37 +7,9 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 /// Appends one line to a diagnostic file, without depending on `FX_TRACE`.
 ///
 /// A preview lives outside the cell grid, so none of the usual frame traces
-/// say whether its bytes were written. This is deliberately unconditional and
-/// deliberately tiny: a timestamp, the byte count, and the placement count.
-/// The file is truncated once per process so a run never inherits an old one.
-var overlay_log_started: bool = false;
-
-fn recordOverlayWrite(byte_count: usize, placement_count: usize) void {
-    const io = @import("../../core/shared/io.zig");
-    const root = io.getenv("TEMP") orelse io.getenv("TMP") orelse return;
-    const zio = io.getIo();
-    const path = std.heap.c_allocator.print(
-        "{s}\\fx-image-overlay.log",
-        .{root},
-    ) catch return;
-    defer std.heap.c_allocator.free(path);
-
-    const first = !overlay_log_started;
-    overlay_log_started = true;
-    const file = std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = first }) catch return;
-    defer file.close(zio);
-    var line_buf: [160]u8 = undefined;
-    const line = std.mem.print(&line_buf, "{d} bytes={d} placements={d}\n", .{
-        io.milliTimestamp(),
-        byte_count,
-        placement_count,
-    }) catch return;
-    const end = if (first) 0 else file.length(zio) catch return;
-    file.writePositionalAll(zio, line, end) catch {};
-}
-
 const frame_cell_match = @import("frame_cell_match.zig");
 const image_overlay_module = @import("image_overlay.zig");
+const preview_diag = @import("../../core/shared/preview_diag.zig");
 
 /// The overlay the terminal is currently showing, so pixels are sent when it
 /// changes rather than on every frame that redraws a line of text.
@@ -637,9 +609,11 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         }
         if (image_bytes.written().len != 0) {
             // Unconditional diagnostic: a preview that never reaches the
-            // terminal is otherwise invisible in every trace scope. One line
-            // per write, to a file outside the repo, with a timestamp.
-            recordOverlayWrite(image_bytes.written().len, if (input.image_overlay) |overlay| overlay.placements.len else 0);
+            // terminal is otherwise invisible in every trace scope.
+            preview_diag.log("overlay bytes={d} placements={d}", .{
+                image_bytes.written().len,
+                if (input.image_overlay) |overlay| overlay.placements.len else 0,
+            });
             _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
         }
         last_image_overlay_fingerprint = wanted_fingerprint;
