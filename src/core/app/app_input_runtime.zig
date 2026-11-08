@@ -1110,36 +1110,7 @@ pub fn Runtime(comptime App: type) type {
                 .page_down,
                 .mouse_wheel,
                 .mouse_pointer,
-                => {
-                    // The composer reads clicks, not scrolls, but the terminal
-                    // stops scrolling itself while it is reporting mouse
-                    // events. So the wheel and the page keys are scrolled here
-                    // instead of being dropped: without this the transcript
-                    // froze at the fold and the user could not reach history.
-                    const lines: i32 = switch (decoded) {
-                        .page_up => -@as(i32, @intCast(@max(1, app.shell.layout.rows -| 3))),
-                        .page_down => @as(i32, @intCast(@max(1, app.shell.layout.rows -| 3))),
-                        .mouse_wheel => |direction| switch (direction) {
-                            .up => -3,
-                            .down => 3,
-                        },
-                        else => 0,
-                    };
-                    if (lines != 0) {
-                        // `CSI n S` scrolls the viewport up by n lines and
-                        // `CSI n T` down, which is the terminal's own history
-                        // buffer: fx keeps no scroll state of its own.
-                        var sequence: [24]u8 = undefined;
-                        const written = if (lines < 0)
-                            std.mem.print(&sequence, "\x1b[{d}S", .{-lines})
-                        else
-                            std.mem.print(&sequence, "\x1b[{d}T", .{lines});
-                        const bytes = written catch "";
-                        if (bytes.len != 0) {
-                            _ = io_mod.writeFd(app.shell.stdout_file.handle, bytes) catch {};
-                        }
-                    }
-                },
+                => {},
                 .clear_line => {
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     if (draftHasState(app, agents.screenAgentOf(app))) {
