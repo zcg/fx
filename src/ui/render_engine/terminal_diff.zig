@@ -11,10 +11,33 @@ const frame_cell_match = @import("frame_cell_match.zig");
 const image_overlay_module = @import("image_overlay.zig");
 const preview_diag = @import("../../core/shared/preview_diag.zig");
 
-/// The overlay the terminal is currently showing, so pixels are sent when it
-/// changes rather than on every frame that redraws a line of text.
+/// One placement the terminal is currently showing, so a redraw knows which
+/// ids to delete and which to leave alone.
+const OverlaySnapshot = struct {
+    id: u32,
+    row: u16,
+    column: u16,
+    columns: u16,
+    rows: u16,
+};
+
+/// The placements the terminal is currently showing.
+var last_image_overlay: []const OverlaySnapshot = &.{};
 var last_image_overlay_fingerprint: u64 = 0;
-var last_image_overlay_highest: u32 = 0;
+
+/// Whether `id` is wanted again with the same cells, so its old placement and
+/// the new one are the same picture in the same place.
+fn overlayWants(id: u32, overlay: ?*const image_overlay_module.Overlay, previous: OverlaySnapshot) bool {
+    const wanted = overlay orelse return false;
+    for (wanted.placements) |placement| {
+        if (placement.image_id != id) continue;
+        return placement.row == previous.row and
+            placement.column == previous.column and
+            placement.columns == previous.columns and
+            placement.rows == previous.rows;
+    }
+    return false;
+}
 const frame_scroll_plan = @import("frame_scroll_plan.zig");
 const frame_surface = @import("frame_surface.zig");
 const paint_plan = @import("paint_plan.zig");
@@ -587,22 +610,23 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     //
     // Pixels go out when the overlay changes, and again on a full repaint,
     // which is the one frame where the terminal may have discarded its image
-    // layer. Kitty keeps a placement until it is deleted, so any change clears
-    // the ids the previous frame used before drawing the new ones; otherwise a
-    // moved preview leaves a ghost at its old cells.
+    // layer. Kitty keeps a placement until it is deleted, so a placement that
+    // is gone, or that moved, has its id deleted before the new copy is drawn;
+    // a placement that is still there with the same cells is left alone. A
+    // terminal that answers a same-id delete-then-redraw pair by dropping the
+    // redraw is exactly why the delete skips what is being drawn.
     const wanted_fingerprint: u64 = if (input.image_overlay) |overlay|
         if (overlay.isEmpty()) 0 else overlay.fingerprint()
     else
         0;
-    const wanted_highest: u32 = if (input.image_overlay) |overlay| overlay.highest_id else 0;
     const overlay_changed = wanted_fingerprint != last_image_overlay_fingerprint;
     const overlay_resend = wanted_fingerprint != 0 and full_repaint;
     if (overlay_changed or overlay_resend) {
         var image_bytes: std.Io.Writer.Allocating = .init(alloc);
         defer image_bytes.deinit();
-        const clear_top = @max(last_image_overlay_highest, wanted_highest);
-        if (clear_top != 0) {
-            image_overlay_module.writeClear(&image_bytes.writer, clear_top) catch {};
+        for (last_image_overlay) |previous| {
+            if (overlayWants(previous.id, input.image_overlay, previous)) continue;
+            image_overlay_module.writeDelete(&image_bytes.writer, previous.id) catch {};
         }
         if (wanted_fingerprint != 0) {
             image_overlay_module.write(&image_bytes.writer, input.image_overlay.?.*) catch {};
@@ -617,7 +641,22 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
             _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
         }
         last_image_overlay_fingerprint = wanted_fingerprint;
-        last_image_overlay_highest = wanted_highest;
+        if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
+        if (input.image_overlay) |overlay| {
+            const snapshots = try alloc.alloc(OverlaySnapshot, overlay.placements.len);
+            for (overlay.placements, 0..) |placement, index| {
+                snapshots[index] = .{
+                    .id = placement.image_id,
+                    .row = placement.row,
+                    .column = placement.column,
+                    .columns = placement.columns,
+                    .rows = placement.rows,
+                };
+            }
+            last_image_overlay = snapshots;
+        } else {
+            last_image_overlay = &[_]OverlaySnapshot{};
+        }
     }
 
     debug_trace.logf(

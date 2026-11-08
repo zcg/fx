@@ -125,8 +125,13 @@ fn writeOne(w: *Writer, placement: Placement) !void {
 pub fn writeClear(w: *Writer, highest_id: u32) !void {
     var id: u32 = 1;
     while (id <= highest_id) : (id += 1) {
-        try w.print("\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{id});
+        try writeDelete(w, id);
     }
+}
+
+/// Writes the sequence that removes one image id and its placements.
+pub fn writeDelete(w: *Writer, image_id: u32) !void {
+    try w.print("\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{image_id});
 }
 
 /// Standard base64 with `=` padding, which is what the protocol expects.
