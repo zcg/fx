@@ -408,6 +408,31 @@ pub fn Runtime(comptime App: type) type {
                         _ = try app_render_runtime.Runtime(App).resetVisualEpoch(app, .ctrl_l);
                     }
                 },
+                .toggle_image_preview => {
+                    // Shows the newest pasted image, and the next press hides
+                    // it. A key is what the preview has to use: the pointer
+                    // would need mouse reporting, and a terminal that reports
+                    // stops scrolling itself.
+                    if (comptime agents.hasAgentField(App, "pending_images") and
+                        @hasField(App, "preview_pinned_id"))
+                    {
+                        const images = app.main_agent.pending_images.items;
+                        if (images.len == 0) {
+                            try app.writeDomainNotice(.{
+                                .topic = "images",
+                                .tone = .neutral,
+                                .body = "no pasted image to preview",
+                            }, true);
+                            return;
+                        }
+                        if (app.preview_pinned_id != null) {
+                            app.preview_pinned_id = null;
+                        } else {
+                            app.preview_pinned_id = images[images.len - 1].id;
+                        }
+                        app.shell.render_requests.request(.footer);
+                    }
+                },
                 .history_next => {
                     try completion_rt.navigatePromptHistory(app, agent, 1);
                     syncCatalogMenus(app, agent);
