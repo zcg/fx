@@ -41,6 +41,8 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const ui_surface_frame = @import("../../ui/footer/surface_frame.zig");
 const ui_image_strip = @import("../../ui/footer/image_strip.zig");
 const terminal_image = @import("../shared/terminal_image.zig");
+const gdiplus_decode = @import("../images/gdiplus_decode.zig");
+const Allocator = std.mem.Allocator;
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
@@ -2349,11 +2351,7 @@ fn buildImageOverlay(
     placements: *std.ArrayList(render_engine.image_overlay.Placement),
 ) !void {
     if (comptime !@hasField(App, "main_agent")) return;
-    debug_trace.logf("images", "overlay start supported={} images={d}", .{
-        render_engine.image_overlay.supported(terminal_image.current().drawsImages()),
-        app.main_agent.pending_images.items.len,
-    });
-    if (!render_engine.image_overlay.supported(terminal_image.current().drawsImages())) return;
+    if (!terminal_image.current().drawsImages()) return;
     const images = app.main_agent.pending_images.items;
     if (images.len == 0) return;
 
@@ -2364,39 +2362,89 @@ fn buildImageOverlay(
     }
     overlay.highest_id = highest;
 
-    // The newest attachment is the one the user just pasted, so it is the one
-    // to preview. A hover consumer can replace this choice later.
-    const target = images[images.len - 1];
-    const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, target.id) orelse {
-        debug_trace.logf("images", "overlay no anchor id={d} rows={d}", .{ target.id, footer_frame.composed.rows.items.len });
-        return;
-    };
-    const rect = ui_image_strip.previewRect(
-        anchor,
-        .{ .rows = layout.rows, .cols = layout.cols },
-        .{ .columns = ui_image_strip.preview_columns, .rows = ui_image_strip.preview_rows },
-    ) orelse return;
+    // The preview belongs to the badge the pointer is on: hover shows it,
+    // moving away drops it. A keyboard-only session never sets a hover
+    // position, so its composer simply has no preview, which is what every
+    // terminal can show anyway.
+    const hover = if (comptime @hasField(App, "hover_position")) app.hover_position else null;
+    if (hover == null) return;
+    for (images) |image| {
+        const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse continue;
+        const over_badge = hover.?.row == anchor.row and
+            hover.?.column >= anchor.column and
+            hover.?.column < anchor.column + anchor.width;
+        if (!over_badge) continue;
 
-    // The terminal opens the file and detects the format itself. No bytes are
-    // read here: a JPEG sent as `f=100` would be dropped, and holding a
-    // megabyte of pixels in fx's memory for a preview is unnecessary.
-    const path = target.path;
-    debug_trace.logf("images", "overlay file path={s} rect={d},{d} {d}x{d}", .{
-        path,
-        rect.row,
-        rect.column,
-        rect.columns,
-        rect.rows,
-    });
-    try placements.append(app.alloc, .{
-        .row = rect.row,
-        .column = rect.column,
-        .columns = rect.columns,
-        .rows = rect.rows,
-        .image_id = @intCast(target.id),
-        .source = .{ .file = path },
-    });
+        const rect = ui_image_strip.previewRect(
+            anchor,
+            .{ .rows = layout.rows, .cols = layout.cols },
+            .{ .columns = ui_image_strip.preview_columns, .rows = ui_image_strip.preview_rows },
+        ) orelse continue;
+
+        const png = previewPngFor(app.alloc, image.id, image.path) orelse {
+            debug_trace.logf("images", "overlay decode failed path={s}", .{image.path});
+            continue;
+        };
+        debug_trace.logf("images", "overlay png bytes={d} rect={d},{d} {d}x{d}", .{
+            png.len,
+            rect.row,
+            rect.column,
+            rect.columns,
+            rect.rows,
+        });
+        try placements.append(app.alloc, .{
+            .row = rect.row,
+            .column = rect.column,
+            .columns = rect.columns,
+            .rows = rect.rows,
+            .image_id = @intCast(image.id),
+            .png = png,
+        });
+    }
     overlay.placements = placements.items;
+}
+
+/// The PNG bytes the preview is showing, decoded once per image.
+///
+/// A frame is rebuilt on every keystroke, and decoding a photograph plus
+/// re-encoding it as a PNG costs more than the frame can hide. The bytes are
+/// held only while the same image is on screen: pasting another one, or
+/// sending the draft away, drops them again. Nothing here outlives the draft,
+/// because a sent image is only a record of having sent one.
+var preview_png_id: ?usize = null;
+var preview_png_bytes: ?[]u8 = null;
+
+fn previewPngFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]u8 {
+    if (preview_png_id != null and preview_png_id.? == image_id and preview_png_bytes != null) {
+        return preview_png_bytes;
+    }
+    if (preview_png_bytes) |held| alloc.free(held);
+    preview_png_id = null;
+    preview_png_bytes = null;
+
+    // Windows decodes every format through GDI+, scaled to the preview box so
+    // the transfer stays small. Off Windows there is no system decoder wired
+    // up yet: a PNG file passes through as-is, and other formats skip the
+    // preview until one is added.
+    if (gdiplus_decode.decodeToPreviewPng(
+        alloc,
+        path,
+        ui_image_strip.preview_columns,
+        ui_image_strip.preview_rows,
+    )) |png| {
+        preview_png_id = image_id;
+        preview_png_bytes = png;
+        return png;
+    } else |_| {}
+
+    const bytes = ui_image_strip.readPreviewPng(alloc, path) catch return null;
+    if (!std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) {
+        alloc.free(bytes);
+        return null;
+    }
+    preview_png_id = image_id;
+    preview_png_bytes = bytes;
+    return bytes;
 }
 fn FramePaintContext(comptime App: type) type {
     return struct {

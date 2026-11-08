@@ -440,6 +440,8 @@ const App = struct {
     pub const input_limits = paste_framing.default_input_limits;
     pub const build_update_channel = compiled_update_channel;
     pub const build_revision = build_options.git_commit;
+    /// Where the pointer last moved with no button down, in 1-based cells.
+    pub const HoverPosition = struct { row: u16, column: u16 };
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
@@ -615,6 +617,10 @@ const App = struct {
     should_exit: bool = false,
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
+    /// Where the pointer last moved with no button down, in terminal cells.
+    /// A hover preview is built from this; the paste flow itself never reads
+    /// it, so a mouse-driven session and a keyboard-only one behave alike.
+    hover_position: ?HoverPosition = null,
     /// The main conversation's own state.
     main_agent: agents.Agent = .{},
     /// The agent the main loop is working for. Null means main, so `App` can

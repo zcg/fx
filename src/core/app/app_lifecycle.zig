@@ -50,11 +50,10 @@ const normal_exit_restore_prefix = ui_terminal.theme_notification_disable_sequen
 const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m";
 const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
-// `?1000h` reports button presses and `?1002h` reports motion while a button
-// is held. `?1003h` would report every motion, but nothing consumes a hover
-// yet, so leaving it on would only flood the input loop with events that are
-// thrown away. It is enabled when a hover consumer is wired up.
-const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+// `?1000h` reports button presses, `?1002h` motion while a button is held,
+// and `?1003h` every motion. The last is what makes a hover possible: a
+// pointer that moves with no button down is otherwise silent.
+const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 
 /// Original handlers, written at bootstrap and restored at shutdown.
 /// Signal context never mutates them.

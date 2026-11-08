@@ -1010,10 +1010,19 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (resolved == .mouse_pointer and resolved.mouse_pointer.kind == .hover) {
-                // A pointer move with no button down is not a click. It only
-                // exists so a hover state can be built from it; until that
-                // state is wired up, letting it reach the composer would move
-                // the caret on every mouse move.
+                // A pointer move with no button down is not a click. The
+                // position is kept so the image preview can hit-test the
+                // badge under the pointer, and a move that changes the
+                // hovered cell redraws the frame the preview lives in.
+                const pointer = resolved.mouse_pointer;
+                const previous = app.hover_position;
+                const changed = previous == null or
+                    previous.?.row != pointer.row or previous.?.column != pointer.column;
+                app.hover_position = .{ .row = pointer.row, .column = pointer.column };
+                if (changed) {
+                    app.shell.render_requests.request(.transcript);
+                    app.shell.render_requests.request(.footer);
+                }
                 return .done;
             }
 

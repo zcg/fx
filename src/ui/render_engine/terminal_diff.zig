@@ -38,6 +38,11 @@ fn recordOverlayWrite(byte_count: usize, placement_count: usize) void {
 
 const frame_cell_match = @import("frame_cell_match.zig");
 const image_overlay_module = @import("image_overlay.zig");
+
+/// The overlay the terminal is currently showing, so pixels are sent when it
+/// changes rather than on every frame that redraws a line of text.
+var last_image_overlay_fingerprint: u64 = 0;
+var last_image_overlay_highest: u32 = 0;
 const frame_scroll_plan = @import("frame_scroll_plan.zig");
 const frame_surface = @import("frame_surface.zig");
 const paint_plan = @import("paint_plan.zig");
@@ -608,24 +613,37 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     // payload has no cells to check. This is exactly the order a terminal
     // needs -- text first, then pixels anchored to absolute cells.
     //
-    // A file placement is only a few dozen bytes, so it is sent on every
-    // committed frame. That is deliberate: a terminal can lose its image layer
-    // on resize, clear, or a full repaint, and a cached "already sent" flag
-    // would then leave the user with a badge and no picture until the image
-    // itself changed.
-    if (input.image_overlay) |overlay| {
-        if (!overlay.isEmpty()) {
-            var image_bytes: std.Io.Writer.Allocating = .init(alloc);
-            defer image_bytes.deinit();
-            image_overlay_module.write(&image_bytes.writer, overlay.*) catch {};
-            if (image_bytes.written().len != 0) {
-                // Unconditional diagnostic: a preview that never reaches the
-                // terminal is otherwise invisible in every trace scope. One
-                // line per write, to a file outside the repo, with a timestamp.
-                recordOverlayWrite(image_bytes.written().len, overlay.placements.len);
-                _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
-            }
+    // Pixels go out when the overlay changes, and again on a full repaint,
+    // which is the one frame where the terminal may have discarded its image
+    // layer. Kitty keeps a placement until it is deleted, so any change clears
+    // the ids the previous frame used before drawing the new ones; otherwise a
+    // moved preview leaves a ghost at its old cells.
+    const wanted_fingerprint: u64 = if (input.image_overlay) |overlay|
+        if (overlay.isEmpty()) 0 else overlay.fingerprint()
+    else
+        0;
+    const wanted_highest: u32 = if (input.image_overlay) |overlay| overlay.highest_id else 0;
+    const overlay_changed = wanted_fingerprint != last_image_overlay_fingerprint;
+    const overlay_resend = wanted_fingerprint != 0 and full_repaint;
+    if (overlay_changed or overlay_resend) {
+        var image_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer image_bytes.deinit();
+        const clear_top = @max(last_image_overlay_highest, wanted_highest);
+        if (clear_top != 0) {
+            image_overlay_module.writeClear(&image_bytes.writer, clear_top) catch {};
         }
+        if (wanted_fingerprint != 0) {
+            image_overlay_module.write(&image_bytes.writer, input.image_overlay.?.*) catch {};
+        }
+        if (image_bytes.written().len != 0) {
+            // Unconditional diagnostic: a preview that never reaches the
+            // terminal is otherwise invisible in every trace scope. One line
+            // per write, to a file outside the repo, with a timestamp.
+            recordOverlayWrite(image_bytes.written().len, if (input.image_overlay) |overlay| overlay.placements.len else 0);
+            _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
+        }
+        last_image_overlay_fingerprint = wanted_fingerprint;
+        last_image_overlay_highest = wanted_highest;
     }
 
     debug_trace.logf(
@@ -1721,6 +1739,7 @@ const TestFrameCommitOptions = struct {
     prepared_movement: ?*const PreparedTerminalMovement = null,
     synchronized_update: ?bool = null,
     history_reset_uses_ris: bool = false,
+    image_overlay: ?*const image_overlay_module.Overlay = null,
 };
 
 fn flush_test_frame(
@@ -1754,7 +1773,51 @@ fn flush_test_frame(
         .prepared_movement = options.prepared_movement,
         .sink = sink.frameSink(),
         .metrics = &metrics,
+        .image_overlay = options.image_overlay,
     });
+}
+
+test "an image overlay reaches the sink after the text frame commits" {
+    const alloc = std.testing.allocator;
+    var previous = try vt_emulator.Grid.init(alloc, 20, 6);
+    defer previous.deinit();
+    var sink = TestSink{};
+    defer sink.deinit(alloc);
+
+    const placements = [_]image_overlay_module.Placement{.{
+        .row = 2,
+        .column = 3,
+        .columns = 12,
+        .rows = 4,
+        .image_id = 7,
+        .source = .{ .file = "C:\\shots\\a.jpg" },
+    }};
+    const overlay = image_overlay_module.Overlay{
+        .placements = &placements,
+        .highest_id = 7,
+    };
+
+    const result = try flush_test_frame(&previous, &sink, .{ .image_overlay = &overlay });
+    try std.testing.expect(result.is_committed());
+
+    // The image bytes are a separate write, after the text, and they carry a
+    // file placement rather than a PNG payload.
+    try std.testing.expect(sink.write_calls >= 2);
+    const written = sink.bytes.items;
+    try std.testing.expect(std.mem.find(u8, written, "\x1b_Ga=T,q=2,i=7,c=12,r=4,C=1,t=f;") != null);
+    try std.testing.expect(std.mem.find(u8, written, "Qzpcc2hvdHNcYS5qcGc=") != null);
+    try std.testing.expect(std.mem.find(u8, written, "\x1b8") != null);
+}
+
+test "an empty overlay does not add a write" {
+    const alloc = std.testing.allocator;
+    var previous = try vt_emulator.Grid.init(alloc, 20, 6);
+    defer previous.deinit();
+    var sink = TestSink{};
+    defer sink.deinit(alloc);
+    const result = try flush_test_frame(&previous, &sink, .{});
+    try std.testing.expect(result.is_committed());
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b_Ga=T") == null);
 }
 
 test "append pending wrap real sink preserves occupied last cell in history" {

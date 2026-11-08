@@ -88,6 +88,11 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
     exe.root_module.addImport("fuzz_corpus", fuzz_corpus);
     exe.root_module.addImport("fuzz_seed", fuzz_seed);
+    // The image preview decodes pasted photographs with the system's own GDI+,
+    // which every Windows install ships and nothing else in fx needs.
+    if (target.result.os.tag == .windows) {
+        exe.root_module.linkSystemLibrary("gdiplus", .{});
+    }
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
     session_manager.sanitize_thread = sanitize_thread;
 
