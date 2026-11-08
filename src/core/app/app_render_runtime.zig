@@ -2361,14 +2361,11 @@ fn buildImageOverlay(
     }
     if (!terminal_image.current().drawsImages()) return;
 
-    // A badge is shown with no pointer mode at all.
-    //
-    // Asking the terminal to report mouse events is what took scrolling away:
-    // a terminal that reports stays put and forwards the wheel, and nothing in
-    // the composer consumes it, so the transcript froze at the fold. The
-    // preview is therefore keyboard-driven -- the badge carries a number and
-    // `/image N` shows it -- which also survives a crash with no terminal mode
-    // to restore.
+    // Pointer reporting is armed only while a badge exists, because a badge is
+    // the one thing in the composer that reads a click. Events that arrive
+    // while nothing reads them are handled by scrolling the terminal, so the
+    // wheel keeps working either way.
+    app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, true);
 
     const layout = app.shell.layout;
     var highest: u32 = 0;

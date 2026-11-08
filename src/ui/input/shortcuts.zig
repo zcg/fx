@@ -22,7 +22,6 @@ pub fn fromControlByte(byte: u8) ?ShortcutAction {
         25 => .yank,
         31 => .undo,
         12 => .redraw,
-        16 => .toggle_image_preview,
         127, 8 => .delete_backward,
         '\n' => .insert_newline,
         else => null,

@@ -408,31 +408,6 @@ pub fn Runtime(comptime App: type) type {
                         _ = try app_render_runtime.Runtime(App).resetVisualEpoch(app, .ctrl_l);
                     }
                 },
-                .toggle_image_preview => {
-                    // Shows the newest pasted image, and the next press hides
-                    // it. A key is what the preview has to use: the pointer
-                    // would need mouse reporting, and a terminal that reports
-                    // stops scrolling itself.
-                    if (comptime agents.hasAgentField(App, "pending_images") and
-                        @hasField(App, "preview_pinned_id"))
-                    {
-                        const images = app.main_agent.pending_images.items;
-                        if (images.len == 0) {
-                            try app.writeDomainNotice(.{
-                                .topic = "images",
-                                .tone = .neutral,
-                                .body = "no pasted image to preview",
-                            }, true);
-                            return;
-                        }
-                        if (app.preview_pinned_id != null) {
-                            app.preview_pinned_id = null;
-                        } else {
-                            app.preview_pinned_id = images[images.len - 1].id;
-                        }
-                        app.shell.render_requests.request(.footer);
-                    }
-                },
                 .history_next => {
                     try completion_rt.navigatePromptHistory(app, agent, 1);
                     syncCatalogMenus(app, agent);
@@ -1135,7 +1110,36 @@ pub fn Runtime(comptime App: type) type {
                 .page_down,
                 .mouse_wheel,
                 .mouse_pointer,
-                => {},
+                => {
+                    // The composer reads clicks, not scrolls, but the terminal
+                    // stops scrolling itself while it is reporting mouse
+                    // events. So the wheel and the page keys are scrolled here
+                    // instead of being dropped: without this the transcript
+                    // froze at the fold and the user could not reach history.
+                    const lines: i32 = switch (decoded) {
+                        .page_up => -@as(i32, @intCast(@max(1, app.shell.layout.rows -| 3))),
+                        .page_down => @as(i32, @intCast(@max(1, app.shell.layout.rows -| 3))),
+                        .mouse_wheel => |direction| switch (direction) {
+                            .up => -3,
+                            .down => 3,
+                        },
+                        else => 0,
+                    };
+                    if (lines != 0) {
+                        // `CSI n S` scrolls the viewport up by n lines and
+                        // `CSI n T` down, which is the terminal's own history
+                        // buffer: fx keeps no scroll state of its own.
+                        var sequence: [24]u8 = undefined;
+                        const written = if (lines < 0)
+                            std.mem.print(&sequence, "\x1b[{d}S", .{-lines})
+                        else
+                            std.mem.print(&sequence, "\x1b[{d}T", .{lines});
+                        const bytes = written catch "";
+                        if (bytes.len != 0) {
+                            _ = io_mod.writeFd(app.shell.stdout_file.handle, bytes) catch {};
+                        }
+                    }
+                },
                 .clear_line => {
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     if (draftHasState(app, agents.screenAgentOf(app))) {
