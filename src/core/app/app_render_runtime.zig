@@ -995,6 +995,17 @@ pub fn Runtime(comptime App: type) type {
                         render_requests.animation_next_deadline_ms,
                     },
                 );
+                // The attempt was rolled back above, so the terminal and the
+                // committed transcript still agree; only this frame is lost.
+                // A rendering disagreement says the scroll model and the
+                // terminal drifted apart for one frame, which the next frame
+                // resolves by repainting from the restored anchor. Ending the
+                // session over it would turn a repaint into a lost
+                // conversation, so these errors are absorbed here.
+                if (isRecoverableFrameError(err)) {
+                    render_requests.request(.transcript);
+                    return;
+                }
                 return err;
             };
             const result = attempted orelse {
@@ -1109,6 +1120,25 @@ pub fn Runtime(comptime App: type) type {
                 return err;
             };
             return result;
+        }
+
+        /// Whether a failed frame attempt is a rendering disagreement that the
+        /// next frame can resolve, rather than a fault worth ending the session
+        /// for.
+        ///
+        /// The attempt has already been rolled back when this runs, so the
+        /// terminal and the committed transcript agree; these errors mean the
+        /// scroll and paint model disagreed about one frame, which a repaint
+        /// from the restored anchor fixes. Errors outside this set, such as an
+        /// allocation failure or an I/O fault, still end the session, because
+        /// retrying them would only fail the same way.
+        fn isRecoverableFrameError(err: anyerror) bool {
+            return switch (err) {
+                error.InvalidTranscriptTransition,
+                error.InvalidFrameScrollPlan,
+                => true,
+                else => false,
+            };
         }
 
         fn transcriptInputPending(context: *anyopaque) bool {
