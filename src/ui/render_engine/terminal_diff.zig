@@ -94,7 +94,6 @@ pub const FrameReset = enum {
         return if (history_reset_uses_ris) .ris else .clear;
     }
 };
-
 pub const FrameCommitInput = struct {
     previous: *vt_emulator.Grid,
     surface: *const frame_surface.FrameSurface,
@@ -615,6 +614,18 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     // a placement that is still there with the same cells is left alone. A
     // terminal that answers a same-id delete-then-redraw pair by dropping the
     // redraw is exactly why the delete skips what is being drawn.
+    //
+    // A reset frame clears the terminal, and with it every placement. Forgetting
+    // this made the full transcript screen come up blank: the layout drops the
+    // picture rows when a viewer takes the screen, so the frame carries no
+    // overlay, but the remembered placement still pointed at cells that no
+    // longer exist and the frame was written against a picture that had already
+    // been erased.
+    if (reset != .none) {
+        if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
+        last_image_overlay = &[_]OverlaySnapshot{};
+        last_image_overlay_fingerprint = 0;
+    }
     const wanted_fingerprint: u64 = if (input.image_overlay) |overlay|
         if (overlay.isEmpty()) 0 else overlay.fingerprint()
     else
