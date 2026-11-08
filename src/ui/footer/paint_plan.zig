@@ -1,4 +1,7 @@
 const std = @import("std");
+const io_mod = @import("../../core/shared/io.zig");
+const image_strip = @import("image_strip.zig");
+const terminal_image = @import("../../core/shared/terminal_image.zig");
 const question_state = @import("../../core/agent/question_prompt.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -78,6 +81,10 @@ pub const FooterPlannerInput = struct {
     footer_gap_active: bool = false,
     banner_active: bool,
     banner_rows: u16 = 0,
+    /// Rows above the composer reserved for image thumbnails. They sit in the
+    /// banner band, above the top divider, because the terminal draws them over
+    /// those rows and the composer keeps its own place.
+    image_rows: u16 = 0,
     footer_extra_rows: ?u16 = null,
     allocated_rows: ?u16 = null,
     applied_bottom_reserved_rows: u16 = 0,
@@ -274,6 +281,10 @@ fn resolvePlannerFooterRows(
     footer_extra_rows: u16,
     activity_offset: u16,
 ) FooterRows {
+    // Thumbnails and the steering banner share the band above the top divider:
+    // both are extra rows the composer sits below, and only one of them needs
+    // the space at a time in practice.
+    const banner_rows = input.banner_rows +| input.image_rows;
     return footer_layout.resolve(.{
         .footer_top_for_extra = footer_top_for_extra,
         .terminal_rows = shell.layout.rows,
@@ -283,8 +294,8 @@ fn resolvePlannerFooterRows(
         .input_visible = input.input_visible,
         .composer_top_chrome_rows = input.composer_top_chrome_rows,
         .picker_rows = input.picker_rows,
-        .banner_active = input.banner_active,
-        .banner_rows = input.banner_rows,
+        .banner_active = input.banner_active or input.image_rows > 0,
+        .banner_rows = banner_rows,
         .allocated_rows = input.allocated_rows,
     });
 }
@@ -663,6 +674,7 @@ pub fn composeFooterFrame(
     var frame = footer_viewport.ComposedFooterFrame{};
     errdefer frame.deinit(alloc);
 
+    try pushImageStripRows(alloc, &frame, plan, input, ctx, shell.layout.cols);
     try pushSteeringRows(alloc, &frame, plan, ctx, shell.layout.cols);
 
     const needs_top_divider = !input.input_visible or input.composer_top_chrome_rows > 0;
@@ -1167,6 +1179,82 @@ fn composeAndPushVisibleInputRows(
     }
     return placement;
 }
+
+/// Draws the attached images as thumbnails in the band above the composer.
+///
+/// The rows are already reserved by `resolvePlannerFooterRows`, so this writes
+/// the pixels into them and nothing else: the caller keeps its cursor moves and
+/// the composer stays where it was. A terminal without an image protocol takes
+/// the early return and the badge stays the whole story.
+fn pushImageStripRows(
+    alloc: Allocator,
+    frame: *footer_viewport.ComposedFooterFrame,
+    plan: PaintPlan,
+    input: FooterPlannerInput,
+    ctx: render_input.RenderContext,
+    terminal_cols: u16,
+) !void {
+    if (plan.footer.banner_rows == 0) return;
+    if (input.image_rows == 0) return;
+    if (ctx.pending_images.len == 0) return;
+
+    const protocol = terminal_image.current();
+    if (!protocol.drawsImages()) return;
+
+    var ids = try alloc.alloc(usize, ctx.pending_images.len);
+    defer alloc.free(ids);
+    var paths = try alloc.alloc([]const u8, ctx.pending_images.len);
+    defer alloc.free(paths);
+    var highest: u32 = 0;
+    for (ctx.pending_images, 0..) |attachment, index| {
+        ids[index] = attachment.id;
+        paths[index] = attachment.path;
+        highest = @max(highest, @as(u32, @intCast(attachment.id)));
+    }
+
+    for (0..input.image_rows) |offset| {
+        const row = plan.footer.banner + @as(u16, @intCast(offset));
+        if (!plan.footer_band.isEmpty() and !plan.footer_band.containsRow(row)) continue;
+        var text: std.ArrayList(u8) = .empty;
+        // The first reserved row carries the whole strip: the terminal places
+        // every thumbnail from one cursor position, and the rest of the rows
+        // stay blank so the pictures are not painted over.
+        if (offset == 0) {
+            var writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &text);
+            image_strip.writeStrip(&writer.writer, alloc, .{
+                .ids = ids,
+                .paths = paths,
+                .highest_id = highest,
+            }, ImageThumbnailSource{}, terminal_cols) catch {};
+            text = writer.toArrayList();
+        }
+        try frame.pushComposedRow(alloc, row, &text);
+    }
+}
+
+/// Reads the bytes for a pasted image so the strip can send them.
+///
+/// The terminal scales the raster into the cell box itself, so the source can
+/// stay whatever the user pasted: no decode, no re-encode, no resampling here.
+/// What it cannot do is send an enormous file, so anything past the limit is
+/// skipped and the badge stays. The limit matches what the terminals themselves
+/// guard against, not what the model accepts: this path never touches the bytes
+/// that reach a provider.
+const ImageThumbnailSource = struct {
+    const limit = 32 * 1024 * 1024;
+
+    pub fn get(_: *const @This(), path: []const u8) ![]const u8 {
+        const alloc = std.heap.c_allocator;
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return error.NoThumbnail;
+        defer file.close(io_mod.getIo());
+        const bytes = io_mod.readFileToEnd(alloc, &file, limit) catch return error.NoThumbnail;
+        if (bytes.len == 0) {
+            alloc.free(bytes);
+            return error.NoThumbnail;
+        }
+        return bytes;
+    }
+};
 
 fn pushFooterBandRow(
     alloc: Allocator,

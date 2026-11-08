@@ -35,6 +35,12 @@ pub const Protocol = enum {
 /// Pick the protocol from the environment. `getenv` is a parameter so a host
 /// that supplies its own environment, such as the WebAssembly runtime, answers
 /// for itself.
+///
+/// The environment is only a hint. A terminal can implement Kitty graphics
+/// without naming itself in `TERM` or setting `KITTY_WINDOW_ID`, which is what
+/// ELYTerminal does: it reports `TERM=xterm-256color` and marks itself with its
+/// own `ELY_*` variables instead. `probeKitty` asks the terminal directly and
+/// is what settles the question when a TTY is available.
 pub fn detect(getenv: anytype) Protocol {
     // Kitty sets KITTY_WINDOW_ID in every kitty window, including ones started
     // over ssh, so it is the most direct signal there is.
@@ -46,6 +52,11 @@ pub fn detect(getenv: anytype) Protocol {
     if (getenv("TERM")) |term| {
         if (mentions(term, "kitty") or mentions(term, "ghostty")) return .kitty;
     }
+    // ELYTerminal draws Kitty graphics while calling itself an xterm, so its
+    // own variables are the only signal it gives. `ELY_CMD_PROMPT` is set in
+    // every one of its shells.
+    if (getenv("ELY_CMD_PROMPT") != null) return .kitty;
+    if (getenv("ELY_TERMINAL") != null) return .kitty;
     // WezTerm and mintty both answer to iTerm2's protocol.
     if (getenv("TERM_PROGRAM")) |program| {
         if (std.ascii.eqlIgnoreCase(program, "iTerm.app") or

@@ -28,6 +28,8 @@ const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const surface_invalidation = @import("surface_invalidation.zig");
 const footer_paint_plan = @import("paint_plan.zig");
+const image_strip = @import("image_strip.zig");
+const terminal_image = @import("../../core/shared/terminal_image.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const render_engine = @import("../render_engine.zig");
@@ -125,6 +127,8 @@ const FooterSurfaceProjection = struct {
     banner_active: bool,
     banner_rows: u16,
     footer_extra: u16,
+    /// Rows above the composer reserved for image thumbnails.
+    image_rows: u16,
     total_lines: u16,
     show_picker: bool,
     picker_kind: PickerKind,
@@ -172,6 +176,7 @@ const FooterSurfaceProjection = struct {
             .footer_gap_active = self.footer_gap_active,
             .banner_active = self.banner_active,
             .banner_rows = self.banner_rows,
+            .image_rows = self.image_rows,
             .footer_extra_rows = self.footer_extra,
             .allocated_rows = self.allocated_rows,
             .applied_bottom_reserved_rows = applied_bottom_reserved_rows,
@@ -695,6 +700,13 @@ fn buildFooterSurfaceProjection(
             null,
     };
     const picker_extra: u16 = if (modal_active) picker_rows else if (show_picker) picker_rows + 1 else 0;
+    // Thumbnails sit above the composer, so the footer reserves their rows.
+    // A terminal without an image protocol reports zero here and nothing above
+    // the composer changes: the badge stays the whole story.
+    const image_rows: u16 = if (viewer_active or modal_active)
+        0
+    else
+        image_strip.rowsFor(terminal_image.current(), ctx.pending_images.len);
     return .{
         .active_label = active_label,
         .activity_projection = activity_projection,
@@ -710,7 +722,8 @@ fn buildFooterSurfaceProjection(
         .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0),
         .banner_active = banner_active,
         .banner_rows = banner_rows,
-        .footer_extra = geometry.input_extra + banner_rows + picker_extra,
+        .footer_extra = geometry.input_extra + banner_rows + picker_extra + image_rows,
+        .image_rows = image_rows,
         .total_lines = geometry.total_lines,
         .show_picker = show_picker,
         .picker_kind = picker_kind,
@@ -909,6 +922,9 @@ pub const SurfaceFooterMeasurement = struct {
     banner_active: bool = false,
     banner_rows: u16 = 0,
     footer_extra: u16 = 0,
+    /// Rows above the composer reserved for image thumbnails. Zero when the
+    /// terminal cannot draw them or nothing is attached.
+    image_rows: u16 = 0,
     total_lines: u16 = 1,
     show_picker: bool = false,
     picker_kind: PickerKind = .model_stage,
@@ -1203,6 +1219,7 @@ pub noinline fn measureSurfaceFooter(
         }
     }
     measurement.footer_extra = projection.footer_extra;
+    measurement.image_rows = projection.image_rows;
 
     return measurement;
 }
