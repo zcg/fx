@@ -703,10 +703,27 @@ fn buildFooterSurfaceProjection(
     // Thumbnails sit above the composer, so the footer reserves their rows.
     // A terminal without an image protocol reports zero here and nothing above
     // the composer changes: the badge stays the whole story.
+    //
+    // The strip only appears when the window has room for it. Reserving rows
+    // that the footer cannot fit would push its band into scrollback, and the
+    // paint plan rejects a frame like that outright, so the composer is what
+    // gets protected here and the thumbnails are what give way.
     const image_rows: u16 = if (viewer_active or modal_active)
         0
     else
         image_strip.rowsFor(terminal_image.current(), ctx.pending_images.len);
+    const usable_image_rows: u16 = blk: {
+        if (image_rows == 0) break :blk 0;
+        const scrollback_floor: u16 = if (shell.owned_top_row > 1) shell.owned_top_row else 1;
+        const below_floor = shell.layout.rows -| scrollback_floor + 1;
+        const composer_needs = footer_layout.reservedBaseRows(
+            input_visible,
+            composer_top_chrome_rows,
+        );
+        // Everything the footer already asks for, before the strip.
+        const taken = composer_needs +| geometry.input_extra +| banner_rows +| picker_extra +| 2;
+        break :blk if (below_floor > taken) @min(image_rows, below_floor - taken) else 0;
+    };
     return .{
         .active_label = active_label,
         .activity_projection = activity_projection,
@@ -722,8 +739,8 @@ fn buildFooterSurfaceProjection(
         .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0),
         .banner_active = banner_active,
         .banner_rows = banner_rows,
-        .footer_extra = geometry.input_extra + banner_rows + picker_extra + image_rows,
-        .image_rows = image_rows,
+        .footer_extra = geometry.input_extra + banner_rows + picker_extra + usable_image_rows,
+        .image_rows = usable_image_rows,
         .total_lines = geometry.total_lines,
         .show_picker = show_picker,
         .picker_kind = picker_kind,
@@ -1007,7 +1024,8 @@ pub const SurfaceFooterMeasurement = struct {
     }
 
     pub noinline fn frameLayoutRows(self: *const SurfaceFooterMeasurement, terminal_rows: u16, top: u16) FooterRows {
-        const banner_rows: u16 = if (self.banner_rows > 0) self.banner_rows else if (self.banner_active) 1 else 0;
+        const base_banner: u16 = if (self.banner_rows > 0) self.banner_rows else if (self.banner_active) 1 else 0;
+        const banner_rows: u16 = base_banner;
         const natural_rows = self.frameLayoutMeasurement().natural_rows;
         const available_rows = if (top > 0 and top <= terminal_rows)
             terminal_rows - top + 1
@@ -1055,6 +1073,7 @@ pub const SurfaceFooterMeasurement = struct {
             .footer_gap_active = self.footer_gap_active,
             .banner_active = banner_active,
             .banner_rows = banner_rows,
+            .image_rows = self.image_rows,
             .footer_extra_rows = self.footer_extra,
             .allocated_rows = if (self.file_approval_active)
                 self.frameLayoutMeasurement().natural_rows

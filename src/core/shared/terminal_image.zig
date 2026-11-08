@@ -57,6 +57,9 @@ pub fn detect(getenv: anytype) Protocol {
     // every one of its shells.
     if (getenv("ELY_CMD_PROMPT") != null) return .kitty;
     if (getenv("ELY_TERMINAL") != null) return .kitty;
+    // Windows Terminal speaks Sixel rather than Kitty, and marks itself with
+    // `WT_SESSION` in every tab.
+    if (getenv("WT_SESSION") != null) return .sixel;
     // WezTerm and mintty both answer to iTerm2's protocol.
     if (getenv("TERM_PROGRAM")) |program| {
         if (std.ascii.eqlIgnoreCase(program, "iTerm.app") or
@@ -93,7 +96,18 @@ fn mentionsSixel(term: []const u8) bool {
 /// The protocol for this process, computed once.
 pub fn current() Protocol {
     if (comptime builtin.target.os.tag == .wasi) return .none;
+    if (probed) |answer| return answer;
     return detect(envLookup);
+}
+
+/// What the terminal answered when it was asked at startup. Null until a
+/// caller installs an answer.
+var probed: ?Protocol = null;
+
+/// Records what the terminal said about itself. `probeKitty` supplies the
+/// answer; a host without a TTY passes null and the environment decides.
+pub fn installProbe(answer: ?Protocol) void {
+    probed = answer;
 }
 
 /// The query a terminal answers when it can draw Kitty graphics.

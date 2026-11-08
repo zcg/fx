@@ -532,4 +532,4 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 * Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
 
-* Do not add dependencies outside the Zig standard library without discussion
+* A dependency outside the Zig standard library needs agreement before it lands. Weigh it by what it costs the binary and what writing the part you need yourself would take: a small, self-contained piece of a format is usually cheaper to own than a dependency, while a whole codec or a protocol with many edge cases is usually not. Never take a dependency that grows the release binary by a noticeable fraction of its budget for a feature that runs only on demand.

@@ -18,6 +18,7 @@
 //! the cell box so a scaled-down draw still looks sharp.
 
 const std = @import("std");
+const io_mod = @import("../../core/shared/io.zig");
 const terminal_image = @import("../../core/shared/terminal_image.zig");
 const terminal_image_render = @import("../../core/shared/terminal_image_render.zig");
 
@@ -46,17 +47,28 @@ pub const Strip = struct {
     highest_id: u32,
 };
 
+/// Whether thumbnails above the composer are drawn at all.
+///
+/// A thumbnail is decoration on top of the badge, so it must never cost the
+/// composer. The image sequence cannot travel inside a text row either: the
+/// terminal surface writes a band as rows of text, and a multi-megabyte APC
+/// string makes that band overflow. Drawing a thumbnail needs its own pass
+/// after the text, which is not built yet, so the badge stays the whole story.
+fn thumbnailsEnabled() bool {
+    return false;
+}
+
 /// How many rows a strip of `count` thumbnails needs, or 0 when there is
 /// nothing to draw.
 ///
 /// The caller reserves these rows. A count of zero keeps the composer exactly
 /// as it is today, which is what a terminal without an image protocol gets.
 pub fn rowsFor(protocol: terminal_image.Protocol, count: usize) u16 {
+    if (!thumbnailsEnabled()) return 0;
     if (!protocol.drawsImages()) return 0;
     if (count == 0) return 0;
     return thumbnail_rows;
 }
-
 /// Columns the first `count` thumbnails occupy, clamped to `available`.
 pub fn columnsFor(count: usize) u16 {
     if (count == 0) return 0;
@@ -72,32 +84,44 @@ pub fn columnsFor(count: usize) u16 {
 /// read them. A path that cannot be read is skipped rather than ending the
 /// draw, because a thumbnail is decoration and a broken one must not cost the
 /// user their composer.
+///
+/// `origin` is the row and column of the first thumbnail. Each placement moves
+/// the text cursor there first, because a Kitty placement with `C=1` leaves the
+/// cursor alone and every image would otherwise land on the previous one.
 pub fn writeStrip(
     w: *std.Io.Writer,
     alloc: Allocator,
     strip: Strip,
     png_for: anytype,
+    origin: Origin,
     available_columns: u16,
 ) !void {
     if (strip.ids.len == 0) return;
     const shown = @min(strip.ids.len, max_thumbnails);
     var column: u16 = 0;
     for (strip.ids[0..shown], strip.paths[0..shown]) |id, path| {
-        if (column + thumbnail_columns > available_columns) return;
+        if (origin.column + column + thumbnail_columns > available_columns) return;
         // A read failure leaves the badge in place and draws nothing here.
         const png: []const u8 = png_for.get(path) catch continue;
         defer freeBytes(alloc, png);
+        // Absolute placement, so two thumbnails never share a cell.
+        try w.print("\x1b[{d};{d}H", .{ origin.row, origin.column + column });
         try terminal_image_render.writePng(w, png, .{
             .columns = thumbnail_columns,
             .rows = thumbnail_rows,
             .image_id = @intCast(id),
         });
-        // The placement leaves the cursor where it started, so the next
-        // thumbnail needs the move spelled out.
-        try w.print("\x1b[{d}C", .{thumbnail_columns + gap_columns});
         column += thumbnail_columns + gap_columns;
     }
+    // Leave the cursor below the strip, where the composer expects it.
+    try w.print("\x1b[{d};{d}H", .{ origin.row + thumbnail_rows, origin.column });
 }
+
+/// Where the first thumbnail goes, in 1-based terminal coordinates.
+pub const Origin = struct {
+    row: u16,
+    column: u16,
+};
 
 /// Writes the sequences that remove every placement the strip owned.
 ///
@@ -149,7 +173,7 @@ test "the strip keeps the badge image ids as its placement ids" {
         .ids = &ids,
         .paths = &paths,
         .highest_id = 5,
-    }, Decoder{}, 200);
+    }, Decoder{}, .{ .row = 1, .column = 1 }, 200);
     const written = out.written();
     try std.testing.expect(std.mem.find(u8, written, "i=4,c=12,r=6") != null);
     try std.testing.expect(std.mem.find(u8, written, "i=5,c=12,r=6") != null);
@@ -173,7 +197,7 @@ test "an unreadable image is skipped without losing the rest of the strip" {
         .ids = &ids,
         .paths = &paths,
         .highest_id = 2,
-    }, Decoder{}, 200);
+    }, Decoder{}, .{ .row = 1, .column = 1 }, 200);
     const written = out.written();
     try std.testing.expect(std.mem.find(u8, written, "i=1,") == null);
     try std.testing.expect(std.mem.find(u8, written, "i=2,") != null);

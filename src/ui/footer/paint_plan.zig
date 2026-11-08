@@ -281,12 +281,14 @@ fn resolvePlannerFooterRows(
     footer_extra_rows: u16,
     activity_offset: u16,
 ) FooterRows {
-    // Thumbnails and the steering banner share the band above the top divider:
-    // both are extra rows the composer sits below, and only one of them needs
-    // the space at a time in practice.
-    const banner_rows = input.banner_rows +| input.image_rows;
+    // Rows above `owned_top_row` belong to scrollback and are not repainted, so
+    // the footer must not grow into them: a footer band that reaches one of
+    // those rows makes the paint plan reject the whole frame, which would take
+    // the composer down with it.
+    const min_top: u16 = if (shell.owned_top_row > 1) shell.owned_top_row else 1;
+    const clamped_top = @max(footer_top_for_extra, min_top);
     return footer_layout.resolve(.{
-        .footer_top_for_extra = footer_top_for_extra,
+        .footer_top_for_extra = clamped_top,
         .terminal_rows = shell.layout.rows,
         .activity_offset = activity_offset,
         .extra_input_rows = footer_extra_rows,
@@ -294,8 +296,8 @@ fn resolvePlannerFooterRows(
         .input_visible = input.input_visible,
         .composer_top_chrome_rows = input.composer_top_chrome_rows,
         .picker_rows = input.picker_rows,
-        .banner_active = input.banner_active or input.image_rows > 0,
-        .banner_rows = banner_rows,
+        .banner_active = input.banner_active,
+        .banner_rows = input.banner_rows,
         .allocated_rows = input.allocated_rows,
     });
 }
@@ -1194,7 +1196,6 @@ fn pushImageStripRows(
     ctx: render_input.RenderContext,
     terminal_cols: u16,
 ) !void {
-    if (plan.footer.banner_rows == 0) return;
     if (input.image_rows == 0) return;
     if (ctx.pending_images.len == 0) return;
 
@@ -1214,6 +1215,8 @@ fn pushImageStripRows(
 
     for (0..input.image_rows) |offset| {
         const row = plan.footer.banner + @as(u16, @intCast(offset));
+        // A row past the last one belongs to no band and would be rejected.
+        if (row == 0 or row > plan.layout.rows) return;
         if (!plan.footer_band.isEmpty() and !plan.footer_band.containsRow(row)) continue;
         var text: std.ArrayList(u8) = .empty;
         // The first reserved row carries the whole strip: the terminal places
@@ -1225,7 +1228,10 @@ fn pushImageStripRows(
                 .ids = ids,
                 .paths = paths,
                 .highest_id = highest,
-            }, ImageThumbnailSource{}, terminal_cols) catch {};
+            }, ImageThumbnailSource{}, .{
+                .row = row + 1,
+                .column = 1,
+            }, terminal_cols) catch {};
             text = writer.toArrayList();
         }
         try frame.pushComposedRow(alloc, row, &text);

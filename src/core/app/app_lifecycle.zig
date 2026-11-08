@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const terminal_image = @import("../shared/terminal_image.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const env_settings = @import("../config/env_settings.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -1087,6 +1088,16 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.terminal_title,
     );
     try cfg.terminal.enableRawMode();
+    // Ask the terminal what it can draw before the first frame, while the input
+    // stream is quiet. A terminal that speaks Kitty graphics answers at once;
+    // one that does not stays silent and the environment decides instead.
+    terminal_image.installProbe(terminal_image.probeKitty(
+        io_mod.getIo(),
+        io_mod.stdinHandle(),
+        io_mod.stdoutHandle(),
+        300,
+    ));
+    debug_trace.logf("images", "startup probe protocol={s}", .{@tagName(terminal_image.current())});
     cfg.terminal.installResizeSignal(cfg.resize_handler);
     installAbnormalExitHandlers(io_mod.getenv("TMUX"));
     cfg.shell.layout = try cfg.terminal.queryLayout(cfg.footer_rows);

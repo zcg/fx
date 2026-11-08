@@ -1736,6 +1736,43 @@ fn utf8Width(first: u8) usize {
 ///
 /// `GetConsoleMode` succeeds only for a console handle, which is the question
 /// that decides whether a console-only call is needed.
+/// How many bytes are ready to read on `fd` without blocking.
+///
+/// A terminal that answers a query writes its reply into the input stream, and
+/// a terminal that does not stays silent; without this the probe would park on
+/// a read that never returns. A console reports its pending record count, a
+/// pipe reports its buffered bytes, and anything else reports zero so the
+/// caller falls back to its timeout.
+pub fn bytesWaiting(fd: std.posix.fd_t) !usize {
+    if (comptime builtin.target.os.tag == .wasi) return 0;
+    if (comptime builtin.target.os.tag != .windows) {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 0) catch return 0;
+        if (ready == 0) return 0;
+        return 1;
+    }
+    if (isConsoleHandle(fd)) {
+        var count: u32 = 0;
+        if (windows_console_input.GetNumberOfConsoleInputEvents(fd, &count) == 0) return 0;
+        return @intCast(count);
+    }
+    var available: u32 = 0;
+    if (windows_console_input.PeekNamedPipe(fd, null, 0, null, &available, null) == 0) return 0;
+    return @intCast(available);
+}
+
+const windows_console_input = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn GetNumberOfConsoleInputEvents(handle: std.os.windows.HANDLE, count: *u32) callconv(.winapi) i32;
+    extern "kernel32" fn PeekNamedPipe(
+        pipe: std.os.windows.HANDLE,
+        buffer: ?*anyopaque,
+        buffer_size: u32,
+        bytes_read: ?*u32,
+        total_available: ?*u32,
+        bytes_left: ?*u32,
+    ) callconv(.winapi) i32;
+};
+
 pub fn isConsoleHandle(fd: std.posix.fd_t) bool {
     if (comptime builtin.target.os.tag != .windows) return false;
     var mode: u32 = 0;

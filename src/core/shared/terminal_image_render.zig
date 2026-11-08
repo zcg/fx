@@ -38,7 +38,6 @@ pub const Placement = struct {
 pub fn writePng(w: *Writer, bytes: []const u8, placement: Placement) !void {
     if (bytes.len == 0) return;
     var offset: usize = 0;
-    const first_chunk = true;
     var chunk_index: usize = 0;
     while (offset < bytes.len) : (chunk_index += 1) {
         const end = @min(bytes.len, offset + chunk_bytes);
@@ -46,10 +45,10 @@ pub fn writePng(w: *Writer, bytes: []const u8, placement: Placement) !void {
         const more = end < bytes.len;
         try w.writeAll("\x1b_G");
         if (chunk_index == 0) {
-            // `a=T` transmits and displays in one command, `f=100` is PNG, and
-            // `q=2` suppresses the terminal's own reply so nothing lands in the
-            // conversation.
-            try w.print("a=T,f=100,q=2,i={d},c={d},r={d}", .{
+            // `a=T` transmits and displays in one command, `f=100` is PNG,
+            // `q=2` suppresses the terminal's own reply, and `C=1` leaves the
+            // text cursor where it was so the caller's line accounting holds.
+            try w.print("a=T,f=100,q=2,i={d},c={d},r={d},C=1", .{
                 placement.image_id,
                 placement.columns,
                 placement.rows,
@@ -63,7 +62,6 @@ pub fn writePng(w: *Writer, bytes: []const u8, placement: Placement) !void {
         try w.writeAll("\x1b\\");
         offset = end;
     }
-    _ = first_chunk;
 }
 
 /// Writes the sequence that deletes `image_id`, for a redraw that no longer has
