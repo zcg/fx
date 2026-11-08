@@ -52,8 +52,14 @@ const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
 // `?1000h` reports button presses, `?1002h` motion while a button is held,
 // and `?1003h` every motion. The last is what makes a hover possible: a
-// pointer that moves with no button down is otherwise silent.
+// pointer that moves with no button down is otherwise silent. Alternate-screen
+// owners scroll with wheel events, and a wheel is a button report, so only the
+// owners need motion at all.
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+// The composer and the image preview read clicks only. Motion costs a report
+// per pointer cell and, if the process dies with the mode still on, leaves the
+// shell printing those reports as text, so the session never asks for it.
+const session_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
 
 /// Original handlers, written at bootstrap and restored at shutdown.
 /// Signal context never mutates them.
@@ -1249,6 +1255,13 @@ pub fn shutdownInteractiveShell(
     terminal_title: host.TerminalTitle,
 ) void {
     leaveAlternateScreens(terminal, shell, metrics);
+    // Whatever armed pointer reporting has to be disarmed here too: the exit
+    // restore sequence would cover it, but only if that sequence runs, and a
+    // count of what is still on is what makes this order-independent.
+    if (terminal.session_mouse_tracking) {
+        _ = writeLifecycleTerminalBytes(shell, metrics, ui_terminal.alternate_mouse_tracking_leave_sequence) catch {};
+        terminal.session_mouse_tracking = false;
+    }
     terminal.uninstallResizeSignal();
     uninstallAbnormalExitHandlers();
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
@@ -1757,7 +1770,7 @@ pub fn setSessionMouseTracking(
     if (terminal.alternate_screen_owner != .none) return;
     if (enabled) {
         terminal.session_mouse_tracking = true;
-        _ = writeLifecycleTerminalBytes(shell, metrics, alternate_mouse_tracking_enter) catch {};
+        _ = writeLifecycleTerminalBytes(shell, metrics, session_mouse_tracking_enter) catch {};
         return;
     }
     _ = writeLifecycleTerminalBytes(

@@ -241,7 +241,9 @@ fn decodeToPreviewRasterWindows(
 
     const row_bytes: usize = @intCast(raster_width * 4);
     const rgba = try alloc.alloc(u8, row_bytes * raster_height);
-    defer alloc.free(rgba);
+    // Ownership moves to the caller on success; a failure below has to release
+    // it, or every failed decode leaks the whole raster.
+    errdefer alloc.free(rgba);
 
     // GDI+'s 32bpp ARGB is laid out little-endian as B, G, R, A. Every consumer
     // downstream takes RGBA, so the channels are reordered while the rows are
@@ -260,8 +262,6 @@ fn decodeToPreviewRasterWindows(
         }
     }
 
-    const png_downscale = @import("png_downscale.zig");
-    _ = png_downscale;
     return .{
         .width = raster_width,
         .height = raster_height,
