@@ -1024,12 +1024,20 @@ pub fn Runtime(comptime App: type) type {
 
             if (resolved == .mouse_pointer and resolved.mouse_pointer.kind == .hover) {
                 // A pointer move with no button down is not a click. The
-                // position is recorded for diagnostics only: the preview is
-                // click-pinned, so motion neither shows nor hides it.
+                // position drives the image preview: hover a badge to see its
+                // image, move away to drop it. A changed cell redraws the
+                // frame the preview lives in.
                 const pointer = resolved.mouse_pointer;
                 preview_diag.noteMotion();
                 preview_diag.log("hover row={d} col={d}", .{ pointer.row, pointer.column });
+                const previous = app.hover_position;
+                const changed = previous == null or
+                    previous.?.row != pointer.row or previous.?.column != pointer.column;
                 app.hover_position = .{ .row = pointer.row, .column = pointer.column };
+                if (changed) {
+                    app.shell.render_requests.request(.transcript);
+                    app.shell.render_requests.request(.footer);
+                }
                 return .done;
             }
 

@@ -2363,18 +2363,22 @@ fn buildImageOverlay(
     }
     overlay.highest_id = highest;
 
-    // Which image is shown is click-driven everywhere: click a badge to show
-    // its image, click it again or click anywhere else to drop the preview.
-    // Pointer motion is recorded but deliberately drives nothing — a preview
-    // that follows the cursor is a different feature, and this one was asked
-    // to be click-pinned.
+    // Which image is shown follows the pointer: hover a badge to see its
+    // image, move away to drop the preview. A terminal that does not report
+    // motion cannot drive that, so a click pins the preview for it instead:
+    // click a badge to show the image, click it again or click anywhere else
+    // to drop it.
+    const motion = preview_diag.motionReported();
     const hover = if (comptime @hasField(App, "hover_position")) app.hover_position else null;
-    preview_diag.log("overlay eval images={d} hover_set={}", .{
+    preview_diag.log("overlay eval images={d} motion={} hover_row={d} hover_col={d} pinned={d}", .{
         images.len,
-        hover != null,
+        motion,
+        if (hover) |h| h.row else 0,
+        if (hover) |h| h.column else 0,
+        if (comptime @hasField(App, "preview_pinned_id")) (if (app.preview_pinned_id) |p| p else 0) else 0,
     });
 
-    if (comptime @hasField(App, "pointer_click")) {
+    if (!motion and comptime @hasField(App, "pointer_click")) {
         if (app.pointer_click) |click| {
             if (click.seq != app.preview_click_seq_seen) {
                 app.preview_click_seq_seen = click.seq;
@@ -2403,15 +2407,18 @@ fn buildImageOverlay(
     }
 
     const pinned: ?usize = if (comptime @hasField(App, "preview_pinned_id")) app.preview_pinned_id else null;
-    preview_diag.log("pinned={d}", .{pinned orelse 0});
 
     for (images) |image| {
         const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse {
             preview_diag.log("no anchor id={d}", .{image.id});
             continue;
         };
-        const pinned_to = pinned != null and pinned.? == image.id;
-        if (!pinned_to) continue;
+        const over_badge = motion and hover != null and
+            hover.?.row == anchor.row and
+            hover.?.column >= anchor.column and
+            hover.?.column < anchor.column + anchor.width;
+        const pinned_to = !motion and pinned != null and pinned.? == image.id;
+        if (!over_badge and !pinned_to) continue;
 
         const rect = ui_image_strip.previewRect(
             anchor,
