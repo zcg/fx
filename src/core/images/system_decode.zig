@@ -54,6 +54,41 @@ pub fn decodeToPreviewPng(
     }
 }
 
+/// A decoded preview: straight RGBA rows, `width * height * 4` bytes.
+///
+/// Kitty takes a PNG, but Sixel takes pixels, and Windows Terminal speaks only
+/// Sixel. Returning the raster rather than an encoded file lets each protocol
+/// encode the form it needs from one decode.
+pub const Raster = struct {
+    width: u32,
+    height: u32,
+    /// RGBA, row-major, no padding between rows.
+    pixels: []u8,
+
+    pub fn deinit(self: Raster, alloc: Allocator) void {
+        alloc.free(self.pixels);
+    }
+};
+
+/// Decodes `path` into a raster fitted into the cell box.
+///
+/// The preview is letterboxed on transparency, so a terminal that composites
+/// over its own background shows no frame around the picture.
+pub fn decodeToPreviewRaster(
+    alloc: Allocator,
+    path: []const u8,
+    box_columns: u32,
+    box_rows: u32,
+) Error!Raster {
+    if (box_columns == 0 or box_rows == 0) return error.EmptyImage;
+    switch (builtin.target.os.tag) {
+        .windows => return decodeToPreviewRasterWindows(alloc, path, box_columns, box_rows),
+        // The mac path returns a PNG; a raster would mean decoding it again, and
+        // no protocol that reaches a mac needs one.
+        else => return error.DecodeFailed,
+    }
+}
+
 /// Off Windows and macOS there is no decoder wired up: a PNG already carries
 /// the bytes the terminal wants, scaled by the terminal itself, and any other
 /// format declines the preview rather than linking a codec for it.
@@ -102,6 +137,21 @@ fn decodeToPreviewPngWindows(
     box_columns: u32,
     box_rows: u32,
 ) Error![]u8 {
+    const raster = try decodeToPreviewRasterWindows(alloc, path, box_columns, box_rows);
+    defer raster.deinit(alloc);
+    const png_downscale = @import("png_downscale.zig");
+    return png_downscale.encodeRgba(alloc, raster.width, raster.height, raster.pixels) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.DecodeFailed,
+    };
+}
+
+fn decodeToPreviewRasterWindows(
+    alloc: Allocator,
+    path: []const u8,
+    box_columns: u32,
+    box_rows: u32,
+) Error!Raster {
     ensureStarted() catch return error.DecodeFailed;
 
     const wide_path = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return error.OutOfMemory;
@@ -193,9 +243,9 @@ fn decodeToPreviewPngWindows(
     const rgba = try alloc.alloc(u8, row_bytes * raster_height);
     defer alloc.free(rgba);
 
-    // GDI+'s 32bpp ARGB is laid out little-endian as B, G, R, A. The PNG
-    // encoder and the clipboard decoder both take RGBA, so the channels are
-    // reordered while the rows are copied out of the locked stride.
+    // GDI+'s 32bpp ARGB is laid out little-endian as B, G, R, A. Every consumer
+    // downstream takes RGBA, so the channels are reordered while the rows are
+    // copied out of the locked stride.
     const stride: usize = @intCast(locked.stride);
     var row: usize = 0;
     while (row < raster_height) : (row += 1) {
@@ -211,9 +261,11 @@ fn decodeToPreviewPngWindows(
     }
 
     const png_downscale = @import("png_downscale.zig");
-    return png_downscale.encodeRgba(alloc, raster_width, raster_height, rgba) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.DecodeFailed,
+    _ = png_downscale;
+    return .{
+        .width = raster_width,
+        .height = raster_height,
+        .pixels = rgba,
     };
 }
 

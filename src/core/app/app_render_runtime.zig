@@ -42,6 +42,7 @@ const ui_surface_frame = @import("../../ui/footer/surface_frame.zig");
 const ui_image_strip = @import("../../ui/footer/image_strip.zig");
 const terminal_image = @import("../shared/terminal_image.zig");
 const system_decode = @import("../images/system_decode.zig");
+const sixel_encode = @import("../images/sixel_encode.zig");
 const preview_diag = @import("../shared/preview_diag.zig");
 const Allocator = std.mem.Allocator;
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
@@ -2430,13 +2431,27 @@ fn buildImageOverlay(
             continue;
         };
 
-        const png = previewPngFor(app.alloc, image.id, image.path) orelse {
-            preview_diag.log("decode failed path={s}", .{image.path});
-            continue;
-        };
-        preview_diag.log("draw id={d} bytes={d} rect={d},{d} {d}x{d}", .{
+        // Windows Terminal parses Sixel and ignores Kitty graphics, so the
+        // payload follows the protocol the terminal answered with. A Sixel
+        // preview is encoded from the raster directly and needs no PNG.
+        const sixel_terminal = terminal_image.current() == .sixel;
+        var png: []const u8 = &.{};
+        var sixel: []const u8 = &.{};
+        if (sixel_terminal) {
+            sixel = previewSixelFor(app.alloc, image.id, image.path) orelse {
+                preview_diag.log("sixel encode failed path={s}", .{image.path});
+                continue;
+            };
+        } else {
+            png = previewPngFor(app.alloc, image.id, image.path) orelse {
+                preview_diag.log("decode failed path={s}", .{image.path});
+                continue;
+            };
+        }
+        preview_diag.log("draw id={d} png={d} sixel={d} rect={d},{d} {d}x{d}", .{
             image.id,
             png.len,
+            sixel.len,
             rect.row,
             rect.column,
             rect.columns,
@@ -2449,6 +2464,7 @@ fn buildImageOverlay(
             .rows = rect.rows,
             .image_id = @intCast(image.id),
             .png = png,
+            .sixel = sixel,
         });
     }
     overlay.placements = placements.items;
@@ -2496,6 +2512,47 @@ fn previewPngFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]u8 {
     preview_png_bytes = bytes;
     return bytes;
 }
+
+/// The Sixel form of the preview for `image_id`, encoded once per image.
+///
+/// Sixel has no ids and no deletion, so this is a separate cache from the PNG:
+/// a terminal that speaks Sixel never asks for one, and a terminal that speaks
+/// Kitty never asks for the other.
+fn previewSixelFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]const u8 {
+    if (preview_sixel_id != null and preview_sixel_id.? == image_id) {
+        if (preview_sixel_bytes) |held| return held;
+    }
+    if (preview_sixel_bytes) |held| alloc.free(held);
+    preview_sixel_id = null;
+    preview_sixel_bytes = null;
+
+    const raster = system_decode.decodeToPreviewRaster(
+        alloc,
+        path,
+        ui_image_strip.preview_columns,
+        ui_image_strip.preview_rows,
+    ) catch return null;
+    defer raster.deinit(alloc);
+
+    const encoded = sixel_encode.encode(
+        alloc,
+        raster.pixels,
+        raster.width,
+        raster.height,
+        sixel_max_bytes,
+    ) catch return null;
+    preview_sixel_id = image_id;
+    preview_sixel_bytes = encoded;
+    return encoded;
+}
+
+/// The ceiling on one Sixel preview. A busy photograph can encode to megabytes,
+/// and a terminal that stalls on a slow write is worse than a badge, so a
+/// preview past this size is skipped rather than sent.
+const sixel_max_bytes: usize = 2 * 1024 * 1024;
+
+var preview_sixel_id: ?usize = null;
+var preview_sixel_bytes: ?[]const u8 = null;
 fn FramePaintContext(comptime App: type) type {
     return struct {
         app: *App,

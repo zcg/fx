@@ -37,6 +37,11 @@ pub const Placement = struct {
     image_id: u32,
     /// PNG bytes. The caller owns them for the duration of the write.
     png: []const u8,
+    /// The same image already encoded as Sixel, for a terminal that speaks no
+    /// Kitty graphics. Sixel has no ids and no deletion: the picture is painted
+    /// into the cells and stays until text is written over them, so the
+    /// protocol decides which of the two payloads a frame carries.
+    sixel: []const u8 = &.{},
 };
 
 /// The images a frame draws once its text is on screen.
@@ -81,9 +86,21 @@ pub const Overlay = struct {
 /// absolute cell, so the frame's own cursor bookkeeping is untouched. `C=1`
 /// tells the terminal not to move its raster cursor either, and `q=2` keeps it
 /// from answering.
+///
+/// A placement that carries Sixel is drawn that way instead. Windows Terminal
+/// parses DCS Sixel and drops the Kitty APC sequence without a word, so the
+/// payload decides which protocol goes out; a placement with neither is
+/// skipped.
 pub fn write(w: *Writer, overlay: Overlay) !void {
     for (overlay.placements) |placement| {
         if (placement.columns == 0 or placement.rows == 0) continue;
+        if (placement.sixel.len != 0) {
+            try w.writeAll("\x1b7");
+            try w.print("\x1b[{d};{d}H", .{ placement.row, placement.column });
+            try w.writeAll(placement.sixel);
+            try w.writeAll("\x1b8");
+            continue;
+        }
         if (placement.png.len == 0) continue;
         try w.writeAll("\x1b7");
         try w.print("\x1b[{d};{d}H", .{ placement.row, placement.column });
@@ -130,8 +147,25 @@ pub fn writeClear(w: *Writer, highest_id: u32) !void {
 }
 
 /// Writes the sequence that removes one image id and its placements.
+///
+/// A Sixel placement has no id: its pixels live in the cells it painted, and
+/// the text frame that follows writes over them. So this is a Kitty-only verb,
+/// and `overlayUsesSixel` decides whether the caller sends it at all.
 pub fn writeDelete(w: *Writer, image_id: u32) !void {
     try w.print("\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{image_id});
+}
+
+/// Whether this overlay is drawn with Sixel rather than Kitty graphics.
+///
+/// The two protocols differ in more than the payload: Kitty keeps a placement
+/// until it is deleted, and Sixel paints into cells that the next text frame
+/// overwrites. A caller that clears placements before drawing must skip that
+/// for Sixel, or it writes delete verbs a Sixel terminal cannot act on.
+pub fn overlayUsesSixel(overlay: Overlay) bool {
+    for (overlay.placements) |placement| {
+        if (placement.sixel.len != 0) return true;
+    }
+    return false;
 }
 
 /// Standard base64 with `=` padding, which is what the protocol expects.
@@ -161,6 +195,40 @@ fn writeBase64(w: *Writer, bytes: []const u8) !void {
         try w.writeByte(alphabet[(b & 0x0f) << 2]);
         try w.writeByte('=');
     }
+}
+
+test "a Sixel placement is drawn as Sixel, not as Kitty bytes" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const sixel = "\x1bP0;1;0q#0;2;100;0;0!8~\x1b\\";
+    try write(&out.writer, .{
+        .placements = &.{.{
+            .row = 5,
+            .column = 3,
+            .columns = 8,
+            .rows = 2,
+            .image_id = 7,
+            .png = "",
+            .sixel = sixel,
+        }},
+        .highest_id = 7,
+    });
+    const written = out.written();
+    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b7\x1b[5;3H"));
+    try std.testing.expect(std.mem.find(u8, written, sixel) != null);
+    try std.testing.expect(std.mem.find(u8, written, "\x1b_G") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\x1b8"));
+    try std.testing.expect(overlayUsesSixel(.{
+        .placements = &.{.{ .row = 1, .column = 1, .columns = 1, .rows = 1, .image_id = 1, .png = "", .sixel = "x" }},
+    }));
+}
+
+test "an overlay of PNG placements is not Sixel" {
+    try std.testing.expect(!overlayUsesSixel(.{
+        .placements = &.{.{ .row = 1, .column = 1, .columns = 1, .rows = 1, .image_id = 1, .png = "x" }},
+    }));
+    try std.testing.expect(!overlayUsesSixel(.{}));
 }
 
 test "a placement is bracketed and declares PNG" {

@@ -24,6 +24,9 @@ const OverlaySnapshot = struct {
 /// The placements the terminal is currently showing.
 var last_image_overlay: []const OverlaySnapshot = &.{};
 var last_image_overlay_fingerprint: u64 = 0;
+/// Whether the picture on screen was painted with Sixel, which has no delete
+/// verb: its pixels live in the cells and the next text frame erases them.
+var last_image_overlay_sixel: bool = false;
 
 /// Whether `id` is wanted again with the same cells, so its old placement and
 /// the new one are the same picture in the same place.
@@ -452,7 +455,14 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     const dimensions_changed = input.previous.rows != target.rows or input.previous.cols != target.cols;
     const previous_for_diff = movement.post_movement;
     const changed_cells = countChangedCells(previous_for_diff, target, repaint_window);
-    const full_repaint = input.surface.plan.reset_terminal or dimensions_changed or terminal_scroll_rows > 0 or invalidationRequiresFullRepaint(input.surface.plan.invalidation);
+    var full_repaint = input.surface.plan.reset_terminal or dimensions_changed or terminal_scroll_rows > 0 or invalidationRequiresFullRepaint(input.surface.plan.invalidation);
+    // Sixel paints its pixels into cells, and only a text write takes them
+    // away. Closing a preview changes no cell, so the frame has to be forced
+    // through the band painter or the picture stays on screen forever.
+    const overlay_present = input.image_overlay != null and !input.image_overlay.?.isEmpty();
+    if (!overlay_present and last_image_overlay_sixel and last_image_overlay.len != 0) {
+        full_repaint = true;
+    }
     if (terminal_scroll_bytes.len == 0 and
         terminal_scroll_rows == 0 and
         !full_repaint and
@@ -635,9 +645,21 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     if (overlay_changed or overlay_resend) {
         var image_bytes: std.Io.Writer.Allocating = .init(alloc);
         defer image_bytes.deinit();
-        for (last_image_overlay) |previous| {
-            if (overlayWants(previous.id, input.image_overlay, previous)) continue;
-            image_overlay_module.writeDelete(&image_bytes.writer, previous.id) catch {};
+        // Sixel paints into cells and has no way to take a picture back: the
+        // text frame that follows is what erases it. Sending a Kitty delete
+        // verb to a Sixel terminal would write bytes it cannot parse, so the
+        // deletes stay with the protocol that understands them.
+        const uses_sixel = if (input.image_overlay) |overlay|
+            image_overlay_module.overlayUsesSixel(overlay.*)
+        else if (last_image_overlay_sixel)
+            true
+        else
+            false;
+        if (!uses_sixel) {
+            for (last_image_overlay) |previous| {
+                if (overlayWants(previous.id, input.image_overlay, previous)) continue;
+                image_overlay_module.writeDelete(&image_bytes.writer, previous.id) catch {};
+            }
         }
         if (wanted_fingerprint != 0) {
             image_overlay_module.write(&image_bytes.writer, input.image_overlay.?.*) catch {};
@@ -645,12 +667,14 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         if (image_bytes.written().len != 0) {
             // Unconditional diagnostic: a preview that never reaches the
             // terminal is otherwise invisible in every trace scope.
-            preview_diag.log("overlay bytes={d} placements={d}", .{
+            preview_diag.log("overlay bytes={d} placements={d} sixel={}", .{
                 image_bytes.written().len,
                 if (input.image_overlay) |overlay| overlay.placements.len else 0,
+                uses_sixel,
             });
             _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
         }
+        last_image_overlay_sixel = uses_sixel;
         last_image_overlay_fingerprint = wanted_fingerprint;
         if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
         if (input.image_overlay) |overlay| {
