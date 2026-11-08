@@ -110,6 +110,19 @@ pub fn installProbe(answer: ?Protocol) void {
     probed = answer;
 }
 
+/// Whether asking the terminal is worth the risk.
+///
+/// The query is an APC string, and a terminal that does not speak the protocol
+/// has no reason to recognize it: Windows Terminal drops APC silently and never
+/// answers, so the probe can only wait out its timeout while the input stream
+/// goes unread. Only a terminal that already names itself as Kitty -- or the
+/// one this was written against, which draws graphics while calling itself an
+/// xterm -- gets asked.
+pub fn probeWanted() bool {
+    if (comptime builtin.target.os.tag == .wasi) return false;
+    return detect(envLookup) == .kitty;
+}
+
 /// The query a terminal answers when it can draw Kitty graphics.
 pub const kitty_query = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 

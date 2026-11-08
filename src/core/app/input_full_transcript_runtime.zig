@@ -110,6 +110,12 @@ pub fn Runtime(comptime App: type) type {
                     &app.shell,
                     &app.metrics,
                 );
+                // Entering the alternate screen clears the display. A modal
+                // request alone can be absorbed by the frame that opened it,
+                // which leaves a blank screen until any key forces a repaint.
+                // An external-damage request says the new screen has no valid
+                // pixels at all and must be drawn now.
+                app.shell.render_requests.request(.external_damage);
                 requestActiveSurfaceFrame(app);
             } else {
                 std.debug.assert(to == .inline_mode);
@@ -119,6 +125,11 @@ pub fn Runtime(comptime App: type) type {
                     &app.shell,
                     &app.metrics,
                 );
+                // Leaving the alternate screen restores the inline screen, but
+                // that restore is not a draw of its own: without a request the
+                // inline transcript only comes back on the next keystroke.
+                app.shell.render_requests.request(.external_damage);
+                app.shell.render_requests.request(.footer);
             }
             logDepthTransition(
                 from,
@@ -143,6 +154,8 @@ pub fn Runtime(comptime App: type) type {
                 &app.shell,
                 &app.metrics,
             );
+            app.shell.render_requests.request(.external_damage);
+            app.shell.render_requests.request(.footer);
             logDepthTransition(from, .inline_mode, .root, trigger);
         }
 

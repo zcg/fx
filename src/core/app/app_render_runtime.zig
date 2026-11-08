@@ -1651,6 +1651,12 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (full_transcript_projection) |projection| {
                     const area = footer_frame.paint.transcript_band;
+                    // Unconditional diagnostic: an empty band is what makes the
+                    // full transcript come up as a blank screen.
+                    preview_diag.log(
+                        "full_transcript band={d}..{d} empty={} rows={d}",
+                        .{ area.top, area.bottom, area.isEmpty(), app.shell.layout.rows },
+                    );
                     if (!area.isEmpty()) {
                         const staged = try presentation_shell.prepareFullTranscriptSurfacePaintInterruptible(
                             app.alloc,
@@ -2457,6 +2463,14 @@ fn buildImageOverlay(
         var png: []const u8 = &.{};
         var sixel: []const u8 = &.{};
         if (sixel_terminal) {
+            // Windows Terminal acknowledges Sixel but its parser can stall on
+            // a large payload: one 27 KB preview froze the tab until the shell
+            // behind it was killed. A badge is better than a dead terminal, so
+            // this terminal keeps the attachment and draws no preview here.
+            if (terminal_image.current() == .sixel) {
+                preview_diag.log("sixel preview skipped: terminal stalls on large payloads", .{});
+                continue;
+            }
             sixel = previewSixelFor(app.alloc, image.id, image.path) orelse {
                 preview_diag.log("sixel encode failed path={s}", .{image.path});
                 continue;

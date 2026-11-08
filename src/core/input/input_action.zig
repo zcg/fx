@@ -67,13 +67,6 @@ pub const ShortcutAction = union(enum) {
     yank,
     redraw,
     insert_newline,
-    /// Shows or hides the newest pasted image preview.
-    ///
-    /// The preview cannot be driven by the pointer without asking the terminal
-    /// to report mouse events, and that request is what takes scrolling away
-    /// from the user. A key is the only way to show a picture without holding
-    /// the terminal's scroll hostage.
-    toggle_image_preview,
 };
 
 /// Typed result of UI-owned terminal escape decoding.

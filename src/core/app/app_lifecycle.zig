@@ -1097,15 +1097,23 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.terminal_title,
     );
     try cfg.terminal.enableRawMode();
-    // Ask the terminal what it can draw before the first frame, while the input
-    // stream is quiet. A terminal that speaks Kitty graphics answers at once;
-    // one that does not stays silent and the environment decides instead.
-    terminal_image.installProbe(terminal_image.probeKitty(
-        io_mod.getIo(),
-        io_mod.stdinHandle(),
-        io_mod.stdoutHandle(),
-        300,
-    ));
+    // Only ask a terminal that has already given a reason to expect an answer.
+    //
+    // The query is an APC string carrying base64, and a terminal that does not
+    // speak the protocol has no reason to recognize it: Windows Terminal drops
+    // APC silently, and while the probe waits for a reply the input stream is
+    // not being read, so a keystroke typed in that window is lost. Worse, the
+    // bytes themselves are noise to a terminal that reserved APC for other
+    // uses. So the probe runs only when the environment already names a Kitty
+    // terminal, and everything else is settled from the environment alone.
+    if (terminal_image.probeWanted()) {
+        terminal_image.installProbe(terminal_image.probeKitty(
+            io_mod.getIo(),
+            io_mod.stdinHandle(),
+            io_mod.stdoutHandle(),
+            300,
+        ));
+    }
     debug_trace.logf("images", "startup probe protocol={s}", .{@tagName(terminal_image.current())});
     // Mouse reporting stays off until something needs it: the image preview
     // turns it on when a badge is present, and the composer's click routing
