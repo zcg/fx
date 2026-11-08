@@ -486,7 +486,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     try reportImageTooLarge(app);
                     break :blk null;
                 },
-                else => null,
+                else => blk: {
+                    debug_trace.logf("input", "paste_image_whole_load_failed path={s} err={t}", .{ path, err });
+                    break :blk null;
+                },
             };
             const img = maybe_img orelse return false;
             var attached = img;
@@ -544,7 +547,11 @@ pub fn PasteEditRuntime(comptime App: type) type {
             // which pastes it as text rather than dropping what was copied.
             var attached_whole = false;
             if (image_attachments.wholePastedImagePath(bytes)) |path| {
+                debug_trace.logf("input", "paste_image_whole path={s} bytes={d}", .{ path, bytes.len });
                 attached_whole = try attachWholePastedImage(app, &stage, path, first_image_id);
+                debug_trace.logf("input", "paste_image_whole attached={}", .{attached_whole});
+            } else {
+                debug_trace.logf("input", "paste_image_whole rejected bytes={d}", .{bytes.len});
             }
             if (!attached_whole) {
                 var prev: usize = 0;
@@ -566,7 +573,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
                                 try reportImageTooLarge(app);
                                 break :blk null;
                             },
-                            else => null,
+                            else => blk: {
+                                debug_trace.logf("input", "paste_image_token_load_failed token={s} err={t}", .{ raw, err });
+                                break :blk null;
+                            },
                         };
                         if (maybe_img) |img| {
                             var attached = img;

@@ -2129,6 +2129,14 @@ fn normalizePathInput(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     const slice = stripBalancedOuterQuotes(trimmed);
 
+    // A Windows path separates its components with `\`, so a backslash is a
+    // separator rather than an escape: `C:\Users\me` must keep every one of
+    // them. Only the shell-token form uses escapes, and that arrives with
+    // `literal_payload` set and is decoded by `file_picker_path` instead.
+    if (comptime builtin.target.os.tag == .windows) {
+        return alloc.dupe(u8, slice);
+    }
+
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
@@ -2295,6 +2303,12 @@ pub fn hasImagePathToken(bytes: []const u8) bool {
 }
 
 fn extensionIgnoringEscapes(raw: []const u8) []const u8 {
+    // On Windows a backslash separates path components, so the last dot is the
+    // extension whether or not something precedes it with a backslash.
+    if (comptime builtin.target.os.tag == .windows) {
+        const dot = std.mem.findScalarLast(u8, raw, '.') orelse return "";
+        return raw[dot..];
+    }
     var dot_index: ?usize = null;
     var i: usize = 0;
     while (i < raw.len) : (i += 1) {
@@ -2877,6 +2891,34 @@ test "a pasted Windows image path becomes one token" {
         quoted.len,
         nextShellTokenEnd(quoted, 0),
     );
+}
+
+test "a Windows path keeps every backslash when it is resolved" {
+    // A backslash separates components here, so it is not an escape. Reading it
+    // as one turned `C:\Users\zcg\AppData` into `C:UserszcgAppData`, and the
+    // file then did not exist, so a pasted screenshot stayed text.
+    const alloc = std.testing.allocator;
+    const input = "C:\\Users\\zcg\\AppData\\Local\\PixPin\\Temp\\shot.jpg";
+    const normalized = try normalizePathInput(alloc, input);
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings(input, normalized);
+
+    // A quoted path loses only its quotes.
+    const quoted = "\"C:\\Users\\me\\My Shot.png\"";
+    const unquoted = try normalizePathInput(alloc, quoted);
+    defer alloc.free(unquoted);
+    try std.testing.expectEqualStrings("C:\\Users\\me\\My Shot.png", unquoted);
+}
+
+test "a Windows extension survives the backslash before it" {
+    // `\.jpg` is a separator followed by the extension, not an escaped dot, so
+    // the extension has to be seen or the paste never looks like an image.
+    try std.testing.expectEqualStrings(
+        ".jpg",
+        extensionIgnoringEscapes("C:\\Users\\me\\PixPin_2026-11-08_11-51-09.jpg"),
+    );
+    try std.testing.expectEqualStrings(".png", extensionIgnoringEscapes("C:\\a\\b\\shot.png"));
+    try std.testing.expectEqualStrings("", extensionIgnoringEscapes("C:\\a\\b\\shot"));
 }
 
 test "inline image edits preserve outer multiline whitespace and stable digit boundaries" {
