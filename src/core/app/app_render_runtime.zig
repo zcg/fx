@@ -2363,10 +2363,11 @@ fn buildImageOverlay(
     }
     overlay.highest_id = highest;
 
-    // Which image is shown follows the pointer: the badge it rests on. A
-    // terminal that never reports motion cannot drive a hover, so the newest
-    // attachment is previewed instead — the paste just happened, and that is
-    // the image the user is looking for.
+    // Which image is shown follows the pointer. A terminal that reports
+    // motion drives the preview from the badge under the pointer; one that
+    // does not (this run's did not send a single motion event) pins it with a
+    // click: click a badge to see its image, click it again or click away to
+    // drop the preview.
     const motion = preview_diag.motionReported();
     const hover = if (comptime @hasField(App, "hover_position")) app.hover_position else null;
     preview_diag.log("overlay eval images={d} motion={} hover_set={} hover_row={d} hover_col={d}", .{
@@ -2377,25 +2378,48 @@ fn buildImageOverlay(
         if (hover) |h| h.column else 0,
     });
 
+    if (comptime @hasField(App, "pointer_click")) {
+        if (app.pointer_click) |click| {
+            if (click.seq != app.preview_click_seq_seen) {
+                app.preview_click_seq_seen = click.seq;
+                var hit_id: usize = 0;
+                for (images) |image| {
+                    const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse continue;
+                    if (click.row == anchor.row and
+                        click.column >= anchor.column and
+                        click.column < anchor.column + anchor.width)
+                    {
+                        hit_id = image.id;
+                        break;
+                    }
+                }
+                // Clicking a badge shows its image; clicking the same badge or
+                // anywhere else takes it away again.
+                app.preview_pinned_id = if (hit_id != 0 and app.preview_pinned_id != hit_id) hit_id else null;
+                preview_diag.log("click row={d} col={d} hit={d} pinned={d}", .{
+                    click.row,
+                    click.column,
+                    hit_id,
+                    app.preview_pinned_id orelse 0,
+                });
+            }
+        }
+    }
+
+    const pinned: ?usize = if (comptime @hasField(App, "preview_pinned_id")) app.preview_pinned_id else null;
+    preview_diag.log("pinned={d}", .{pinned orelse 0});
+
     for (images) |image| {
         const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, image.id) orelse {
             preview_diag.log("no anchor id={d}", .{image.id});
             continue;
         };
-        const over_badge = hover != null and motion and
+        const over_badge = motion and hover != null and
             hover.?.row == anchor.row and
             hover.?.column >= anchor.column and
             hover.?.column < anchor.column + anchor.width;
-        const newest = !motion and image.id == images[images.len - 1].id;
-        preview_diag.log("badge id={d} anchor={d},{d} w={d} over={} newest={}", .{
-            image.id,
-            anchor.row,
-            anchor.column,
-            anchor.width,
-            over_badge,
-            newest,
-        });
-        if (!over_badge and !newest) continue;
+        const pinned_to = !motion and pinned != null and pinned.? == image.id;
+        if (!over_badge and !pinned_to) continue;
 
         const rect = ui_image_strip.previewRect(
             anchor,

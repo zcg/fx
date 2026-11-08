@@ -1010,6 +1010,18 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (resolved == .mouse_pointer and resolved.mouse_pointer.kind == .press) {
+                // The click is recorded rather than consumed, so the preview
+                // can pin or dismiss itself on the badge it lands on while
+                // the composer's own click routing continues unchanged.
+                app.pointer_click_seq += 1;
+                app.pointer_click = .{
+                    .row = resolved.mouse_pointer.row,
+                    .column = resolved.mouse_pointer.column,
+                    .seq = app.pointer_click_seq,
+                };
+            }
+
             if (resolved == .mouse_pointer and resolved.mouse_pointer.kind == .hover) {
                 // A pointer move with no button down is not a click. The
                 // position is kept so the image preview can hit-test the

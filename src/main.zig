@@ -442,6 +442,9 @@ const App = struct {
     pub const build_revision = build_options.git_commit;
     /// Where the pointer last moved with no button down, in 1-based cells.
     pub const HoverPosition = struct { row: u16, column: u16 };
+    /// A left-button press, in 1-based cells, counted so a frame can tell
+    /// which presses it has already answered.
+    pub const PointerClick = struct { row: u16, column: u16, seq: u64 };
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
@@ -621,6 +624,13 @@ const App = struct {
     /// A hover preview is built from this; the paste flow itself never reads
     /// it, so a mouse-driven session and a keyboard-only one behave alike.
     hover_position: ?HoverPosition = null,
+    /// The last left-button press, so a preview can be pinned or dismissed by
+    /// clicking a badge on terminals that never report pointer motion.
+    pointer_click: ?PointerClick = null,
+    pointer_click_seq: u64 = 0,
+    /// The attachment id whose preview is pinned by a click, if any.
+    preview_pinned_id: ?usize = null,
+    preview_click_seq_seen: u64 = 0,
     /// The main conversation's own state.
     main_agent: agents.Agent = .{},
     /// The agent the main loop is working for. Null means main, so `App` can
