@@ -20,7 +20,7 @@ const Writer = std.Io.Writer;
 const OptionDoc = command_specs.OptionDoc;
 const SubcommandDoc = command_specs.SubcommandDoc;
 
-pub const Shell = enum { bash, zsh, fish };
+pub const Shell = enum { bash, zsh, fish, pwsh };
 
 pub fn parseShell(name: []const u8) ?Shell {
     return std.meta.stringToEnum(Shell, name);
@@ -229,6 +229,7 @@ pub fn writeScript(
         .bash => try writeBash(writer, &model),
         .zsh => try writeZsh(writer, &model),
         .fish => try writeFish(writer, &model),
+        .pwsh => try writePwsh(writer, &model),
     }
 }
 
@@ -732,7 +733,7 @@ fn writeFishEntries(w: *Writer, entries: []const Entry) !void {
     }
 }
 
-const Quoting = enum { zsh, zsh_name, fish };
+const Quoting = enum { zsh, zsh_name, fish, pwsh };
 
 /// Writes `text` for the inside of a single-quoted string.
 fn writeEscaped(w: *Writer, text: []const u8, quoting: Quoting) !void {
@@ -745,6 +746,12 @@ fn writeEscaped(w: *Writer, text: []const u8, quoting: Quoting) !void {
         .fish => switch (byte) {
             '\'' => try w.writeAll("\\'"),
             '\\' => try w.writeAll("\\\\"),
+            else => try w.writeByte(byte),
+        },
+        // PowerShell single-quoted strings take a doubled quote and nothing
+        // else, so every other byte is literal.
+        .pwsh => switch (byte) {
+            '\'' => try w.writeAll("''"),
             else => try w.writeByte(byte),
         },
     };
@@ -821,4 +828,167 @@ test "descriptions are quoted for each shell" {
     w = .fixed(&buffer);
     try writeEscaped(&w, "it's \\n", .fish);
     try std.testing.expectEqualStrings("it\\'s \\\\n", w.buffered());
+    // PowerShell doubles the quote and leaves every other byte alone.
+    w = .fixed(&buffer);
+    try writeEscaped(&w, "it's", .pwsh);
+    try std.testing.expectEqualStrings("it''s", w.buffered());
+}
+
+// -- pwsh ---------------------------------------------------------------------
+
+/// PowerShell completion, through `Register-ArgumentCompleter`.
+///
+/// PowerShell passes the words already typed and the word under the cursor to
+/// one script block, so the block repeats the walk the other scripts do: skip
+/// the flag a value belongs to, follow words that name a subcommand, then offer
+/// the current node's words, its flags, a flag's fixed values, or the setting
+/// keys after `config get|set|unset`.
+///
+/// The tables are baked into the script as literals, so Tab runs no fx process
+/// and works offline.
+fn writePwsh(w: *Writer, model: *const Model) !void {
+    try w.writeAll(
+        \\# PowerShell completion for fx. Load it with:
+        \\#   fx completion pwsh | Out-String | Invoke-Expression
+        \\# Add that line to $PROFILE to keep it in new shells.
+        \\
+        \\$__fxWords = @{
+        \\
+    );
+    for (model.nodes.items) |n| {
+        if (n.words.items.len == 0) continue;
+        try w.print("    '{s}' = @(", .{n.path});
+        try writePwshEntries(w, n.words.items);
+        try w.writeAll(")\n");
+    }
+    try w.writeAll(
+        \\}
+        \\
+        \\$__fxFlags = @{
+        \\
+    );
+    for (model.nodes.items) |n| {
+        if (n.flags.items.len == 0) continue;
+        try w.print("    '{s}' = @(", .{n.path});
+        try writePwshEntries(w, n.flags.items);
+        try w.writeAll(")\n");
+    }
+    try w.writeAll(
+        \\}
+        \\
+        \\$__fxValues = @{
+        \\
+    );
+    for (model.values.items) |entry| {
+        try w.print("    '{s}' = @(", .{entry.flag});
+        try writePwshWords(w, entry.values);
+        try w.writeAll(")\n");
+    }
+    try w.writeAll(
+        \\}
+        \\
+        \\$__fxValueFlags = @(
+    );
+    try writePwshWords(w, model.value_flags.items);
+    try w.writeAll(
+        \\)
+        \\
+        \\$__fxKeys = @(
+    );
+    try writePwshWords(w, model.setting_keys.items);
+    try w.writeAll(
+        \\)
+        \\
+        \\$__fxSettableKeys = @(
+    );
+    try writePwshWords(w, model.settable_keys.items);
+    try w.writeAll(
+        \\)
+        \\
+        \\$__fxKeyPaths = @(
+    );
+    try writePwshKeyPaths(w, model, .all);
+    try w.writeAll(
+        \\)
+        \\
+        \\$__fxSettableKeyPaths = @(
+    );
+    try writePwshKeyPaths(w, model, .settable);
+    try w.writeAll(
+        \\)
+        \\
+        \\Register-ArgumentCompleter -Native -CommandName fx -ScriptBlock {
+        \\    param($wordToComplete, $commandAst, $cursorPosition)
+        \\    $words = @($commandAst.CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.Extent.Text })
+        \\    $path = ''
+        \\    $skip = $false
+        \\    $prev = ''
+        \\    foreach ($w in $words) {
+        \\        if ($skip) { $skip = $false; continue }
+        \\        if ($w -like '--*=*') { continue }
+        \\        if ($w -like '-*') {
+        \\            if ($__fxValueFlags -contains $w) { $skip = $true }
+        \\            $prev = $w
+        \\            continue
+        \\        }
+        \\        $next = if ($path -eq '') { $w } else { "$path $w" }
+        \\        if ($__fxWords.ContainsKey($next) -or $__fxFlags.ContainsKey($next)) {
+        \\            $path = $next
+        \\            $prev = $w
+        \\            continue
+        \\        }
+        \\        break
+        \\    }
+        \\    $out = @()
+        \\    if ($__fxValues.ContainsKey($prev)) {
+        \\        $out = $__fxValues[$prev]
+        \\    } elseif ($wordToComplete -like '-*') {
+        \\        if ($path -ne '' -and $__fxFlags.ContainsKey($path)) { $out = $__fxFlags[$path] }
+        \\        elseif ($__fxFlags.ContainsKey('')) { $out = $__fxFlags[''] }
+        \\    } elseif ($prev -in @('get', 'set', 'unset') -and $__fxKeyPaths -contains $path) {
+        \\        if ($__fxSettableKeyPaths -contains $path) { $out = $__fxSettableKeys } else { $out = $__fxKeys }
+        \\    } else {
+        \\        if ($path -ne '' -and $__fxWords.ContainsKey($path)) { $out = $__fxWords[$path] }
+        \\        elseif ($__fxWords.ContainsKey('')) { $out = $__fxWords[''] }
+        \\    }
+        \\    $out | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        \\        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+        \\    }
+        \\}
+        \\
+    );
+}
+
+fn writePwshEntries(w: *Writer, items: []const Entry) !void {
+    var first = true;
+    for (items) |entry| {
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try w.writeByte('\'');
+        try writeEscaped(w, entry.name, .pwsh);
+        try w.writeByte('\'');
+    }
+}
+
+fn writePwshWords(w: *Writer, items: []const []const u8) !void {
+    var first = true;
+    for (items) |item| {
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try w.writeByte('\'');
+        try writeEscaped(w, item, .pwsh);
+        try w.writeByte('\'');
+    }
+}
+
+fn writePwshKeyPaths(w: *Writer, model: *const Model, list: KeyList) !void {
+    var first = true;
+    for (model.nodes.items) |n| {
+        if (n.keys != list) continue;
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try w.writeByte('\'');
+        try writeEscaped(w, n.path, .pwsh);
+        try w.writeByte('\'');
+    }
 }

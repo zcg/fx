@@ -2343,7 +2343,7 @@ fn runNonInteractiveWithDeps(
             const shell = if (rest.len == 1) completion.parseShell(rest[0]) else null;
             if (shell == null) {
                 if (rest.len == 1) {
-                    try writeStderrLine(alloc, deps, "fx completion: unknown shell {s}; choose bash, zsh, or fish\n", rest[0]);
+                    try writeStderrLine(alloc, deps, "fx completion: unknown shell {s}; choose bash, zsh, fish, or pwsh\n", rest[0]);
                 }
                 try writeTopLevelUsage(cfg.command_catalog, deps, .completion);
                 return usage_failure;

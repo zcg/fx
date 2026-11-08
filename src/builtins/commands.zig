@@ -432,15 +432,16 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .completion,
         .token = "completion",
-        .usage = "completion bash|zsh|fish",
+        .usage = "completion bash|zsh|fish|pwsh",
         .summary = "Print a shell completion script",
         .subcommands = &.{
             .{ .usage = "bash", .description = "Load it with: eval \"$(fx completion bash)\"" },
             .{ .usage = "zsh", .description = "Load it after compinit with: source <(fx completion zsh)" },
             .{ .usage = "fish", .description = "Load it with: fx completion fish | source" },
+            .{ .usage = "pwsh", .description = "Load it with: fx completion pwsh | Out-String | Invoke-Expression" },
         },
         .details = &.{
-            "Add the load line to ~/.bashrc, ~/.zshrc, or ~/.config/fish/config.fish to keep it in new shells.",
+            "Add the load line to ~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish, or $PROFILE to keep it in new shells.",
             "Tab completes commands, flags, setting keys after fx config get, set, and unset, and fixed flag values.",
         },
     },
