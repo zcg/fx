@@ -15389,6 +15389,42 @@ test "app_input_runtime image path paste commits complete text and attachments i
     try std.testing.expectEqual(@as(usize, 2), try countTestSnapshotFiles(snapshot_dir));
 }
 
+test "app_input_runtime attaches a Windows image path whose name has spaces" {
+    // The path a screenshot tool writes on Windows: a drive letter, backslashes,
+    // and spaces in the file name. The shell-token walk splits on space, so this
+    // covers the whole-buffer path taken before it.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_name = "Screenshot 2026-11-08 123456.png";
+    try writeTestImage(&tmp, file_name);
+
+    const workspace_root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(workspace_root);
+    const expected_path = try realTmpPath(alloc, &tmp, file_name);
+    defer alloc.free(expected_path);
+
+    var app = FakeSubmitApp{
+        .alloc = alloc,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    // A trailing newline is how the clipboard usually ends a copied path.
+    const pasted = try alloc.print("{s}\r\n", .{expected_path});
+    defer alloc.free(pasted);
+    try Runtime(FakeSubmitApp).handlePastedBytes(
+        &app,
+        (&app).agent(),
+        pasted,
+        FakeSubmitApp.input_byte_limit,
+    );
+
+    try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().pending_images.items.len);
+    try std.testing.expectEqualStrings(expected_path, app.agent().pending_images.items[0].path);
+}
+
 test "app_input_runtime image path paste resolves paths from the workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

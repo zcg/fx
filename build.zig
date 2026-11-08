@@ -316,6 +316,20 @@ pub fn build(b: *std.Build) void {
     const run_image_query_probe = b.addRunArtifact(image_query_probe);
     const image_query_probe_step = b.step("probe-image-query", "Ask the terminal whether it draws Kitty graphics");
     image_query_probe_step.dependOn(&run_image_query_probe.step);
+    // What the Windows clipboard currently holds, as a PNG.
+    const clipboard_probe = b.addExecutable(.{
+        .name = "clipboard-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/windows/clipboard_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    clipboard_probe.root_module.addImport("windows_clipboard", b.createModule(.{ .root_source_file = b.path("src/core/images/windows_clipboard.zig"), .target = target, .optimize = optimize }));
+    clipboard_probe.root_module.addImport("png_downscale", b.createModule(.{ .root_source_file = b.path("src/core/images/png_downscale.zig"), .target = target, .optimize = optimize }));
+    const run_clipboard_probe = b.addRunArtifact(clipboard_probe);
+    const clipboard_probe_step = b.step("probe-clipboard", "Read the Windows clipboard bitmap and write it as a PNG");
+    clipboard_probe_step.dependOn(&run_clipboard_probe.step);
 
     // Which step of the skills refresh fails, and with what error.
     const skills_refresh_probe = b.addExecutable(.{

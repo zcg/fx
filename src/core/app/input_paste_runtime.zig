@@ -465,12 +465,17 @@ pub fn PasteEditRuntime(comptime App: type) type {
         /// A pasted screenshot is one path, and Windows file names carry spaces, so
         /// the shell-token walk in `handlePastedBytes` cannot be the only reader:
         /// it would cut the path at the first space and paste the rest as text.
+        ///
+        /// Returns false when the path could not be read as an image, so the
+        /// caller falls back to pasting the bytes as text. A path the user
+        /// copied has to arrive either way: losing it because the file moved is
+        /// worse than pasting it uninterpreted.
         fn attachWholePastedImage(
             app: *App,
             stage: *ImagePasteStage,
             path: []const u8,
             first_image_id: usize,
-        ) !void {
+        ) !bool {
             const maybe_img = image_attachments.loadUserImageAttachment(
                 app.alloc,
                 app.workspace_root,
@@ -483,7 +488,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 },
                 else => null,
             };
-            const img = maybe_img orelse return;
+            const img = maybe_img orelse return false;
             var attached = img;
             var owns_attached = true;
             defer if (owns_attached) {
@@ -493,7 +498,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             attached.id = first_image_id;
             switch (try image_attachments.captureImageAttachmentForAdmission(App, app, &attached)) {
                 .captured => {},
-                .rejected => return,
+                .rejected => return false,
             }
 
             var ph_buf: [32]u8 = undefined;
@@ -509,6 +514,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             });
             try stage.images.append(app.alloc, attached);
             owns_attached = false;
+            return true;
         }
 
         pub fn handlePastedBytes(app: *App, agent: *AppAgent, bytes: []const u8, max_input_len: usize) !void {
@@ -534,9 +540,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
             // A pasted screenshot arrives as one path, and on Windows that path
             // usually holds spaces. The token walk below splits on them, so a
             // buffer that is exactly one path is attached before the walk runs.
+            // A path that does not load as an image falls through to the walk,
+            // which pastes it as text rather than dropping what was copied.
+            var attached_whole = false;
             if (image_attachments.wholePastedImagePath(bytes)) |path| {
-                try attachWholePastedImage(app, &stage, path, first_image_id);
-            } else {
+                attached_whole = try attachWholePastedImage(app, &stage, path, first_image_id);
+            }
+            if (!attached_whole) {
                 var prev: usize = 0;
                 var i: usize = 0;
                 while (i < bytes.len) {

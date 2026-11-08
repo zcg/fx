@@ -246,18 +246,27 @@ fn loadResolvedImageAttachment(
     };
 }
 
+/// The folder fx writes short-lived files into.
+///
+/// `/tmp` is the Unix spelling. Windows has no such directory, so a path under
+/// the profile's temporary folder is what actually exists there.
+fn tempRootPath() []const u8 {
+    return if (builtin.target.os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
+}
+
 pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
-    const temp_root = try io_mod.realpathAlloc(alloc, "/tmp");
+    // `/tmp` exists on macOS and Linux; Windows keeps its temporary files
+    // under the profile, and `io_mod` already resolves the right folder.
+    const temp_root = try io_mod.realpathAlloc(alloc, tempRootPath());
     defer alloc.free(temp_root);
     for (0..16) |_| {
         var suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&suffix));
         // Fixed width, so the model's note naming a snapshot here is the
         // same length in every process.
-        const path = try alloc.print(
-            "{s}/fx-image-snapshots-{x:0>16}",
-            .{ temp_root, suffix },
-        );
+        const name = try alloc.print("fx-image-snapshots-{x:0>16}", .{suffix});
+        defer alloc.free(name);
+        const path = try std.Io.Dir.path.join(alloc, &.{ temp_root, name });
         errdefer alloc.free(path);
         std.Io.Dir.createDirAbsolute(
             io_mod.getIo(),
@@ -1993,7 +2002,60 @@ pub const ClipboardImageAttachment = struct {
     }
 };
 
+/// Reads a screenshot off the Windows clipboard and writes it as a PNG.
+///
+/// A screenshot reaches the clipboard as a DIB, but model providers take an
+/// encoded image, so the bytes are encoded once here and the attachment then
+/// behaves exactly like a pasted file.
+fn loadWindowsClipboardImage(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    const windows_clipboard = @import("windows_clipboard.zig");
+
+    const source_dir = try createTempSnapshotDir(alloc);
+    errdefer {
+        cleanupSnapshotDir(source_dir);
+        alloc.free(source_dir);
+    }
+    const temp_path = try std.Io.Dir.path.join(alloc, &.{ source_dir, "clipboard.png" });
+    defer alloc.free(temp_path);
+
+    // A program that put PNG on the clipboard already encoded it; keep those
+    // bytes rather than decoding and re-encoding.
+    if (try windows_clipboard.readClipboardPng(alloc)) |png| {
+        defer alloc.free(png);
+        try writeSnapshotFile(io_mod.getIo(), temp_path, png);
+        return .{
+            .attachment = try loadImageAttachment(alloc, temp_path),
+            .source_dir = source_dir,
+        };
+    }
+
+    var bitmap = windows_clipboard.readClipboardBitmap(alloc) catch |err| switch (err) {
+        error.NoImage => return error.NoClipboardImage,
+        error.ClipboardBusy => return error.ClipboardBusy,
+        error.UnsupportedFormat => return error.UnsupportedClipboardFormat,
+        error.MalformedImage => return error.MalformedClipboardImage,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer bitmap.deinit(alloc);
+
+    const png = try png_downscale.encodeRgba(alloc, bitmap.width, bitmap.height, bitmap.pixels);
+    defer alloc.free(png);
+    try writeSnapshotFile(io_mod.getIo(), temp_path, png);
+
+    return .{
+        .attachment = try loadImageAttachment(alloc, temp_path),
+        .source_dir = source_dir,
+    };
+}
+
+fn writeSnapshotFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
+
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    if (comptime builtin.target.os.tag == .windows) return loadWindowsClipboardImage(alloc);
     if (builtin.target.os.tag != .macos) return error.Unsupported;
 
     const source_dir = try createTempSnapshotDir(alloc);

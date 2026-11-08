@@ -88,14 +88,25 @@ pub fn Commands(comptime App: type) type {
 
         pub fn attachClipboard(app: *App) !void {
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
-                if (err == error.NoClipboardImage) {
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                } else if (err != error.Unsupported) {
-                    const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
-                    defer app.alloc.free(line);
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                switch (err) {
+                    // Nothing on the clipboard to attach. A terminal that sends
+                    // Ctrl+V as a plain key press still pastes its text right
+                    // after this, so a notice would only add noise.
+                    error.NoClipboardImage => {
+                        return;
+                    },
+                    // Another program held the clipboard past the retry budget.
+                    error.ClipboardBusy => {
+                        try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "the clipboard is busy; try again" }, true);
+                        return;
+                    },
+                    else => {
+                        const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
+                        defer app.alloc.free(line);
+                        try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                        return;
+                    },
                 }
-                return;
             };
             defer loaded.deinit(app.alloc);
             switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {

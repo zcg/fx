@@ -28,6 +28,33 @@ fn writeChunk(writer: *std.Io.Writer, kind: *const [4]u8, data: []const u8) std.
     try writer.writeAll(&checksum);
 }
 
+/// Encodes 8-bit RGBA pixels as a PNG.
+///
+/// A Windows clipboard bitmap arrives as BGRA rows with no compression, and the
+/// model providers want an encoded image, so the paste path needs an encoder as
+/// well as the decoder this folder already had. `pixels` is `width * height * 4`
+/// bytes in RGBA order; the caller owns the returned buffer.
+pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, pixels: []const u8) ![]u8 {
+    if (width == 0 or height == 0) return error.InvalidDimensions;
+    const row_bytes = std.math.mul(usize, width, 4) catch return error.InvalidDimensions;
+    const expected = std.math.mul(usize, row_bytes, height) catch return error.InvalidDimensions;
+    if (pixels.len != expected) return error.InvalidPixelCount;
+    if (row_bytes > std.math.maxInt(u32)) return error.InvalidDimensions;
+
+    // Each scanline carries a filter byte, which `testEncode` expects already
+    // present. Filter 0 (None) keeps the encoder small; the deflate pass after
+    // it recovers most of the redundancy.
+    const scanlines = try alloc.alloc(u8, expected + height);
+    defer alloc.free(scanlines);
+    for (0..height) |row| {
+        const at = row * (row_bytes + 1);
+        scanlines[at] = 0;
+        const src = pixels[row * row_bytes ..][0..row_bytes];
+        @memcpy(scanlines[at + 1 ..][0..row_bytes], src);
+    }
+    return testEncode(alloc, width, height, .rgba, 8, scanlines, &.{});
+}
+
 /// Encodes raw scanlines (each already prefixed with its filter byte).
 fn testEncode(alloc: Allocator, width: u32, height: u32, color_type: ColorType, bit_depth: u8, scanlines: []const u8, extra_chunks: []const [2][]const u8) ![]u8 {
     var idat = try std.Io.Writer.Allocating.initCapacity(alloc, 1024);
