@@ -1101,6 +1101,11 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         300,
     ));
     debug_trace.logf("images", "startup probe protocol={s}", .{@tagName(terminal_image.current())});
+    // Mouse reporting is on for the whole interactive session, not only the
+    // alternate-screen owners: the image preview pins and dismisses on a
+    // badge click, and the composer's own click routing reads the same
+    // events. The exit restore sequences already turn every mode here off.
+    try writeLifecycleTerminalBytes(cfg.shell, cfg.metrics, alternate_mouse_tracking_enter);
     cfg.terminal.installResizeSignal(cfg.resize_handler);
     installAbnormalExitHandlers(io_mod.getenv("TMUX"));
     cfg.shell.layout = try cfg.terminal.queryLayout(cfg.footer_rows);
