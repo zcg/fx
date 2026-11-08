@@ -8,10 +8,15 @@
 # build.zig, the macOS signing script, the native SDK addon, an E2E file listed
 # in tests/e2e/macos-platform-tests.json, a shared E2E helper that reads the
 # platform before or after the change, or the macOS checks themselves. A Linux
-# branch counts because macOS takes its other path. A Windows-only branch does
-# not, because macOS and Linux share its other path. Set MACOS_REQUESTED to a
-# reason to force the checks, and SDK_NATIVE_REQUESTED=true to force the native
-# SDK addon check.
+# branch counts because macOS takes its other path.
+#
+# A Windows branch counts too. Windows is the third platform fx builds for, and
+# a compiled branch that only exists there still has to keep the file building
+# on macOS, so a change that adds or edits one is worth the macOS compile even
+# though macOS never takes that path at run time.
+#
+# Set MACOS_REQUESTED to a reason to force the checks, and
+# SDK_NATIVE_REQUESTED=true to force the native SDK addon check.
 #
 # Writes needed=true|false and sdk_native=true|false to $GITHUB_OUTPUT and the
 # reasons to $GITHUB_STEP_SUMMARY when those files are set. Exits non-zero when

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,67 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "detect-macos-need.sh"
 PLATFORM_LIST = "tests/e2e/macos-platform-tests.json"
 
+
+def posix_path(path: pathlib.Path | str, bash: str) -> str:
+    """`path` as the Bash being used sees it.
+
+    CI runs on Linux and macOS, where a POSIX path is already what the script
+    gets. On Windows the tests run under Git Bash, which mounts the drives under
+    `/d/...`, so a Windows path passed straight through names nothing there.
+    """
+    text = str(path)
+    if os.name != "nt" or bash == "bash":
+        return text
+    cygpath = shutil.which("cygpath")
+    if cygpath:
+        result = subprocess.run(
+            [cygpath, "--unix", text],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    # `cygpath` ships with Git Bash; without it, do the drive mapping by hand.
+    drive = pathlib.Path(text).drive
+    if len(drive) == 2 and drive[1] == ":":
+        rest = text[2:].replace("\\", "/")
+        return f"/{drive[0].lower()}{rest}"
+    return text
+
+
+def find_bash() -> str:
+    """The Bash to run the script with.
+
+    On Windows `bash` resolves to the WSL launcher in System32, which runs a
+    Linux distribution that has none of this checkout's paths. The script needs
+    Git Bash, so the installs Git for Windows uses are tried first.
+    """
+    if os.name == "nt":
+        candidates = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ]
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(
+                os.path.join(local_app_data, "Programs", "Git", "bin", "bash.exe"),
+            )
+        # Scoop keeps Git outside the standard install folders.
+        scoop = os.environ.get("SCOOP")
+        if scoop:
+            candidates.append(os.path.join(scoop, "apps", "git", "current", "bin", "bash.exe"))
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            candidates.append(
+                os.path.join(user_profile, "scoop", "apps", "git", "current", "bin", "bash.exe"),
+            )
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+    return "bash"
 
 class DetectMacosNeedTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -58,12 +120,18 @@ class DetectMacosNeedTests(unittest.TestCase):
     ) -> tuple[int, dict[str, str], str]:
         output_path = self.root.parent / f"{self.root.name}-output"
         output_path.write_text("", encoding="utf-8")
+        bash = find_bash()
         result = subprocess.run(
-            ["bash", str(SCRIPT_PATH), base or self.base, head],
+            [bash, posix_path(SCRIPT_PATH, bash), base or self.base, head],
             cwd=self.root,
-            env={**self.env, "GITHUB_OUTPUT": str(output_path), **env},
+            env={**self.env, "GITHUB_OUTPUT": posix_path(output_path, bash), **env},
             capture_output=True,
             text=True,
+            # Git Bash on a non-English Windows writes its diagnostics in the
+            # console ANSI code page, which is not UTF-8, so a strict UTF-8
+            # decode would raise before the assertion could report what ran.
+            encoding="utf-8",
+            errors="replace",
         )
         outputs = dict(
             line.split("=", 1)
@@ -87,12 +155,19 @@ class DetectMacosNeedTests(unittest.TestCase):
     def test_change_without_platform_behavior_skips_macos(self) -> None:
         self.write("README.md", "fx docs\n")
         self.write("src/plain.zig", "pub fn plain() u8 { return 1; }\n")
-        self.write("src/windows.zig", "if (builtin.os.tag == .windows) {} else {}\n")
         self.write("src/linux_target.zig", "const name = .linux_x64;\n")
         self.write("tests/e2e/unlisted.test.ts", "test\n")
         self.commit("head")
 
         self.assert_not_needed()
+
+    def test_a_windows_branch_needs_macos_because_the_file_still_compiles(self) -> None:
+        # A Windows branch never runs on macOS, but the file that holds it still
+        # has to build there, so the change is worth the macOS compile.
+        self.write("src/windows.zig", "if (builtin.os.tag == .windows) {} else {}\n")
+        self.commit("head")
+
+        self.assertIn("src/windows.zig", self.assert_needed())
 
     def test_zig_file_with_macos_code_needs_macos(self) -> None:
         self.write("src/mac.zig", "if (builtin.os.tag == .macos) { run(); }\n")
