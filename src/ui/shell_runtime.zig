@@ -87,6 +87,13 @@ pub const TerminalState = struct {
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
     alternate_mouse_tracking_active: bool = false,
+    /// Whether fx asked the terminal to report pointer motion for the composer
+    /// and the image preview, rather than for an alternate-screen owner.
+    ///
+    /// Mouse reporting is only on while something reads it, because a process
+    /// that dies with the mode still set leaves the shell printing every
+    /// pointer move as text.
+    session_mouse_tracking: bool = false,
     signal_handler_installed: bool = false,
     old_winch_action: ?std.posix.Sigaction = null,
 

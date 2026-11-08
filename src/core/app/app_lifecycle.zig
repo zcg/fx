@@ -1101,11 +1101,11 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         300,
     ));
     debug_trace.logf("images", "startup probe protocol={s}", .{@tagName(terminal_image.current())});
-    // Mouse reporting is on for the whole interactive session, not only the
-    // alternate-screen owners: the image preview pins and dismisses on a
-    // badge click, and the composer's own click routing reads the same
-    // events. The exit restore sequences already turn every mode here off.
-    try writeLifecycleTerminalBytes(cfg.shell, cfg.metrics, alternate_mouse_tracking_enter);
+    // Mouse reporting stays off until something needs it: the image preview
+    // turns it on when a badge is present, and the composer's click routing
+    // does the same. Enabling it for the whole session meant a crash left the
+    // terminal reporting every pointer move into the shell that regained the
+    // prompt, which printed `ESC[<...M` as text until the window was closed.
     cfg.terminal.installResizeSignal(cfg.resize_handler);
     installAbnormalExitHandlers(io_mod.getenv("TMUX"));
     cfg.shell.layout = try cfg.terminal.queryLayout(cfg.footer_rows);
@@ -1739,6 +1739,33 @@ fn setAlternateScreenMouseTracking(
         ui_terminal.alternate_mouse_tracking_leave_sequence,
     );
     terminal.alternate_mouse_tracking_active = false;
+}
+
+/// Turns pointer reporting on for the composer and the image preview.
+///
+/// Reporting is armed only while something reads it, and never twice, so the
+/// frames that ask on every redraw cost one comparison. An alternate-screen
+/// owner keeps its own switch: the two never overlap, because the composer is
+/// not drawn while one of them holds the screen.
+pub fn setSessionMouseTracking(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    enabled: bool,
+) void {
+    if (terminal.session_mouse_tracking == enabled) return;
+    if (terminal.alternate_screen_owner != .none) return;
+    if (enabled) {
+        terminal.session_mouse_tracking = true;
+        _ = writeLifecycleTerminalBytes(shell, metrics, alternate_mouse_tracking_enter) catch {};
+        return;
+    }
+    _ = writeLifecycleTerminalBytes(
+        shell,
+        metrics,
+        ui_terminal.alternate_mouse_tracking_leave_sequence,
+    ) catch {};
+    terminal.session_mouse_tracking = false;
 }
 
 fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) void {

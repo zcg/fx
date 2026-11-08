@@ -2353,9 +2353,19 @@ fn buildImageOverlay(
     placements: *std.ArrayList(render_engine.image_overlay.Placement),
 ) !void {
     if (comptime !@hasField(App, "main_agent")) return;
-    if (!terminal_image.current().drawsImages()) return;
     const images = app.main_agent.pending_images.items;
-    if (images.len == 0) return;
+    if (images.len == 0) {
+        // Nothing left to click, so nothing needs pointer reports. Turning the
+        // mode off here is what keeps a crash from leaking it to the shell.
+        app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, false);
+        return;
+    }
+    if (!terminal_image.current().drawsImages()) return;
+
+    // Pointer reporting is armed here rather than at startup: a badge is what
+    // reads a click, so the mode is on exactly while there is something to
+    // click. A crash with no badge leaves the terminal untouched.
+    app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, true);
 
     const layout = app.shell.layout;
     var highest: u32 = 0;

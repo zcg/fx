@@ -11,7 +11,13 @@ pub const theme_background_query = "\x1b]11;?\x1b\\";
 pub const theme_response_fence_query = "\x1b[c";
 pub const theme_background_query_with_fence = theme_background_query ++ theme_response_fence_query;
 pub const alternate_screen_leave_sequence = "\x1b[?1049l";
-pub const alternate_mouse_tracking_leave_sequence = "\x1b[?1000l\x1b[?1006l";
+/// Turns off every mouse report the enter sequence turned on.
+///
+/// This has to mirror the enter sequence exactly. Leaving `?1002` or `?1003`
+/// on puts the terminal back in report-every-motion mode after fx exits, so the
+/// shell that regains the prompt receives a stream of `ESC[<...M` reports and
+/// prints them as text.
+pub const alternate_mouse_tracking_leave_sequence = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
 pub fn alternateScreenLeaveSequence(mouse_tracking_active: bool) []const u8 {
     return if (mouse_tracking_active)
