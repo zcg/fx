@@ -2355,17 +2355,20 @@ fn buildImageOverlay(
     if (comptime !@hasField(App, "main_agent")) return;
     const images = app.main_agent.pending_images.items;
     if (images.len == 0) {
-        // Nothing left to click, so nothing needs pointer reports. Turning the
-        // mode off here is what keeps a crash from leaking it to the shell.
-        app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, false);
+        // Nothing left to preview. Pointer reporting is never armed for the
+        // composer, so there is nothing to disarm here either.
         return;
     }
     if (!terminal_image.current().drawsImages()) return;
 
-    // Pointer reporting is armed here rather than at startup: a badge is what
-    // reads a click, so the mode is on exactly while there is something to
-    // click. A crash with no badge leaves the terminal untouched.
-    app_lifecycle.setSessionMouseTracking(&app.terminal, &app.shell, &app.metrics, true);
+    // A badge is shown with no pointer mode at all.
+    //
+    // Asking the terminal to report mouse events is what took scrolling away:
+    // a terminal that reports stays put and forwards the wheel, and nothing in
+    // the composer consumes it, so the transcript froze at the fold. The
+    // preview is therefore keyboard-driven -- the badge carries a number and
+    // `/image N` shows it -- which also survives a crash with no terminal mode
+    // to restore.
 
     const layout = app.shell.layout;
     var highest: u32 = 0;
