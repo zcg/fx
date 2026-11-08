@@ -47,6 +47,68 @@ pub const Strip = struct {
     highest_id: u32,
 };
 
+/// Cells the preview covers. Wider than tall, because a screenshot is usually
+/// wider than tall and a terminal cell is about twice as tall as it is wide.
+pub const preview_columns: u16 = 48;
+pub const preview_rows: u16 = 14;
+
+/// Reads an image file for the preview.
+///
+/// The terminal scales the raster into the cell box itself, so the bytes go out
+/// exactly as they were saved: no decode, no re-encode, no resampling. What is
+/// bounded is the transfer, because a preview is decoration and must not stall
+/// a frame; anything past the limit simply leaves the badge alone.
+pub fn readPreviewPng(alloc: Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    var held = file;
+    const bytes = try io_mod.readFileToEnd(alloc, &held, preview_byte_limit);
+    errdefer alloc.free(bytes);
+    if (bytes.len == 0) return error.EmptyImage;
+    return bytes;
+}
+
+/// Holds the bytes of the one image a preview is showing.
+///
+/// A frame is rebuilt many times a second while a key is held or a reply
+/// streams in, and re-reading a megabyte from disk on every one of those frames
+/// is work nobody sees. The bytes are kept only while the same image stays on
+/// screen: the moment the preview moves to another image, or the attachment
+/// leaves the composer, the memory goes back. Nothing here outlives the turn,
+/// because a sent image is only a record of having sent one.
+pub const PreviewCache = struct {
+    /// The image these bytes belong to; zero means empty.
+    image_id: usize = 0,
+    bytes: []u8 = .{},
+
+    pub fn deinit(self: *PreviewCache, alloc: Allocator) void {
+        if (self.bytes.len != 0) alloc.free(self.bytes);
+        self.* = .{};
+    }
+
+    /// The bytes for `attachment`, reading them only when they are not already
+    /// held. The returned slice stays valid until the next call.
+    pub fn get(self: *PreviewCache, alloc: Allocator, attachment: anytype) ![]const u8 {
+        if (self.image_id == attachment.id and self.bytes.len != 0) return self.bytes;
+        self.deinit(alloc);
+        const bytes = try readPreviewPng(alloc, attachment.path);
+        self.image_id = attachment.id;
+        self.bytes = bytes;
+        return bytes;
+    }
+
+    /// Drops the bytes when the preview no longer shows `image_id`.
+    pub fn keepOnly(self: *PreviewCache, alloc: Allocator, image_id: usize) void {
+        if (self.image_id == image_id) return;
+        self.deinit(alloc);
+    }
+};
+
+/// How large a preview source may be. The terminals guard against a large
+/// raster themselves, and a frame that waits on a multi-megabyte read is worse
+/// than a frame without a picture.
+pub const preview_byte_limit: usize = 16 * 1024 * 1024;
+
 /// Whether thumbnails above the composer are drawn at all.
 ///
 /// A thumbnail is decoration on top of the badge, so it must never cost the
@@ -56,6 +118,139 @@ pub const Strip = struct {
 /// after the text, which is not built yet, so the badge stays the whole story.
 fn thumbnailsEnabled() bool {
     return false;
+}
+
+/// Where a badge sits in the composed footer, in 1-based terminal cells.
+pub const BadgeAnchor = struct {
+    row: u16,
+    column: u16,
+    /// Visible columns the badge occupies, so a preview can center on it.
+    width: u16,
+};
+
+/// Finds the first image badge in the composed rows.
+///
+/// The badge text is what the composer already writes, so the anchor is read
+/// from the same string the user sees rather than recomputed from the layout:
+/// two sources of truth for one position would drift apart the first time the
+/// composer changed.
+pub fn findBadgeAnchor(rows: anytype, image_id: usize) ?BadgeAnchor {
+    var needle_buf: [32]u8 = undefined;
+    const needle = std.mem.print(&needle_buf, "[Image {d}]", .{image_id}) catch return null;
+    for (rows) |composed| {
+        // Rows carry escape sequences for links and styling, so the badge is
+        // searched in the visible text rather than the raw bytes.
+        const visible_at = visibleColumnOf(composed.text.items, needle) orelse continue;
+        return .{
+            .row = composed.row,
+            .column = @intCast(visible_at + 1),
+            .width = @intCast(needle.len),
+        };
+    }
+    return null;
+}
+
+/// The 0-based visible column where `needle` starts, ignoring escape sequences.
+fn visibleColumnOf(text: []const u8, needle: []const u8) ?usize {
+    var visible: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == 0x1b) {
+            index = skipEscape(text, index);
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[index..], needle)) return visible;
+        // Only printable bytes advance the column; a control byte does not.
+        if (text[index] >= 0x20) visible += 1;
+        index += 1;
+    }
+    return null;
+}
+
+/// Advances past the escape sequence starting at `index`.
+fn skipEscape(text: []const u8, index: usize) usize {
+    if (index + 1 >= text.len) return text.len;
+    return switch (text[index + 1]) {
+        // CSI and OSC both end at a terminator, not at a fixed length.
+        '[' => blk: {
+            var at = index + 2;
+            while (at < text.len) : (at += 1) {
+                const byte = text[at];
+                if (byte >= 0x40 and byte <= 0x7e) break :blk at + 1;
+            }
+            break :blk text.len;
+        },
+        ']' => blk: {
+            var at = index + 2;
+            while (at < text.len) : (at += 1) {
+                if (text[at] == 0x07) break :blk at + 1;
+                if (text[at] == 0x1b and at + 1 < text.len and text[at + 1] == '\\') break :blk at + 2;
+            }
+            break :blk text.len;
+        },
+        // A two-byte sequence such as `ESC 7`.
+        else => index + 2,
+    };
+}
+
+/// A rectangle a preview occupies, in 1-based terminal cells.
+pub const Rect = struct {
+    row: u16,
+    column: u16,
+    columns: u16,
+    rows: u16,
+};
+
+/// Places a preview above `anchor`, moving it only when the window cannot hold
+/// it there.
+///
+/// The badge is where the user's eye already is, so the preview belongs right
+/// above it. That is only possible when there is room: a badge near the top of
+/// the window has to push the preview down, and one near the right edge has to
+/// pull it left. The result always fits inside `layout` and never covers the
+/// row the badge itself is on, so the badge stays readable while the preview is
+/// up.
+pub fn previewRect(
+    anchor: BadgeAnchor,
+    layout: struct { rows: u16, cols: u16 },
+    wanted: struct { columns: u16, rows: u16 },
+) ?Rect {
+    if (layout.rows == 0 or layout.cols == 0) return null;
+    if (wanted.columns == 0 or wanted.rows == 0) return null;
+
+    const columns = @min(wanted.columns, layout.cols);
+    const rows = @min(wanted.rows, layout.rows -| 1);
+    if (rows == 0) return null;
+
+    // Horizontally: center on the badge, then pull back inside the window.
+    const half = anchor.width / 2;
+    const centered_start = if (anchor.column > half) anchor.column - half else 1;
+    const max_start = layout.cols -| columns + 1;
+    const column = @max(@as(u16, 1), @min(centered_start, max_start));
+
+    // Vertically: sit directly above the badge when the rows fit, otherwise
+    // drop below it, and finally clamp to the window.
+    const above_row = anchor.row -| rows;
+    const fits_above = anchor.row > rows;
+    const below_row = anchor.row + 1;
+    const fits_below = below_row + rows <= layout.rows + 1;
+    const row = if (fits_above)
+        above_row
+    else if (fits_below)
+        below_row
+    else blk: {
+        // Neither side has room: use the top of the window.
+        break :blk @as(u16, 1);
+    };
+    const max_row = layout.rows -| rows + 1;
+    const clamped_row = @max(@as(u16, 1), @min(row, max_row));
+
+    return .{
+        .row = clamped_row,
+        .column = column,
+        .columns = columns,
+        .rows = rows,
+    };
 }
 
 /// How many rows a strip of `count` thumbnails needs, or 0 when there is
@@ -212,4 +407,59 @@ test "clearing stops at the highest id the strip owned" {
     try std.testing.expect(std.mem.find(u8, written, "i=1,") != null);
     try std.testing.expect(std.mem.find(u8, written, "i=3,") != null);
     try std.testing.expect(std.mem.find(u8, written, "i=4,") == null);
+}
+
+test "a badge anchor is found past the styling the composer writes" {
+    const alloc = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    try text.appendSlice(alloc, "\x1b[1mhello \x1b]8;;file:///a.png\x1b\\[Image 3]\x1b]8;;\x1b\\ done");
+    const Composed = struct { row: u16, text: std.ArrayList(u8) };
+    const composed = [_]Composed{.{ .row = 7, .text = text }};
+    const anchor = findBadgeAnchor(&composed, 3).?;
+    try std.testing.expectEqual(@as(u16, 7), anchor.row);
+    try std.testing.expectEqual(@as(u16, 7), anchor.column);
+    try std.testing.expectEqual(@as(u16, 9), anchor.width);
+}
+
+test "a preview sits above its badge when the window has room" {
+    const rect = previewRect(
+        .{ .row = 20, .column = 10, .width = 9 },
+        .{ .rows = 30, .cols = 80 },
+        .{ .columns = 40, .rows = 12 },
+    ).?;
+    try std.testing.expectEqual(@as(u16, 8), rect.row);
+    try std.testing.expectEqual(@as(u16, 6), rect.column);
+    try std.testing.expectEqual(@as(u16, 40), rect.columns);
+    try std.testing.expectEqual(@as(u16, 12), rect.rows);
+}
+
+test "a preview drops below a badge that sits near the top" {
+    const rect = previewRect(
+        .{ .row = 3, .column = 1, .width = 9 },
+        .{ .rows = 30, .cols = 80 },
+        .{ .columns = 40, .rows = 12 },
+    ).?;
+    try std.testing.expectEqual(@as(u16, 4), rect.row);
+}
+
+test "a preview pulls left at the right edge and never leaves the window" {
+    const rect = previewRect(
+        .{ .row = 20, .column = 78, .width = 9 },
+        .{ .rows = 30, .cols = 80 },
+        .{ .columns = 40, .rows = 12 },
+    ).?;
+    try std.testing.expectEqual(@as(u16, 41), rect.column);
+    try std.testing.expect(rect.column + rect.columns <= 81);
+}
+
+test "a preview shrinks rather than overflow a short window" {
+    const rect = previewRect(
+        .{ .row = 5, .column = 1, .width = 9 },
+        .{ .rows = 8, .cols = 20 },
+        .{ .columns = 40, .rows = 12 },
+    ).?;
+    try std.testing.expectEqual(@as(u16, 20), rect.columns);
+    try std.testing.expect(rect.rows <= 7);
+    try std.testing.expect(rect.row + rect.rows <= 9);
 }

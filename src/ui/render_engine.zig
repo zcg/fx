@@ -7,6 +7,7 @@ pub const frame_layout = @import("render_engine/frame_layout.zig");
 pub const frame_retention = @import("render_engine/frame_retention.zig");
 pub const frame_scroll_plan = @import("render_engine/frame_scroll_plan.zig");
 pub const frame_surface = @import("render_engine/frame_surface.zig");
+pub const image_overlay = @import("render_engine/image_overlay.zig");
 pub const footer_layout = @import("render_engine/footer_layout.zig");
 pub const paint_plan = @import("render_engine/paint_plan.zig");
 pub const terminal_diff = @import("render_engine/terminal_diff.zig");

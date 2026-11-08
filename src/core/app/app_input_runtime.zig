@@ -1009,6 +1009,14 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (resolved == .mouse_pointer and resolved.mouse_pointer.kind == .hover) {
+                // A pointer move with no button down is not a click. It only
+                // exists so a hover state can be built from it; until that
+                // state is wired up, letting it reach the composer would move
+                // the caret on every mouse move.
+                return .done;
+            }
+
             if (resolved == .mouse_pointer and
                 routePrimaryComposerPointerAction(app, agents.screenAgentOf(app), resolved.mouse_pointer))
             {

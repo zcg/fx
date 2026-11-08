@@ -400,9 +400,16 @@ fn writeLine(line: []const u8) void {
     }
 }
 
+/// Whether this process has already started its trace file. A fresh run
+/// truncates the old one instead of appending to it, so a developer looking at
+/// the log always sees only the current run.
+var trace_file_started: bool = false;
+
 fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
+    const first = !trace_file_started;
+    trace_file_started = true;
     var file = std.Io.Dir.createFileAbsolute(zio, path, .{
-        .truncate = false,
+        .truncate = first,
         .lock = .exclusive,
     }) catch return;
     defer file.close(zio);

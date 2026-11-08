@@ -5,6 +5,7 @@ const frame_layout = @import("frame_layout.zig");
 const frame_retention = @import("frame_retention.zig");
 const frame_scroll_plan = @import("frame_scroll_plan.zig");
 const frame_surface = @import("frame_surface.zig");
+const image_overlay = @import("image_overlay.zig");
 const paint_plan = @import("paint_plan.zig");
 const terminal_diff = @import("terminal_diff.zig");
 const transcript_blocks = @import("transcript_blocks.zig");
@@ -60,6 +61,12 @@ pub const BuildFrameOptions = struct {
     presentation: FramePresentation = .styled,
     trace_counters: ?*TraceCounters = null,
     observation: ?FrameObservation = null,
+    /// Images drawn over the finished frame, after its text is on screen.
+    ///
+    /// A caller that has images to show hands them here rather than painting
+    /// them into the surface: an inline image is an APC payload with no column
+    /// of its own, so it travels beside the text instead of inside it.
+    image_overlay: ?*const image_overlay.Overlay = null,
 };
 
 pub const FrameObservation = struct {
@@ -126,6 +133,7 @@ pub fn buildAndFlushFrame(
         .prepared_movement = &movement,
         .sink = shell.frameSink(),
         .metrics = metrics,
+        .image_overlay = options.image_overlay,
     });
     if (options.trace_counters) |counters| counters.frame_commits += 1;
 

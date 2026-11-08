@@ -456,11 +456,26 @@ fn sgrMouseAction(button: u16, column: u16, row: u16, terminator: u8) InputEscap
             else => .ignore,
         };
     }
-    if ((button & 0b11) != 0) return .ignore;
+    // Bits 0-1 name the button: 3 means none is held. With bit 5 set that is a
+    // pointer move, which is the only signal a hover can be built from.
+    const button_bits = button & 0b11;
+    const motion = (button & 32) != 0;
+    if (button_bits == 3) {
+        if (!motion or terminator != 'M') return .ignore;
+        return .{ .mouse_pointer = .{
+            .kind = .hover,
+            .column = column,
+            .row = row,
+            .shift = (button & 4) != 0,
+            .alt = (button & 8) != 0,
+            .ctrl = (button & 16) != 0,
+        } };
+    }
+    if (button_bits != 0) return .ignore;
 
     const kind: MousePointerKind = if (terminator == 'm')
         .release
-    else if (terminator == 'M' and (button & 32) != 0)
+    else if (terminator == 'M' and motion)
         .drag
     else if (terminator == 'M')
         .press

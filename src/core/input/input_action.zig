@@ -12,6 +12,9 @@ pub const MousePointerKind = enum {
     press,
     drag,
     release,
+    /// The pointer moved with no button held, which a terminal only reports
+    /// after it is asked for it (`?1003h`). Hover state is built from this.
+    hover,
 };
 
 pub const MousePointer = struct {

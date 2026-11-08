@@ -38,6 +38,9 @@ const input_presentation = @import("../../ui/footer/input_presentation.zig");
 const footer_viewport = @import("../../ui/footer/viewport.zig");
 const render_request = @import("../../ui/render_request.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
+const ui_surface_frame = @import("../../ui/footer/surface_frame.zig");
+const ui_image_strip = @import("../../ui/footer/image_strip.zig");
+const terminal_image = @import("../shared/terminal_image.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
@@ -1801,6 +1804,22 @@ pub fn Runtime(comptime App: type) type {
                 presentation_shell,
                 active_committed_layout,
             );
+            // A pasted image is drawn over the frame once its text is on
+            // screen, because an APC payload has no column and cannot travel in
+            // a text row. The preview goes above the badge it belongs to, which
+            // is where the user is already looking.
+            var image_overlay_storage: render_engine.image_overlay.Overlay = .{};
+            var image_overlay_placements: std.ArrayList(render_engine.image_overlay.Placement) = .empty;
+            defer image_overlay_placements.deinit(app.alloc);
+            buildImageOverlay(
+                App,
+                app,
+                &footer_frame,
+                &image_overlay_storage,
+                &image_overlay_placements,
+            ) catch |err| {
+                debug_trace.logf("images", "overlay build failed err={t}", .{err});
+            };
             const result = try render_engine.frame_builder.buildAndFlushFrame(
                 app.alloc,
                 &frame_shell,
@@ -1821,6 +1840,7 @@ pub fn Runtime(comptime App: type) type {
                     .footer_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintFooter },
                     .activity_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintActivity },
                     .trace_counters = &counters,
+                    .image_overlay = if (image_overlay_storage.isEmpty()) null else &image_overlay_storage,
                     .observation = .{
                         .observer = &presentation_shell.ui_observer,
                         .row_provenance = observation_rows,
@@ -2314,6 +2334,70 @@ fn transcriptAreaBeforePendingTail(
     return .{ .top = area.top, .bottom = area.top + canonical_rows - 1 };
 }
 
+/// Builds the images a frame draws over its text.
+///
+/// A pasted image is shown above the badge that names it, which is where the
+/// user is already looking after a paste. The rectangle is clamped to the
+/// window, so a badge near an edge pushes the preview inward instead of off
+/// screen. Everything is skipped when the terminal cannot draw images, which
+/// leaves the badge as the whole story.
+fn buildImageOverlay(
+    comptime App: type,
+    app: *App,
+    footer_frame: *const ui_surface_frame.SurfaceFooterFrame,
+    overlay: *render_engine.image_overlay.Overlay,
+    placements: *std.ArrayList(render_engine.image_overlay.Placement),
+) !void {
+    if (comptime !@hasField(App, "main_agent")) return;
+    debug_trace.logf("images", "overlay start supported={} images={d}", .{
+        render_engine.image_overlay.supported(terminal_image.current().drawsImages()),
+        app.main_agent.pending_images.items.len,
+    });
+    if (!render_engine.image_overlay.supported(terminal_image.current().drawsImages())) return;
+    const images = app.main_agent.pending_images.items;
+    if (images.len == 0) return;
+
+    const layout = app.shell.layout;
+    var highest: u32 = 0;
+    for (images) |image| {
+        highest = @max(highest, @as(u32, @intCast(image.id)));
+    }
+    overlay.highest_id = highest;
+
+    // The newest attachment is the one the user just pasted, so it is the one
+    // to preview. A hover consumer can replace this choice later.
+    const target = images[images.len - 1];
+    const anchor = ui_image_strip.findBadgeAnchor(footer_frame.composed.rows.items, target.id) orelse {
+        debug_trace.logf("images", "overlay no anchor id={d} rows={d}", .{ target.id, footer_frame.composed.rows.items.len });
+        return;
+    };
+    const rect = ui_image_strip.previewRect(
+        anchor,
+        .{ .rows = layout.rows, .cols = layout.cols },
+        .{ .columns = ui_image_strip.preview_columns, .rows = ui_image_strip.preview_rows },
+    ) orelse return;
+
+    // The terminal opens the file and detects the format itself. No bytes are
+    // read here: a JPEG sent as `f=100` would be dropped, and holding a
+    // megabyte of pixels in fx's memory for a preview is unnecessary.
+    const path = target.path;
+    debug_trace.logf("images", "overlay file path={s} rect={d},{d} {d}x{d}", .{
+        path,
+        rect.row,
+        rect.column,
+        rect.columns,
+        rect.rows,
+    });
+    try placements.append(app.alloc, .{
+        .row = rect.row,
+        .column = rect.column,
+        .columns = rect.columns,
+        .rows = rect.rows,
+        .image_id = @intCast(target.id),
+        .source = .{ .file = path },
+    });
+    overlay.placements = placements.items;
+}
 fn FramePaintContext(comptime App: type) type {
     return struct {
         app: *App,

@@ -4,7 +4,40 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const ui_terminal = @import("../terminal/terminal.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+/// Appends one line to a diagnostic file, without depending on `FX_TRACE`.
+///
+/// A preview lives outside the cell grid, so none of the usual frame traces
+/// say whether its bytes were written. This is deliberately unconditional and
+/// deliberately tiny: a timestamp, the byte count, and the placement count.
+/// The file is truncated once per process so a run never inherits an old one.
+var overlay_log_started: bool = false;
+
+fn recordOverlayWrite(byte_count: usize, placement_count: usize) void {
+    const io = @import("../../core/shared/io.zig");
+    const root = io.getenv("TEMP") orelse io.getenv("TMP") orelse return;
+    const zio = io.getIo();
+    const path = std.heap.c_allocator.print(
+        "{s}\\fx-image-overlay.log",
+        .{root},
+    ) catch return;
+    defer std.heap.c_allocator.free(path);
+
+    const first = !overlay_log_started;
+    overlay_log_started = true;
+    const file = std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = first }) catch return;
+    defer file.close(zio);
+    var line_buf: [160]u8 = undefined;
+    const line = std.mem.print(&line_buf, "{d} bytes={d} placements={d}\n", .{
+        io.milliTimestamp(),
+        byte_count,
+        placement_count,
+    }) catch return;
+    const end = if (first) 0 else file.length(zio) catch return;
+    file.writePositionalAll(zio, line, end) catch {};
+}
+
 const frame_cell_match = @import("frame_cell_match.zig");
+const image_overlay_module = @import("image_overlay.zig");
 const frame_scroll_plan = @import("frame_scroll_plan.zig");
 const frame_surface = @import("frame_surface.zig");
 const paint_plan = @import("paint_plan.zig");
@@ -74,6 +107,13 @@ pub const FrameCommitInput = struct {
     prepared_movement: ?*const PreparedTerminalMovement = null,
     sink: FrameSink,
     metrics: *Metrics,
+    /// Bytes drawn over the finished text, after the frame is on screen.
+    ///
+    /// An inline image is an APC string of a few hundred kilobytes, which is
+    /// far past what a text band can hold, so it never travels through
+    /// `FrameSurface`. The layout reserves empty rows, the text pass fills them,
+    /// and this overlay paints pixels on top of those rows.
+    image_overlay: ?*const image_overlay_module.Overlay = null,
 };
 
 pub const TerminalMovementSegment = struct {
@@ -447,6 +487,9 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         full_repaint,
         movement,
     );
+    // The image bytes are written separately, after this text frame is
+    // committed: an APC payload has no column and cannot take part in the
+    // shadow terminal's cell-by-cell cross-check.
     const wire_frame_bytes = wire_frame.written();
     const document_append_range = movement.documentAppendWireRange(prefix_len);
     const frame_movement_segments = FrameMovementSegments.fromPreparedMovement(prefix_len, movement.*);
@@ -517,6 +560,10 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
             error.TestShadowFeedFailure,
         );
     }
+    // The shadow terminal replays the frame to cross-check it against the cell
+    // grid, and an inline image has no cells to check: an APC payload paints
+    // pixels the grid does not model. Only the text prefix is replayed, which is
+    // exactly the part the grid describes.
     fed_shadow.feed(wire_frame_bytes) catch |err| {
         return shadowFeedFailedWithRepair(input, changed_cells, full_repaint, accepted_write.accepted_bytes, scroll_commit, accepted_write.scroll_attribution, accepted_write.document_append_committed, err);
     };
@@ -555,6 +602,31 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     input.previous.deinit();
     input.previous.* = fed_shadow;
     fed_shadow_initialized = false;
+
+    // The text frame is committed. Now draw the images over it, as a separate
+    // write: the shadow terminal has already checked the cells, and an APC
+    // payload has no cells to check. This is exactly the order a terminal
+    // needs -- text first, then pixels anchored to absolute cells.
+    //
+    // A file placement is only a few dozen bytes, so it is sent on every
+    // committed frame. That is deliberate: a terminal can lose its image layer
+    // on resize, clear, or a full repaint, and a cached "already sent" flag
+    // would then leave the user with a badge and no picture until the image
+    // itself changed.
+    if (input.image_overlay) |overlay| {
+        if (!overlay.isEmpty()) {
+            var image_bytes: std.Io.Writer.Allocating = .init(alloc);
+            defer image_bytes.deinit();
+            image_overlay_module.write(&image_bytes.writer, overlay.*) catch {};
+            if (image_bytes.written().len != 0) {
+                // Unconditional diagnostic: a preview that never reaches the
+                // terminal is otherwise invisible in every trace scope. One
+                // line per write, to a file outside the repo, with a timestamp.
+                recordOverlayWrite(image_bytes.written().len, overlay.placements.len);
+                _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
+            }
+        }
+    }
 
     debug_trace.logf(
         "frame_commit",
