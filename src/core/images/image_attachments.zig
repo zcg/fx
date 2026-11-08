@@ -248,16 +248,28 @@ fn loadResolvedImageAttachment(
 
 /// The folder fx writes short-lived files into.
 ///
-/// `/tmp` is the Unix spelling. Windows has no such directory, so a path under
-/// the profile's temporary folder is what actually exists there.
-fn tempRootPath() []const u8 {
-    return if (builtin.target.os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
+/// `/tmp` is the Unix spelling. Windows has no such directory: the system one
+/// below the Windows folder belongs to administrators and refuses an ordinary
+/// user's write, so the per-user temporary folder that `TEMP` names is the one
+/// that exists and is writable.
+fn tempRootPath() ?[]const u8 {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (io_mod.getenv("TEMP")) |temp| {
+            if (temp.len != 0) return temp;
+        }
+        if (io_mod.getenv("TMP")) |temp| {
+            if (temp.len != 0) return temp;
+        }
+        return null;
+    }
+    return "/tmp";
 }
 
 pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
-    // `/tmp` exists on macOS and Linux; Windows keeps its temporary files
-    // under the profile, and `io_mod` already resolves the right folder.
-    const temp_root = try io_mod.realpathAlloc(alloc, tempRootPath());
+    // A machine with no temporary folder set is a misconfiguration, not a
+    // reason to write somewhere the process may not own.
+    const root_path = tempRootPath() orelse return error.NoTempDirectory;
+    const temp_root = try io_mod.realpathAlloc(alloc, root_path);
     defer alloc.free(temp_root);
     for (0..16) |_| {
         var suffix: u64 = undefined;

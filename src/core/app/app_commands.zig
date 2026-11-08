@@ -1393,7 +1393,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try image_commands.Commands(App).attachClipboard(app);
+            image_commands.Commands(App).attachClipboard(app);
         }
 
         fn commandHandleFast(ctx: *anyopaque, rest: []const u8) !void {

@@ -1437,7 +1437,13 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "image attach skipped reason=model_picker_borrows_composer", .{});
                         return;
                     }
-                    try image_commands.Commands(App).attachClipboard(app);
+                    // Reading the clipboard is a user action that can fail for
+                    // reasons outside fx: another program holds it, the
+                    // temporary folder is unwritable, the image is corrupt.
+                    // None of that is a reason to end the session, so
+                    // `attachClipboard` reports its own failure and the
+                    // composer stays usable.
+                    image_commands.Commands(App).attachClipboard(app);
                 },
                 24 => {
                     return;

@@ -86,34 +86,41 @@ pub fn Commands(comptime App: type) type {
             }, true);
         }
 
-        pub fn attachClipboard(app: *App) !void {
+        pub fn attachClipboard(app: *App) void {
+            // Every failure here is reported, never returned: a paste is one
+            // user action, and ending the session because the temporary folder
+            // is unwritable or the clipboard is held would lose the draft.
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
                 switch (err) {
                     // Nothing on the clipboard to attach. A terminal that sends
                     // Ctrl+V as a plain key press still pastes its text right
                     // after this, so a notice would only add noise.
-                    error.NoClipboardImage => {
-                        return;
-                    },
+                    error.NoClipboardImage => return,
                     // Another program held the clipboard past the retry budget.
-                    error.ClipboardBusy => {
-                        try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "the clipboard is busy; try again" }, true);
-                        return;
-                    },
+                    error.ClipboardBusy => return reportClipboardNotice(app, .neutral, "the clipboard is busy; try again"),
                     else => {
-                        const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
+                        const line = app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)}) catch {
+                            return reportClipboardNotice(app, .@"error", "failed to paste clipboard image");
+                        };
                         defer app.alloc.free(line);
-                        try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
-                        return;
+                        return reportClipboardNotice(app, .@"error", line);
                     },
                 }
             };
             defer loaded.deinit(app.alloc);
-            switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {
+            switch (insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary) catch |err| {
+                return reportClipboardNotice(app, .@"error", @errorName(err));
+            }) {
                 .inserted => app.shell.render_requests.request(.footer),
                 .rejected => {},
-                .input_full => try writeInputFullNotice(app),
+                .input_full => writeInputFullNotice(app) catch |err| {
+                    reportClipboardNotice(app, .@"error", @errorName(err));
+                },
             }
+        }
+
+        fn reportClipboardNotice(app: *App, tone: types.NoticeTone, body: []const u8) void {
+            app.writeDomainNotice(.{ .topic = "images", .tone = tone, .body = body }, true) catch {};
         }
 
         fn insertImageAtCursor(
