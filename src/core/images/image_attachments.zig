@@ -2100,6 +2100,44 @@ pub fn load_inline_image_attachment(alloc: std.mem.Allocator, workspace_root: []
     return load_user_image_literal(alloc, workspace_root, path);
 }
 
+/// Whether the whole pasted buffer is one image path, which is what a pasted
+/// screenshot path looks like before anything splits it.
+///
+/// A Windows path separates with `\` and Explorer writes spaces into file names
+/// such as `Screenshot 2026-11-08 123456.png`. Splitting that by shell
+/// separators cuts it at the first space, so the paste handler asks this first
+/// and keeps the buffer whole when it names an image. A trailing newline or a
+/// wrapping quote is part of how the clipboard spelled it, not part of the
+/// path.
+pub fn wholePastedImagePath(raw: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const unquoted = stripBalancedOuterQuotes(trimmed);
+    if (unquoted.len != trimmed.len) {
+        // A fully quoted buffer is one path even when it holds spaces.
+        if (supported_path_extension(extensionIgnoringEscapes(unquoted))) return unquoted;
+        return null;
+    }
+    // An unquoted buffer is one path only when nothing splits it, so a pasted
+    // sentence that happens to mention an image stays text.
+    if (std.mem.findAny(u8, trimmed, "\r\n\t") != null) return null;
+    // Spaces are allowed inside a Windows file name. A drive letter or a
+    // leading slash anchors it as one path rather than prose.
+    if (!looksLikeAbsolutePath(trimmed)) return null;
+    if (!supported_path_extension(extensionIgnoringEscapes(trimmed))) return null;
+    return trimmed;
+}
+
+fn looksLikeAbsolutePath(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (text[0] == '/') return true;
+    // A drive-letter path, such as `C:\...` or `C:/...`.
+    if (text.len >= 3 and std.ascii.isAlphabetic(text[0]) and text[1] == ':') {
+        return text[2] == '\\' or text[2] == '/';
+    }
+    return false;
+}
+
 pub fn splitImagePathToken(raw: []const u8) ?ImagePathToken {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed, "@\"")) {
@@ -2761,6 +2799,22 @@ test "hasImagePathToken detects image-looking shell tokens without filesystem ac
     try std.testing.expect(hasImagePathToken("\"/tmp/quoted image.webp\"!"));
     try std.testing.expect(hasImagePathToken("'/tmp/quoted image.gif'"));
     try std.testing.expect(!hasImagePathToken("hello /tmp/not-image.txt"));
+}
+
+test "a pasted Windows image path becomes one token" {
+    // Windows paths separate with `\`, which the tokenizer otherwise treats as
+    // an escape, and Explorer separates with spaces. A pasted path has to
+    // survive both or it arrives as text instead of an attachment.
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\me\\shot.png",
+        "C:\\Users\\me\\shot.png"[0..nextShellTokenEnd("C:\\Users\\me\\shot.png", 0)],
+    );
+    // A quoted path keeps its spaces.
+    const quoted = "\"C:\\Users\\me\\My Shot.png\"";
+    try std.testing.expectEqual(
+        quoted.len,
+        nextShellTokenEnd(quoted, 0),
+    );
 }
 
 test "inline image edits preserve outer multiline whitespace and stable digit boundaries" {

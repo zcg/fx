@@ -459,6 +459,58 @@ pub fn PasteEditRuntime(comptime App: type) type {
             app.input_runtime.paste.buffer.clearRetainingCapacity();
         }
 
+        /// Attaches `path` as the pasted image, for a buffer that is exactly one
+        /// image path.
+        ///
+        /// A pasted screenshot is one path, and Windows file names carry spaces, so
+        /// the shell-token walk in `handlePastedBytes` cannot be the only reader:
+        /// it would cut the path at the first space and paste the rest as text.
+        fn attachWholePastedImage(
+            app: *App,
+            stage: *ImagePasteStage,
+            path: []const u8,
+            first_image_id: usize,
+        ) !void {
+            const maybe_img = image_attachments.loadUserImageAttachment(
+                app.alloc,
+                app.workspace_root,
+                path,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.ImageTooLarge => blk: {
+                    try reportImageTooLarge(app);
+                    break :blk null;
+                },
+                else => null,
+            };
+            const img = maybe_img orelse return;
+            var attached = img;
+            var owns_attached = true;
+            defer if (owns_attached) {
+                image_attachments.discardImageAttachment(app.alloc, attached);
+            };
+
+            attached.id = first_image_id;
+            switch (try image_attachments.captureImageAttachmentForAdmission(App, app, &attached)) {
+                .captured => {},
+                .rejected => return,
+            }
+
+            var ph_buf: [32]u8 = undefined;
+            const placeholder = try image_attachments.formatImagePlaceholder(&ph_buf, first_image_id);
+            const relative_start = stage.replacement.items.len;
+            try stage.replacement.appendSlice(app.alloc, placeholder);
+            try stage.tokens.append(app.alloc, .{
+                .span = .{
+                    .raw_start = relative_start,
+                    .raw_end = relative_start + placeholder.len,
+                },
+                .id = first_image_id,
+            });
+            try stage.images.append(app.alloc, attached);
+            owns_attached = false;
+        }
+
         pub fn handlePastedBytes(app: *App, agent: *AppAgent, bytes: []const u8, max_input_len: usize) !void {
             // The add-provider walk reads its own fields, so a paste belongs to
             // the field being edited rather than to the prompt behind it. A key
@@ -478,70 +530,78 @@ pub fn PasteEditRuntime(comptime App: type) type {
             defer stage.deinit(app.alloc);
 
             const first_image_id = app.peekNextImageId(agent);
-            var prev: usize = 0;
-            var i: usize = 0;
-            while (i < bytes.len) {
-                while (i < bytes.len and image_attachments.isWhitespace(bytes[i])) : (i += 1) {}
-                if (i >= bytes.len) break;
-                const start = i;
-                i = image_attachments.nextShellTokenEnd(bytes, start);
-                const raw = bytes[start..i];
-                if (image_attachments.splitImagePathToken(raw)) |token| {
-                    const maybe_img = image_attachments.load_inline_image_attachment(
-                        app.alloc,
-                        app.workspace_root,
-                        token,
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        error.ImageTooLarge => blk: {
-                            try reportImageTooLarge(app);
-                            break :blk null;
-                        },
-                        else => null,
-                    };
-                    if (maybe_img) |img| {
-                        var attached = img;
-                        var owns_attached = true;
-                        defer if (owns_attached) {
-                            image_attachments.discardImageAttachment(app.alloc, attached);
-                        };
 
-                        const id = std.math.add(
-                            usize,
-                            first_image_id,
-                            stage.images.items.len,
-                        ) catch return error.ImageIdOverflow;
-                        attached.id = id;
-                        switch (try image_attachments.captureImageAttachmentForAdmission(App, app, &attached)) {
-                            .captured => {},
-                            .rejected => continue,
-                        }
-
-                        var ph_buf: [32]u8 = undefined;
-                        const placeholder = try image_attachments.formatImagePlaceholder(&ph_buf, id);
-                        try stage.replacement.appendSlice(app.alloc, bytes[prev..start]);
-                        const relative_start = stage.replacement.items.len;
-                        try stage.replacement.appendSlice(app.alloc, placeholder);
-                        try stage.tokens.append(app.alloc, .{
-                            .span = .{
-                                .raw_start = relative_start,
-                                .raw_end = relative_start + placeholder.len,
+            // A pasted screenshot arrives as one path, and on Windows that path
+            // usually holds spaces. The token walk below splits on them, so a
+            // buffer that is exactly one path is attached before the walk runs.
+            if (image_attachments.wholePastedImagePath(bytes)) |path| {
+                try attachWholePastedImage(app, &stage, path, first_image_id);
+            } else {
+                var prev: usize = 0;
+                var i: usize = 0;
+                while (i < bytes.len) {
+                    while (i < bytes.len and image_attachments.isWhitespace(bytes[i])) : (i += 1) {}
+                    if (i >= bytes.len) break;
+                    const start = i;
+                    i = image_attachments.nextShellTokenEnd(bytes, start);
+                    const raw = bytes[start..i];
+                    if (image_attachments.splitImagePathToken(raw)) |token| {
+                        const maybe_img = image_attachments.load_inline_image_attachment(
+                            app.alloc,
+                            app.workspace_root,
+                            token,
+                        ) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            error.ImageTooLarge => blk: {
+                                try reportImageTooLarge(app);
+                                break :blk null;
                             },
-                            .id = id,
-                        });
-                        try stage.replacement.appendSlice(app.alloc, token.suffix);
-                        try stage.images.append(app.alloc, attached);
-                        owns_attached = false;
-                        prev = i;
+                            else => null,
+                        };
+                        if (maybe_img) |img| {
+                            var attached = img;
+                            var owns_attached = true;
+                            defer if (owns_attached) {
+                                image_attachments.discardImageAttachment(app.alloc, attached);
+                            };
+
+                            const id = std.math.add(
+                                usize,
+                                first_image_id,
+                                stage.images.items.len,
+                            ) catch return error.ImageIdOverflow;
+                            attached.id = id;
+                            switch (try image_attachments.captureImageAttachmentForAdmission(App, app, &attached)) {
+                                .captured => {},
+                                .rejected => continue,
+                            }
+
+                            var ph_buf: [32]u8 = undefined;
+                            const placeholder = try image_attachments.formatImagePlaceholder(&ph_buf, id);
+                            try stage.replacement.appendSlice(app.alloc, bytes[prev..start]);
+                            const relative_start = stage.replacement.items.len;
+                            try stage.replacement.appendSlice(app.alloc, placeholder);
+                            try stage.tokens.append(app.alloc, .{
+                                .span = .{
+                                    .raw_start = relative_start,
+                                    .raw_end = relative_start + placeholder.len,
+                                },
+                                .id = id,
+                            });
+                            try stage.replacement.appendSlice(app.alloc, token.suffix);
+                            try stage.images.append(app.alloc, attached);
+                            owns_attached = false;
+                            prev = i;
+                        }
                     }
                 }
-            }
-            try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
-            if (app.input_runtime.edit_state.input.items.len == 0 and
-                agent.pending_images.items.len == 0 and
-                stripPastedImageSlashPrefix(&stage))
-            {
-                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_slash_command", .{});
+                try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
+                if (app.input_runtime.edit_state.input.items.len == 0 and
+                    agent.pending_images.items.len == 0 and
+                    stripPastedImageSlashPrefix(&stage))
+                {
+                    debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_slash_command", .{});
+                }
             }
 
             const image_count = stage.images.items.len;
