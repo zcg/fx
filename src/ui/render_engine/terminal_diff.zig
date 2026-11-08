@@ -23,6 +23,9 @@ const OverlaySnapshot = struct {
 
 /// The placements the terminal is currently showing.
 var last_image_overlay: []const OverlaySnapshot = &.{};
+/// A fingerprint of what the terminal is showing, so an idle redraw that only
+/// moves a spinner does not send the same pixels again and blink the picture.
+var last_image_overlay_fingerprint: u64 = 0;
 
 /// Whether `id` is wanted again with the same cells, so its old placement and
 /// the new one are the same picture in the same place.
@@ -477,7 +480,8 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
 
     var wire_frame: std.Io.Writer.Allocating = .init(alloc);
     defer wire_frame.deinit();
-    const prefix_len = try composeWireFrame(
+    const overlay_up = input.image_overlay != null and !input.image_overlay.?.isEmpty();
+    const layout = try composeWireFrame(
         &wire_frame,
         input,
         &previous_for_diff,
@@ -485,7 +489,9 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         repaint_window,
         full_repaint,
         movement,
+        overlay_up or last_image_overlay.len != 0,
     );
+    const prefix_len = layout.prefix_len;
     // The image bytes are written separately, after this text frame is
     // committed: an APC payload has no column and cannot take part in the
     // shadow terminal's cell-by-cell cross-check.
@@ -560,12 +566,19 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         );
     }
     // The shadow terminal replays the frame to cross-check it against the cell
-    // grid, and an inline image has no cells to check: an APC payload paints
-    // pixels the grid does not model. Only the text prefix is replayed, which is
-    // exactly the part the grid describes.
-    fed_shadow.feed(wire_frame_bytes) catch |err| {
+    // grid. An inline image has no cells: it paints pixels the grid does not
+    // model, so those bytes are skipped. The text before them and the modes
+    // after them are still replayed, because the closing modes end the
+    // synchronized update and restore the cursor, and a shadow left mid-block
+    // would disagree with the terminal on every later frame.
+    fed_shadow.feed(wire_frame_bytes[0..layout.text_end]) catch |err| {
         return shadowFeedFailedWithRepair(input, changed_cells, full_repaint, accepted_write.accepted_bytes, scroll_commit, accepted_write.scroll_attribution, accepted_write.document_append_committed, err);
     };
+    if (layout.tail_start > layout.text_end) {
+        fed_shadow.feed(wire_frame_bytes[layout.tail_start..]) catch |err| {
+            return shadowFeedFailedWithRepair(input, changed_cells, full_repaint, accepted_write.accepted_bytes, scroll_commit, accepted_write.scroll_attribution, accepted_write.document_append_committed, err);
+        };
+    }
     if (consumeShadowTestFault(.normal_clone_invalid)) fed_shadow.defer_sync_updates = true;
 
     if (!authoritativeShadowHasSteadyState(
@@ -602,44 +615,12 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     input.previous.* = fed_shadow;
     fed_shadow_initialized = false;
 
-    // The text frame is committed. Now draw the images over it, as a separate
-    // write: the shadow terminal has already checked the cells, and an APC
-    // payload has no cells to check. This is exactly the order a terminal
-    // needs -- text first, then pixels anchored to absolute cells.
-    //
-    // The pixels are resent on every frame the overlay is up, not only when
-    // the overlay changes: this terminal repaints text over the picture layer,
-    // so a frame that only redraws a line of text still covers the preview,
-    // and a change-gated cache left the user staring at a badge. A placement
-    // that is gone, or that moved, has its id deleted before the new copy is
-    // drawn; a placement that is still there with the same cells is left
-    // alone, because a same-id delete-then-redraw pair is exactly what this
-    // terminal's graphics layer drops.
-    if ((input.image_overlay != null and !input.image_overlay.?.isEmpty()) or
-        last_image_overlay.len != 0)
-    {
-        var image_bytes: std.Io.Writer.Allocating = .init(alloc);
-        defer image_bytes.deinit();
-        for (last_image_overlay) |previous| {
-            if (overlayWants(previous.id, input.image_overlay, previous)) continue;
-            image_overlay_module.writeDelete(&image_bytes.writer, previous.id) catch {};
-        }
-        if (input.image_overlay) |overlay| {
-            if (!overlay.isEmpty()) {
-                image_overlay_module.write(&image_bytes.writer, overlay.*) catch {};
-            }
-        }
-        if (image_bytes.written().len != 0) {
-            // Unconditional diagnostic: a preview that never reaches the
-            // terminal is otherwise invisible in every trace scope.
-            preview_diag.log("overlay bytes={d} placements={d}", .{
-                image_bytes.written().len,
-                if (input.image_overlay) |overlay| overlay.placements.len else 0,
-            });
-            _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
-        }
-        if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
-        if (input.image_overlay) |overlay| {
+    // The picture bytes rode inside the frame, so nothing is written here. Only
+    // the bookkeeping remains: what the terminal is now showing, so the next
+    // frame knows which ids to delete.
+    if (input.image_overlay) |overlay| {
+        if (!overlay.isEmpty()) {
+            if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
             const snapshots = try alloc.alloc(OverlaySnapshot, overlay.placements.len);
             for (overlay.placements, 0..) |placement, index| {
                 snapshots[index] = .{
@@ -651,10 +632,13 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
                 };
             }
             last_image_overlay = snapshots;
-        } else {
-            last_image_overlay = &[_]OverlaySnapshot{};
+            last_image_overlay_fingerprint = overlay.fingerprint();
         }
+    } else if (last_image_overlay.len != 0) {
+        alloc.free(last_image_overlay);
+        last_image_overlay = &[_]OverlaySnapshot{};
     }
+    if (input.image_overlay == null or input.image_overlay.?.isEmpty()) last_image_overlay_fingerprint = 0;
 
     debug_trace.logf(
         "frame_commit",
@@ -706,7 +690,9 @@ fn composeWireFrame(
     repaint_window: paint_plan.FrameRepaintWindow,
     full_repaint: bool,
     movement: *const PreparedTerminalMovement,
-) !usize {
+    /// Whether a picture is on screen, which hides the text cursor.
+    images_on_screen: bool,
+) !WireFrameLayout {
     // RIS and startup modes precede synchronization; document bytes follow it.
     try wire_frame.writer.writeAll(movement.bytes[0..movement.sync_prefix_offset]);
     const prefix_start = wire_frame.written().len;
@@ -740,10 +726,52 @@ fn composeWireFrame(
     }
 
     try writeCursorPosition(&wire_frame.writer, target.*);
+    // Everything after this point is an inline image. An APC payload paints
+    // pixels and leaves no cell behind, so the shadow terminal has nothing to
+    // check in it, and replaying it could only fail the cross-check.
+    const text_end = wire_frame.written().len;
+
+    // The pixels ride inside the same synchronized update as the text.
+    //
+    // This terminal covers the picture layer with every text commit, so a frame
+    // that redraws a line of text takes the picture away, and only a resend
+    // brings it back. Two commits in a row -- text, then picture -- are exactly
+    // one flash, which is what an activity spinner turning next to a preview
+    // showed. Sent inside the block, the terminal composites text and pixels
+    // once, so the picture stays put however often the frame is rebuilt.
+    //
+    // A placement that is gone, or that moved, has its id deleted first; the id
+    // this frame draws is never deleted, because this terminal drops a same-id
+    // delete-then-redraw pair.
+    if (input.image_overlay) |overlay| {
+        if (!overlay.isEmpty()) {
+            for (last_image_overlay) |previous| {
+                if (overlayWants(previous.id, input.image_overlay, previous)) continue;
+                image_overlay_module.writeDelete(&wire_frame.writer, previous.id) catch {};
+            }
+            image_overlay_module.write(&wire_frame.writer, overlay.*) catch {};
+        }
+    }
+    const tail_start = wire_frame.written().len;
+
     if (input.synchronized_update) try wire_frame.writer.writeAll("\x1b[?2026l");
-    if (target.cursor_visible) try wire_frame.writer.writeAll("\x1b[?25h");
-    return prefix_len;
+    // A picture on screen hides the text cursor. The cursor is drawn over the
+    // picture layer, so a blinking cursor punches a hole in the preview, and
+    // nothing types into a picture: the pointer is the only input that matters
+    // while one is up.
+    if (target.cursor_visible and !images_on_screen) try wire_frame.writer.writeAll("\x1b[?25h");
+    return .{ .prefix_len = prefix_len, .text_end = text_end, .tail_start = tail_start };
 }
+
+/// Where a composed frame's parts sit.
+const WireFrameLayout = struct {
+    /// Length of the mode prefix, used to locate the document append.
+    prefix_len: usize,
+    /// Offset where the cell grid ends and inline images begin.
+    text_end: usize,
+    /// Offset where the inline images end and the closing modes begin.
+    tail_start: usize,
+};
 
 fn recoverPartialFrame(
     input: FrameCommitInput,
