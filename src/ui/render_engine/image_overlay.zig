@@ -42,6 +42,11 @@ pub const Placement = struct {
     /// into the cells and stays until text is written over them, so the
     /// protocol decides which of the two payloads a frame carries.
     sixel: []const u8 = &.{},
+    /// Ordinary truecolor text, for a terminal whose graphics parser is not
+    /// safe to use. Windows Terminal stalls on any DCS image, but half-block
+    /// characters with 24-bit SGR colors are just text: they cannot enter the
+    /// image buffer or its flush loop. The next text frame erases them.
+    text: []const u8 = &.{},
 };
 
 /// The images a frame draws once its text is on screen.
@@ -72,9 +77,15 @@ pub const Overlay = struct {
             hash.update(std.mem.asBytes(&placement.columns));
             hash.update(std.mem.asBytes(&placement.rows));
             hash.update(std.mem.asBytes(&placement.image_id));
-            const length: u64 = placement.png.len;
-            hash.update(std.mem.asBytes(&length));
+            const png_length: u64 = placement.png.len;
+            hash.update(std.mem.asBytes(&png_length));
             hash.update(placement.png[0..@min(placement.png.len, 32)]);
+            const sixel_length: u64 = placement.sixel.len;
+            hash.update(std.mem.asBytes(&sixel_length));
+            hash.update(placement.sixel[0..@min(placement.sixel.len, 32)]);
+            const text_length: u64 = placement.text.len;
+            hash.update(std.mem.asBytes(&text_length));
+            hash.update(placement.text[0..@min(placement.text.len, 32)]);
         }
         return hash.final();
     }
@@ -94,6 +105,12 @@ pub const Overlay = struct {
 pub fn write(w: *Writer, overlay: Overlay) !void {
     for (overlay.placements) |placement| {
         if (placement.columns == 0 or placement.rows == 0) continue;
+        if (placement.text.len != 0) {
+            try w.writeAll("\x1b7");
+            try w.writeAll(placement.text);
+            try w.writeAll("\x1b8");
+            continue;
+        }
         if (placement.sixel.len != 0) {
             try w.writeAll("\x1b7");
             try w.print("\x1b[{d};{d}H", .{ placement.row, placement.column });
@@ -164,6 +181,16 @@ pub fn writeDelete(w: *Writer, image_id: u32) !void {
 pub fn overlayUsesSixel(overlay: Overlay) bool {
     for (overlay.placements) |placement| {
         if (placement.sixel.len != 0) return true;
+    }
+    return false;
+}
+
+/// Whether the overlay is ordinary colored text. It has no id to delete and
+/// is erased by writing over its cells, so the caller treats it like Sixel for
+/// clearing purposes without sending any graphics verb.
+pub fn overlayUsesText(overlay: Overlay) bool {
+    for (overlay.placements) |placement| {
+        if (placement.text.len != 0) return true;
     }
     return false;
 }

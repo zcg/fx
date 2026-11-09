@@ -27,6 +27,9 @@ var last_image_overlay_fingerprint: u64 = 0;
 /// Whether the picture on screen was painted with Sixel, which has no delete
 /// verb: its pixels live in the cells and the next text frame erases them.
 var last_image_overlay_sixel: bool = false;
+/// Whether the picture on screen is ordinary colored text, which is erased by
+/// the next text frame rather than by an image delete verb.
+var last_image_overlay_text: bool = false;
 
 /// Whether `id` is wanted again with the same cells, so its old placement and
 /// the new one are the same picture in the same place.
@@ -460,7 +463,10 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     // away. Closing a preview changes no cell, so the frame has to be forced
     // through the band painter or the picture stays on screen forever.
     const overlay_present = input.image_overlay != null and !input.image_overlay.?.isEmpty();
-    if (!overlay_present and last_image_overlay_sixel and last_image_overlay.len != 0) {
+    if (!overlay_present and
+        (last_image_overlay_sixel or last_image_overlay_text) and
+        last_image_overlay.len != 0)
+    {
         full_repaint = true;
     }
     if (terminal_scroll_bytes.len == 0 and
@@ -635,6 +641,8 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
         last_image_overlay = &[_]OverlaySnapshot{};
         last_image_overlay_fingerprint = 0;
+        last_image_overlay_sixel = false;
+        last_image_overlay_text = false;
     }
     const wanted_fingerprint: u64 = if (input.image_overlay) |overlay|
         if (overlay.isEmpty()) 0 else overlay.fingerprint()
@@ -649,13 +657,21 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
         // text frame that follows is what erases it. Sending a Kitty delete
         // verb to a Sixel terminal would write bytes it cannot parse, so the
         // deletes stay with the protocol that understands them.
+        const uses_text = if (input.image_overlay) |overlay|
+            image_overlay_module.overlayUsesText(overlay.*)
+        else if (last_image_overlay_text)
+            true
+        else
+            false;
         const uses_sixel = if (input.image_overlay) |overlay|
             image_overlay_module.overlayUsesSixel(overlay.*)
         else if (last_image_overlay_sixel)
             true
         else
             false;
-        if (!uses_sixel) {
+        // Neither Sixel nor truecolor text has a Kitty id to delete. The
+        // forced text repaint erases them.
+        if (!uses_sixel and !uses_text) {
             for (last_image_overlay) |previous| {
                 if (overlayWants(previous.id, input.image_overlay, previous)) continue;
                 image_overlay_module.writeDelete(&image_bytes.writer, previous.id) catch {};
@@ -675,6 +691,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
             _ = input.sink.write_frame(input.sink.ctx, input.metrics, image_bytes.written());
         }
         last_image_overlay_sixel = uses_sixel;
+        last_image_overlay_text = uses_text;
         last_image_overlay_fingerprint = wanted_fingerprint;
         if (last_image_overlay.len != 0) alloc.free(last_image_overlay);
         if (input.image_overlay) |overlay| {

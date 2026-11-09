@@ -43,7 +43,7 @@ const ui_image_strip = @import("../../ui/footer/image_strip.zig");
 const terminal_image = @import("../shared/terminal_image.zig");
 const system_decode = @import("../images/system_decode.zig");
 const sixel_encode = @import("../images/sixel_encode.zig");
-const windows_terminal_sixel = @import("../images/windows_terminal_sixel.zig");
+const text_preview = @import("../images/text_preview.zig");
 const preview_diag = @import("../shared/preview_diag.zig");
 const Allocator = std.mem.Allocator;
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
@@ -2463,16 +2463,16 @@ fn buildImageOverlay(
         const sixel_terminal = terminal_image.current() == .sixel;
         var png: []const u8 = &.{};
         const sixel: []const u8 = &.{};
+        var text: []const u8 = &.{};
         if (sixel_terminal) {
-            // Windows Terminal's Sixel parser can stall its UI thread on any
-            // DCS image, not just a large one: `_maybeFlushImageBuffer` advances
-            // the available height by `_cellSize.height` in a loop, and the
-            // virtual 10x20 cell it reports for Sixel does not match the real
-            // font metrics. A 4 KB fixed-palette image killed the tab too.
-            // So no picture bytes go to this terminal at all: the badge stays,
-            // a click is harmless, and the tab survives.
-            preview_diag.log("sixel preview unavailable: Windows Terminal stalls on DCS images", .{});
-            continue;
+            // Windows Terminal stalls on any DCS image, but it draws 24-bit
+            // colored text natively. A half-block character is two sampled
+            // pixels in one cell, so the preview is ordinary ANSI text: no
+            // image buffer, no flush loop, no tab to lose.
+            text = previewTextFor(app.alloc, image.id, image.path, rect) orelse {
+                preview_diag.log("text preview encode failed path={s}", .{image.path});
+                continue;
+            };
         } else {
             png = previewPngFor(app.alloc, image.id, image.path) orelse {
                 preview_diag.log("decode failed path={s}", .{image.path});
@@ -2496,6 +2496,7 @@ fn buildImageOverlay(
             .image_id = @intCast(image.id),
             .png = png,
             .sixel = sixel,
+            .text = text,
         });
     }
     overlay.placements = placements.items;
@@ -2582,11 +2583,21 @@ fn previewSixelFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]const
 /// so a preview past this size is skipped rather than sent.
 const sixel_max_bytes: usize = 2 * 1024 * 1024;
 
-/// A much smaller, fixed-palette raster for Windows Terminal. The decoder is
-/// shared with the full Sixel path, so one decode per image serves either.
-fn previewWindowsTerminalSixelFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]const u8 {
-    if (preview_sixel_id != null and preview_sixel_id.? == image_id and preview_small_sixel_bytes != null) {
-        return preview_small_sixel_bytes;
+/// The truecolor text form of a preview, cached by id and rectangle.
+///
+/// The anchor is part of the cached bytes, so moving the badge invalidates it.
+/// Nothing here outlives the draft: switching images frees the previous form.
+fn previewTextFor(
+    alloc: Allocator,
+    image_id: usize,
+    path: []const u8,
+    rect: ui_image_strip.PreviewRect,
+) ?[]const u8 {
+    if (preview_text_id != null and preview_text_id.? == image_id and
+        preview_text_bytes != null and preview_text_row == rect.row and
+        preview_text_column == rect.column)
+    {
+        return preview_text_bytes;
     }
     const raster = system_decode.decodeToPreviewRaster(
         alloc,
@@ -2596,20 +2607,29 @@ fn previewWindowsTerminalSixelFor(alloc: Allocator, image_id: usize, path: []con
     ) catch return null;
     defer raster.deinit(alloc);
 
-    const encoded = windows_terminal_sixel.encode(
+    const encoded = text_preview.encode(
         alloc,
         raster.pixels,
         raster.width,
         raster.height,
-        windows_terminal_sixel.max_bytes,
+        rect.columns,
+        rect.rows,
+        rect.row,
+        rect.column,
+        text_preview.max_bytes,
     ) catch return null;
-    if (preview_small_sixel_bytes) |held| alloc.free(held);
-    preview_sixel_id = image_id;
-    preview_small_sixel_bytes = encoded;
+    if (preview_text_bytes) |held| alloc.free(held);
+    preview_text_id = image_id;
+    preview_text_row = rect.row;
+    preview_text_column = rect.column;
+    preview_text_bytes = encoded;
     return encoded;
 }
 
-var preview_small_sixel_bytes: ?[]const u8 = null;
+var preview_text_id: ?usize = null;
+var preview_text_row: u16 = 0;
+var preview_text_column: u16 = 0;
+var preview_text_bytes: ?[]const u8 = null;
 
 var preview_sixel_id: ?usize = null;
 var preview_sixel_bytes: ?[]const u8 = null;
