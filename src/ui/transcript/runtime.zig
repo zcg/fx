@@ -34,7 +34,12 @@ const transcript_store = @import("store.zig");
 /// structured entries between compactions. The byte cache itself is capped at
 /// one budget; the entries kept for the window are allowed several so a long
 /// session's scrollback stays readable, while the total still has a ceiling.
-const transcript_window_retention_windows = 4;
+///
+/// Raised from four: with a 256 KiB budget that was a one-megabyte window, which
+/// a working session reaches quickly, and every eviction is history the user can
+/// no longer scroll back to. Sixteen budgets keep a few megabytes instead, and
+/// `enforceTranscriptWindowRetention` says so when even that is exceeded.
+const transcript_window_retention_windows = 16;
 const full_transcript_screen = @import("../full_transcript_screen.zig");
 const transcript_viewport_runtime = @import("viewport_runtime.zig");
 const transcript_writer = @import("writer.zig");
@@ -7259,7 +7264,25 @@ pub const TranscriptRuntime = struct {
         // above the target for one cycle; the next sync tries again.
         debug_trace.logf("transcript_window", "retention evicting entries={d} budget={d}", .{ evict.items.len, budget });
         self.discardTranscriptArchive();
-        _ = try transcript_store.dropEntriesAtomic(self, alloc, evict.items);
+        const dropped = try transcript_store.dropEntriesAtomic(self, alloc, evict.items);
+        // Say so the next time the window is read. The entries are gone from
+        // this process, so scrolling up finds the start sooner than the user
+        // remembers it, and an unexplained gap reads as a rendering bug. One
+        // notice per eviction, not per entry: the count is what matters and a
+        // long session would otherwise bury the transcript in notices.
+        if (dropped) {
+            var line_buf: [200]u8 = undefined;
+            const body = std.mem.print(
+                &line_buf,
+                "scrolled history left this view: {d} older entries unloaded from memory. The session log on disk still holds all of them; reopen the session to scroll that far back.",
+                .{evict.items.len},
+            ) catch "older scrolled history was unloaded from memory; the session log on disk still holds it";
+            _ = self.appendSemanticNotice(alloc, .{
+                .topic = "transcript",
+                .tone = .neutral,
+                .body = body,
+            }) catch {};
+        }
     }
 
     /// Sets whether the session writes a session log, enabling the window
