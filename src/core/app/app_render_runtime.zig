@@ -2462,16 +2462,17 @@ fn buildImageOverlay(
         // preview is encoded from the raster directly and needs no PNG.
         const sixel_terminal = terminal_image.current() == .sixel;
         var png: []const u8 = &.{};
-        var sixel: []const u8 = &.{};
+        const sixel: []const u8 = &.{};
         if (sixel_terminal) {
-            // Windows Terminal's Sixel parser stalled on the full 27 KB
-            // photographic payload and took the tab with it. This terminal gets
-            // a small fixed-palette raster instead: the same click shows and
-            // dismisses it, but the wire form never enters the slow path.
-            sixel = previewWindowsTerminalSixelFor(app.alloc, image.id, image.path) orelse {
-                preview_diag.log("small sixel encode failed path={s}", .{image.path});
-                continue;
-            };
+            // Windows Terminal's Sixel parser can stall its UI thread on any
+            // DCS image, not just a large one: `_maybeFlushImageBuffer` advances
+            // the available height by `_cellSize.height` in a loop, and the
+            // virtual 10x20 cell it reports for Sixel does not match the real
+            // font metrics. A 4 KB fixed-palette image killed the tab too.
+            // So no picture bytes go to this terminal at all: the badge stays,
+            // a click is harmless, and the tab survives.
+            preview_diag.log("sixel preview unavailable: Windows Terminal stalls on DCS images", .{});
+            continue;
         } else {
             png = previewPngFor(app.alloc, image.id, image.path) orelse {
                 preview_diag.log("decode failed path={s}", .{image.path});
