@@ -86,6 +86,20 @@ const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const WS_EX_TOPMOST: u32 = 0x0000_0008;
+/// Makes the window invisible to hit-testing.
+///
+/// Without it the window receives every pointer message for the area it covers,
+/// and since it is a decoration with no input of its own it answers none of
+/// them. Windows then keeps retrying — the busy cursor and the near-freeze the
+/// user sees when the pointer crosses the picture — and moving the pointer away
+/// clears it because the messages stop. A preview is never a click target, so
+/// the pointer belongs to whatever is underneath.
+const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+/// The window must not take the pointer or the mouse capture either.
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+const WM_NCHITTEST: u32 = 0x0084;
+const MA_NOACTIVATE: isize = 3;
+const HTTRANSPARENT: isize = -1;
 const SW_HIDE: c_int = 0;
 const SW_SHOWNOACTIVATE: c_int = 4;
 const ULW_ALPHA: u32 = 0x0000_0002;
@@ -219,6 +233,13 @@ fn ensureApi() bool {
 }
 
 fn windowProc(hwnd: HWND, message: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+    switch (message) {
+        // The preview never activates and never takes the pointer: it is
+        // decoration over another window, and a click belongs to that window.
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE,
+        WM_NCHITTEST => return HTTRANSPARENT,
+        else => {},
+    }
     return def_window_proc.?(hwnd, message, wparam, lparam);
 }
 
@@ -417,7 +438,7 @@ pub const Window = struct {
         _ = register_class.?(&window_class);
 
         const handle = create_window.?(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
             class_name,
             window_name,
             WS_POPUP,
