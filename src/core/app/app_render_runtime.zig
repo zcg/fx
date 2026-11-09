@@ -43,6 +43,7 @@ const ui_image_strip = @import("../../ui/footer/image_strip.zig");
 const terminal_image = @import("../shared/terminal_image.zig");
 const system_decode = @import("../images/system_decode.zig");
 const sixel_encode = @import("../images/sixel_encode.zig");
+const windows_terminal_sixel = @import("../images/windows_terminal_sixel.zig");
 const preview_diag = @import("../shared/preview_diag.zig");
 const Allocator = std.mem.Allocator;
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
@@ -2463,16 +2464,12 @@ fn buildImageOverlay(
         var png: []const u8 = &.{};
         var sixel: []const u8 = &.{};
         if (sixel_terminal) {
-            // Windows Terminal acknowledges Sixel but its parser can stall on
-            // a large payload: one 27 KB preview froze the tab until the shell
-            // behind it was killed. A badge is better than a dead terminal, so
-            // this terminal keeps the attachment and draws no preview here.
-            if (terminal_image.current() == .sixel) {
-                preview_diag.log("sixel preview skipped: terminal stalls on large payloads", .{});
-                continue;
-            }
-            sixel = previewSixelFor(app.alloc, image.id, image.path) orelse {
-                preview_diag.log("sixel encode failed path={s}", .{image.path});
+            // Windows Terminal's Sixel parser stalled on the full 27 KB
+            // photographic payload and took the tab with it. This terminal gets
+            // a small fixed-palette raster instead: the same click shows and
+            // dismisses it, but the wire form never enters the slow path.
+            sixel = previewWindowsTerminalSixelFor(app.alloc, image.id, image.path) orelse {
+                preview_diag.log("small sixel encode failed path={s}", .{image.path});
                 continue;
             };
         } else {
@@ -2579,10 +2576,39 @@ fn previewSixelFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]const
     return encoded;
 }
 
-/// The ceiling on one Sixel preview. A busy photograph can encode to megabytes,
-/// and a terminal that stalls on a slow write is worse than a badge, so a
-/// preview past this size is skipped rather than sent.
+/// The ceiling on one full Sixel preview. A busy photograph can encode to
+/// megabytes, and a terminal that stalls on a slow write is worse than a badge,
+/// so a preview past this size is skipped rather than sent.
 const sixel_max_bytes: usize = 2 * 1024 * 1024;
+
+/// A much smaller, fixed-palette raster for Windows Terminal. The decoder is
+/// shared with the full Sixel path, so one decode per image serves either.
+fn previewWindowsTerminalSixelFor(alloc: Allocator, image_id: usize, path: []const u8) ?[]const u8 {
+    if (preview_sixel_id != null and preview_sixel_id.? == image_id and preview_small_sixel_bytes != null) {
+        return preview_small_sixel_bytes;
+    }
+    const raster = system_decode.decodeToPreviewRaster(
+        alloc,
+        path,
+        ui_image_strip.preview_columns,
+        ui_image_strip.preview_rows,
+    ) catch return null;
+    defer raster.deinit(alloc);
+
+    const encoded = windows_terminal_sixel.encode(
+        alloc,
+        raster.pixels,
+        raster.width,
+        raster.height,
+        windows_terminal_sixel.max_bytes,
+    ) catch return null;
+    if (preview_small_sixel_bytes) |held| alloc.free(held);
+    preview_sixel_id = image_id;
+    preview_small_sixel_bytes = encoded;
+    return encoded;
+}
+
+var preview_small_sixel_bytes: ?[]const u8 = null;
 
 var preview_sixel_id: ?usize = null;
 var preview_sixel_bytes: ?[]const u8 = null;
