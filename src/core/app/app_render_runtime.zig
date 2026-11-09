@@ -2443,7 +2443,7 @@ fn buildImageOverlay(
     // inline path uses: a pinned badge shows its picture, losing the pin takes
     // it away.
     if (terminal_image.current() == .sixel) {
-        showFloatingPreview(App, app, pinned);
+        showFloatingPreview(App, app, footer_frame, pinned);
         return;
     }
 
@@ -7332,7 +7332,12 @@ test "core.app_render_runtime coordinator physically scrolls preserved shell row
 /// the interaction matches the inline path: a pinned badge shows its picture,
 /// and losing the pin takes it away. Nothing here writes to the terminal, so it
 /// cannot disturb the character grid or its scrollback.
-fn showFloatingPreview(comptime App: type, app: *App, pinned: ?usize) void {
+fn showFloatingPreview(
+    comptime App: type,
+    app: *App,
+    footer_frame: *const ui_surface_frame.SurfaceFooterFrame,
+    pinned: ?usize,
+) void {
     if (comptime !(@hasField(App, "preview_window") and @hasField(App, "preview_window_id"))) return;
 
     if (pinned == null) {
@@ -7342,21 +7347,35 @@ fn showFloatingPreview(comptime App: type, app: *App, pinned: ?usize) void {
         }
         return;
     }
+
+    // The badge's own cell is the anchor, so the picture sits next to the thing
+    // the pointer landed on rather than floating somewhere unrelated.
+    const anchor = ui_image_strip.findBadgeAnchor(
+        footer_frame.composed.rows.items,
+        pinned.?,
+    ) orelse return;
+
     if (app.preview_window_id != null and app.preview_window_id.? == pinned.?) return;
 
     const path = previewPathFor(app, pinned.?) orelse return;
     const frame = previewWindowFrame(app.alloc, path) orelse return;
     defer app.alloc.free(frame.pixels);
 
-    const layout = app.shell.layout;
     const shown = app.preview_window.show(
         .{ .pixels = frame.pixels, .width = frame.width, .height = frame.height },
-        layout.rows -| 4,
-        3,
-        10,
-        20,
+        anchor.row,
+        anchor.column,
+        system_decode.cell_pixel_width,
+        system_decode.cell_pixel_height,
     );
-    preview_diag.log("floating preview shown={} id={d} {d}x{d}", .{ shown, pinned.?, frame.width, frame.height });
+    preview_diag.log("floating preview shown={} id={d} {d}x{d} anchor={d},{d}", .{
+        shown,
+        pinned.?,
+        frame.width,
+        frame.height,
+        anchor.row,
+        anchor.column,
+    });
     if (shown) app.preview_window_id = pinned.?;
 }
 
