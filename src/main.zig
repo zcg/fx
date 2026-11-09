@@ -3301,9 +3301,34 @@ const App = struct {
         }
     }
 
+    /// Compares the terminal's current size with the one on record and asks for
+    /// a resize frame when they differ.
+    ///
+    /// A target with a window-change signal gets this for free; one without has
+    /// only the loop, so this runs once per pass there. A failed query is not a
+    /// resize: it means the terminal could not answer, and leaving the layout
+    /// alone is better than collapsing it to nothing.
+    fn pollTerminalSize(self: *App) void {
+        const current = self.terminal.queryLayout(footer_rows) catch return;
+        if (current.rows == self.shell.layout.rows and current.cols == self.shell.layout.cols) return;
+        self.shell.render_requests.observeResizeSignal(
+            app_permission_runtime.monotonicMillis(),
+            resize_debounce_ms,
+        );
+    }
+
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
+
+        // Targets with no SIGWINCH report a resize only when asked, so every
+        // pass compares the terminal's size against the one on record. This is
+        // what makes a window resize redraw at all on Windows: without it the
+        // layout stayed at the size the session started with until some other
+        // event happened to force a frame.
+        if (comptime !host_target.is_wasm and !shell_runtime.supports_resize_signal) {
+            self.pollTerminalSize();
+        }
 
         if (comptime !host_target.is_wasm) {
             if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
