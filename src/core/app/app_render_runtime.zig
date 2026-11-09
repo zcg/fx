@@ -2436,6 +2436,17 @@ fn buildImageOverlay(
 
     const pinned: ?usize = if (comptime @hasField(App, "preview_pinned_id")) app.preview_pinned_id else null;
 
+    // A terminal that cannot draw an inline image gets a real window instead.
+    // Windows Terminal stalls its UI thread on any DCS image, so the picture is
+    // painted by a layered window above the terminal and this path returns
+    // before any cell or byte is touched. The interaction is the same one the
+    // inline path uses: a pinned badge shows its picture, losing the pin takes
+    // it away.
+    if (terminal_image.current() == .sixel) {
+        showFloatingPreview(App, app, pinned);
+        return;
+    }
+
     // A click picks the image, and the preview stays up until the next click
     // takes it away. The pointer's position is not consulted here: a preview
     // driven by motion means the pixels have to outrun the text repaint that
@@ -7313,4 +7324,71 @@ test "core.app_render_runtime coordinator physically scrolls preserved shell row
     try std.testing.expect(try coordinatorRowHasText(terminal, 1));
     try std.testing.expect(try coordinatorGridContains(terminal, "WRAPPED_TAIL"));
     try std.testing.expect(try coordinatorGridContains(terminal, "run /login"));
+}
+
+/// Shows or hides the native floating preview window.
+///
+/// The window is only used where the terminal cannot draw an inline image, and
+/// the interaction matches the inline path: a pinned badge shows its picture,
+/// and losing the pin takes it away. Nothing here writes to the terminal, so it
+/// cannot disturb the character grid or its scrollback.
+fn showFloatingPreview(comptime App: type, app: *App, pinned: ?usize) void {
+    if (comptime !(@hasField(App, "preview_window") and @hasField(App, "preview_window_id"))) return;
+
+    if (pinned == null) {
+        if (app.preview_window_id != null) {
+            app.preview_window.hide();
+            app.preview_window_id = null;
+        }
+        return;
+    }
+    if (app.preview_window_id != null and app.preview_window_id.? == pinned.?) return;
+
+    const path = previewPathFor(app, pinned.?) orelse return;
+    const frame = previewWindowFrame(app.alloc, path) orelse return;
+    defer app.alloc.free(frame.pixels);
+
+    const layout = app.shell.layout;
+    const shown = app.preview_window.show(
+        .{ .pixels = frame.pixels, .width = frame.width, .height = frame.height },
+        layout.rows -| 4,
+        3,
+        10,
+        20,
+    );
+    preview_diag.log("floating preview shown={} id={d} {d}x{d}", .{ shown, pinned.?, frame.width, frame.height });
+    if (shown) app.preview_window_id = pinned.?;
+}
+
+/// The path an attachment's pixels come from.
+fn previewPathFor(app: anytype, image_id: usize) ?[]const u8 {
+    for (app.main_agent.pending_images.items) |image| {
+        if (image.id == image_id) return image.snapshot_path orelse image.path;
+    }
+    return null;
+}
+
+/// A decoded preview as premultiplied BGRA, which is what a layered window
+/// blends with.
+fn previewWindowFrame(alloc: Allocator, path: []const u8) ?struct { pixels: []u8, width: u32, height: u32 } {
+    const raster = system_decode.decodeToPreviewRaster(
+        alloc,
+        path,
+        ui_image_strip.preview_columns,
+        ui_image_strip.preview_rows,
+    ) catch return null;
+    defer raster.deinit(alloc);
+
+    const count = @as(usize, raster.width) * raster.height;
+    const bgra = alloc.alloc(u8, count * 4) catch return null;
+    errdefer alloc.free(bgra);
+    for (0..count) |index| {
+        const base = index * 4;
+        const alpha: u32 = raster.pixels[base + 3];
+        bgra[base + 0] = @intCast(@as(u32, raster.pixels[base + 2]) * alpha / 255);
+        bgra[base + 1] = @intCast(@as(u32, raster.pixels[base + 1]) * alpha / 255);
+        bgra[base + 2] = @intCast(@as(u32, raster.pixels[base + 0]) * alpha / 255);
+        bgra[base + 3] = @intCast(alpha);
+    }
+    return .{ .pixels = bgra, .width = raster.width, .height = raster.height };
 }

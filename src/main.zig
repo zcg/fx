@@ -114,6 +114,7 @@ const agent_frame = @import("core/shared/agent_frame.zig");
 const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
+const preview_window_module = @import("core/images/preview_window.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
@@ -638,6 +639,14 @@ const App = struct {
     /// sequence scrolls that history for it. So the badge owns the pointer
     /// until the user scrolls, and the first scroll gives the pointer back.
     image_pointer_active: bool = false,
+    /// The native floating preview a terminal without graphics uses.
+    ///
+    /// Windows Terminal stalls its UI thread on any inline image, so the
+    /// picture cannot live in the character grid there. A layered window draws
+    /// it above the terminal instead.
+    preview_window: preview_window_module.Window = .{},
+    /// The attachment the floating window is currently showing.
+    preview_window_id: ?usize = null,
     /// The main conversation's own state.
     main_agent: agents.Agent = .{},
     /// The agent the main loop is working for. Null means main, so `App` can
