@@ -1010,6 +1010,10 @@ const api_tests = struct {
     }
 
     test "a read-only session folder fails with AccessDenied, not Io (D29)" {
+        // The test marks a file read-only by narrowing its mode, which is a
+        // POSIX permission bit. Zig 0.17's Windows `dirSetFilePermissions`
+        // is unimplemented, so there is no way to express that state here.
+        if (comptime !storage.modeIsEnforced) return error.SkipZigTest;
         var f: Fixture = undefined;
         try f.init();
         defer f.deinit();

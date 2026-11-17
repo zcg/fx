@@ -180,9 +180,22 @@ pub const Storage = struct {
         return s.openDir(parent, name);
     }
 
+    /// Opens `name` inside `parent`, refusing anything a link redirects out.
+    ///
+    /// POSIX passes `follow_symlinks = false`, and the kernel refuses a link on
+    /// its own. Windows cannot use that flag: a junction is how a package
+    /// manager's link farm, a user's own link, and a redirected profile folder
+    /// all present themselves, and a handle opened with `OPEN_REPARSE_POINT`
+    /// cannot even be statted (`STATUS_REPARSE_POINT_NOT_RESOLVED`). So the
+    /// component is opened with following allowed and the result is checked
+    /// instead: what it resolved to has to stay inside the directory the
+    /// component was found in.
     pub fn openDir(s: Storage, parent: Dir, name: []const u8) Error!Dir {
         try s.alive();
         assertComponent(name);
+        if (comptime builtin.target.os.tag == .windows) {
+            return .{ .handle = openDirRefusingOutside(s.io, parent, name) catch |err| return translate(err) };
+        }
         const handle = parent.handle.openDir(s.io, name, .{
             .iterate = true,
             .follow_symlinks = false,
@@ -237,9 +250,17 @@ pub const Storage = struct {
     }
 
     /// Opens an existing regular file. A symlink or a folder is Refused.
+    /// Opens `name` inside `dir` for reading, or for reading and writing.
+    ///
+    /// `follow_symlinks = false` is what refuses a link on POSIX. Windows has
+    /// no such flag for a file: the entry is asked about first, so a link is
+    /// refused before it is opened, and the open itself does not follow one.
     pub fn openFile(s: Storage, dir: Dir, name: []const u8, access: Access) Error!File {
         try s.alive();
         assertComponent(name);
+        if (comptime builtin.target.os.tag == .windows) {
+            if (isReparsePoint(s.io, dir, name) catch |err| return translate(err)) return error.Refused;
+        }
         const handle = dir.handle.openFile(s.io, name, .{
             .mode = switch (access) {
                 .read_only => .read_only,
@@ -370,14 +391,24 @@ pub const Storage = struct {
     }
 
     /// Hard link (fork blobs). Fails if the new name exists.
+    ///
+    /// Zig 0.17 reports `OperationUnsupported` for a directory hard link on
+    /// Windows, but the volume supports one: a fork's blob is the same bytes
+    /// under a second name, and copying them instead would double the space a
+    /// fork costs and lose the shared page cache. `CreateHardLinkW` is the call
+    /// std does not make, so it is made here.
     pub fn link(s: Storage, old_dir: Dir, old_name: []const u8, new_dir: Dir, new_name: []const u8) Error!void {
         try s.alive();
         try s.mutate();
         assertComponent(old_name);
         assertComponent(new_name);
-        Io.Dir.hardLink(old_dir.handle, old_name, new_dir.handle, new_name, s.io, .{
-            .follow_symlinks = false,
-        }) catch |err| return translate(err);
+        if (comptime builtin.target.os.tag == .windows) {
+            windowsCreateHardLink(s.io, old_dir, old_name, new_dir, new_name) catch |err| return translate(err);
+        } else {
+            Io.Dir.hardLink(old_dir.handle, old_name, new_dir.handle, new_name, s.io, .{
+                .follow_symlinks = false,
+            }) catch |err| return translate(err);
+        }
         if (hooks) if (s.fault) |f| try f.noteCreate(s, new_dir, new_name);
     }
 
@@ -453,6 +484,132 @@ fn assertComponent(name: []const u8) void {
     std.debug.assert(name.len > 0);
     std.debug.assert(std.mem.findScalar(u8, name, '/') == null);
     std.debug.assert(!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."));
+}
+
+/// Links `old_name` in `old_dir` to `new_name` in `new_dir` with
+/// `CreateHardLinkW`, which Zig 0.17's `Io.Dir.hardLink` does not reach on
+/// Windows.
+fn windowsCreateHardLink(
+    io: Io,
+    old_dir: Dir,
+    old_name: []const u8,
+    new_dir: Dir,
+    new_name: []const u8,
+) !void {
+    const alloc = std.heap.page_allocator;
+    const old_path = try absoluteChildPath(alloc, io, old_dir, old_name);
+    defer alloc.free(old_path);
+    const new_path = try absoluteChildPath(alloc, io, new_dir, new_name);
+    defer alloc.free(new_path);
+
+    const old_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path);
+    defer alloc.free(old_wide);
+    const new_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, new_path);
+    defer alloc.free(new_wide);
+
+    if (win_hard_link.CreateHardLinkW(new_wide, old_wide, null) == 0) {
+        // `ERROR_ALREADY_EXISTS`, `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND`,
+        // and `ERROR_ACCESS_DENIED`, by their Win32 values.
+        return switch (win_hard_link.GetLastError()) {
+            183 => error.PathAlreadyExists,
+            2, 3 => error.FileNotFound,
+            5 => error.AccessDenied,
+            else => error.Unexpected,
+        };
+    }
+}
+
+/// The resolved path of `name` inside `dir`, so a link is created between the
+/// real entries rather than between whatever a link would have resolved to.
+fn absoluteChildPath(
+    alloc: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    name: []const u8,
+) ![]u8 {
+    const parent_path = try resolvedPathOf(alloc, io, dir);
+    defer alloc.free(parent_path);
+    return std.Io.Dir.path.join(alloc, &.{ parent_path, name });
+}
+
+const win_hard_link = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn CreateHardLinkW(
+        new_file_name: [*:0]const u16,
+        existing_file_name: [*:0]const u16,
+        security_attributes: ?*anyopaque,
+    ) callconv(.winapi) i32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+};
+
+/// Opens `name` inside `parent` on Windows and refuses a link that leaves it.
+///
+/// The parent's resolved path is the anchor and the child's resolved path is
+/// what it is compared against: a link that redirects outside fails that
+/// comparison, and a junction that stays inside is opened normally, which is
+/// what a redirected profile folder and a package manager's link farm both
+/// need. Comparing resolved paths is what makes this work on a handle opened
+/// with `OPEN_REPARSE_POINT`, which `GetFinalPathNameByHandle` refuses.
+fn openDirRefusingOutside(io: Io, parent: Dir, name: []const u8) !Io.Dir {
+    // The name itself is refused when it is a link, whether or not the link
+    // stays inside: this module's contract is that nothing under the root is
+    // reached through one. That is a reparse point on Windows, and the
+    // attribute is on the entry rather than on what it resolves to, so the name
+    // is asked about before it is opened.
+    if (try isReparsePoint(io, parent, name)) return error.SymLinkLoop;
+
+    const opened = try parent.handle.openDir(io, name, .{ .iterate = true, .follow_symlinks = true });
+    errdefer opened.close(io);
+
+    // A link that arrived between the check and the open would still be caught
+    // here, because what it resolved to has to stay inside `parent`.
+    const alloc = std.heap.page_allocator;
+    const parent_path = try resolvedPathOf(alloc, io, parent);
+    defer alloc.free(parent_path);
+    const opened_path = try resolvedPathOf(alloc, io, .{ .handle = opened });
+    defer alloc.free(opened_path);
+
+    if (!pathIsInside(parent_path, opened_path)) return error.SymLinkLoop;
+    return opened;
+}
+
+/// Whether `name` inside `parent` is a reparse point, which is how Windows
+/// spells a symlink or a junction.
+///
+/// The file attribute is read from the directory entry, so the answer describes
+/// the name rather than whatever a link points at.
+fn isReparsePoint(io: Io, parent: Dir, name: []const u8) !bool {
+    const stat = try parent.handle.statFile(io, name, .{ .follow_symlinks = false });
+    return stat.kind == .sym_link;
+}
+
+/// The absolute, resolved path of an open directory.
+fn resolvedPathOf(alloc: std.mem.Allocator, io: Io, dir: Dir) ![]u8 {
+    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const length = try dir.handle.realPath(io, &buffer);
+    return alloc.dupe(u8, buffer[0..length]);
+}
+
+/// Whether `child` lies beneath `parent`, comparing whole path components.
+///
+/// Windows compares paths without regard to letter case, so a comparison that
+/// respected it would reject `C:\Users\Ann` against `c:\users\ann`, the
+/// same directory written two ways. A separator counts as a boundary, because a
+/// path can arrive with either one.
+fn pathIsInside(parent: []const u8, child: []const u8) bool {
+    if (child.len < parent.len) return false;
+    for (parent, child[0..parent.len]) |a, b| {
+        if (isPathSeparator(a) and isPathSeparator(b)) continue;
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    if (child.len == parent.len) return true;
+    // A parent that already ends at a separator ("C:\") has no boundary byte of
+    // its own to check; everything after it is beneath it.
+    if (parent.len == 0 or isPathSeparator(parent[parent.len - 1])) return true;
+    return isPathSeparator(child[parent.len]);
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == std.Io.Dir.path.sep or byte == '/' or byte == '\\';
 }
 
 fn translate(err: anyerror) Error {
