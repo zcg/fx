@@ -3171,6 +3171,7 @@ const TestRuntime = struct {
     subagent_caller_id: ?[]const u8 = null,
     model: []const u8 = "",
     reviewer_model: []const u8 = "",
+    reviewer_effort: types.ReasoningEffort = .auto,
     session_allocator: Allocator = std.testing.allocator,
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},

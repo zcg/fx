@@ -1431,6 +1431,9 @@ fn startWithTaskLimit(limit: usize) !void {
 }
 
 test "a start whose tasks can't all run closes each of the server's pipes once" {
+    // The leak check counts open descriptors with `fcntl(F.GETFD)`, which is
+    // how a POSIX process lists them; Windows has no such probe.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     helper.start(testing.io);
     // One, two, then three tasks run: the stdout reader, then the stderr
     // reader, then the exit watcher can't start.

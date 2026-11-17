@@ -572,14 +572,14 @@ const ResetPreconnectProbe = struct {
             var reset_stream = address.connect(io, .{ .mode = .stream }) catch
                 return self.finish(true);
             defer reset_stream.close(io);
-            const reset_on_close: std.posix.linger = .{
-                .onoff = 1,
-                .linger = 0,
-            };
-            std.posix.setsockopt(
+            // Closing with a zero linger sends a reset instead of a clean
+            // close, which is what this probe is for. `io_mod` builds the value
+            // in each platform's own layout and names its own option numbers.
+            const reset_on_close = io_mod.lingerReset();
+            io_mod.setsockopt(
                 reset_stream.socket.handle,
-                std.posix.SOL.SOCKET,
-                std.posix.SO.LINGER,
+                io_mod.solSocket(),
+                io_mod.soLinger(),
                 std.mem.asBytes(&reset_on_close),
             ) catch return self.finish(true);
             self.finish(false);

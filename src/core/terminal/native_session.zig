@@ -1553,6 +1553,7 @@ const Session = struct {
     /// The process tree recorded when the owner's exit hangs this terminal
     /// up, so processes outside the shell's process group can be killed
     /// after the shell itself exits. Used only by the exit path.
+    ///
     exit_tree: ?process_tree.Tracker = null,
     engine: terminal_engine.Grid,
     screen_available: bool = true,
@@ -1939,12 +1940,18 @@ const Session = struct {
         _ = self.signalProcess(.hangup);
         if (self.exit_tree) |*tree| {
             if (tree.root) |root| {
-                _ = tree.signalOutsideProcessGroupChecked(signalValue(.hangup), root.pid);
+                _ = tree.signalOutsideProcessGroupChecked(treeSignal(.hangup), root.pid);
             }
         }
         return true;
     }
 
+    /// Records the process tree the exit path must end, once the owner is gone.
+    ///
+    /// A shell can move a job out of its process group, and a group signal then
+    /// misses it, so the tree is recorded before the hangup goes out. Native
+    /// terminals run only where a process group exists, which is why this uses
+    /// the POSIX tracker without a Windows arm.
     fn recordProcessTreeForExit(self: *Session) ?process_tree.Tracker {
         const target = self.signalTarget() orelse return null;
         if (!self.matchesSignalTarget(target)) return null;
@@ -1976,7 +1983,7 @@ const Session = struct {
             self.markLost();
         }
         if (self.exit_tree) |*tree| {
-            _ = tree.signalAll(signalValue(.kill));
+            _ = tree.signalAll(treeSignal(.kill));
             tree.deinit();
             self.exit_tree = null;
         }
@@ -2127,7 +2134,36 @@ const Session = struct {
     }
 
     fn signalProcess(self: *Session, signal: contracts.Signal) bool {
+        if (comptime builtin.target.os.tag == .windows) {
+            return self.signalNativeWindows(signal);
+        }
         return self.signalNative(signalValue(signal));
+    }
+
+    /// Ends the verified terminal process on Windows.
+    ///
+    /// `signalNative` addresses a whole process group through a negative id,
+    /// which Windows does not have. The identity check it performs still
+    /// matters, so it runs against the same recorded pid and token, and then
+    /// the process and everything its job object holds are ended together.
+    fn signalNativeWindows(self: *Session, signal: contracts.Signal) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        const pid = self.child_pid;
+        const token = self.child_token;
+        const running = self.lifecycle == .starting or self.lifecycle == .running;
+        self.mutex.unlock(zio);
+        if (!running or pid == null or token == null) return false;
+        var pid_buffer: [32]u8 = undefined;
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid.?}) catch
+            return false;
+        if (self.durable.profile.process_provider.matchToken(
+            self.alloc,
+            pid_text,
+            token.?,
+        ) != .matched) return false;
+        io_mod.signalProcessNumber(io_mod.pidNumber(pid.?), treeSignal(signal)) catch return false;
+        return true;
     }
 
     /// Kills everything the terminal runs, including processes that job
@@ -2175,6 +2211,10 @@ const Session = struct {
         self: *Session,
         signal: contracts.Signal,
     ) !?bool {
+        // A native terminal runs only where a process group exists, and this
+        // body reads the process table and signals a group, so nothing here is
+        // defined on Windows.
+        if (comptime builtin.target.os.tag == .windows) return error.TerminalHostUnsupported;
         const target = self.signalTarget() orelse return null;
         if (!self.matchesSignalTarget(target)) return false;
         if (failSignalStageForTest("refresh")) {
@@ -2198,7 +2238,7 @@ const Session = struct {
         else
             self.signalVerifiedProcessGroup(target, signal);
         var descendants_delivery = descendants.signalOutsideProcessGroupChecked(
-            signalValue(signal),
+            treeSignal(signal),
             target.pid,
         );
         if (failSignalStageForTest("outside_group")) {
@@ -2223,6 +2263,12 @@ const Session = struct {
         if (!self.matchesSignalTarget(target)) {
             return if (processGroupMissing(target.pid)) .missing else .failed;
         }
+        // Windows has no process group to address with one signal, so the
+        // verified process itself is the only target here. The descendants
+        // outside its group are reached separately, by the tree tracker.
+        if (comptime builtin.target.os.tag == .windows) {
+            return self.signalVerifiedProcessGroupWindows(target, signal);
+        }
         while (true) switch (std.c.errno(std.c.kill(
             -target.pid,
             signalValue(signal),
@@ -2234,7 +2280,24 @@ const Session = struct {
         };
     }
 
+    /// Ends the verified process on Windows, where a terminal has no process
+    /// group and `kill(-pid)` has no counterpart. Its own job object reaches
+    /// whatever it started, so this one call is the whole delivery.
+    fn signalVerifiedProcessGroupWindows(
+        self: *Session,
+        target: SignalTarget,
+        signal: contracts.Signal,
+    ) ProcessGroupDelivery {
+        _ = self;
+        io_mod.signalProcessNumber(io_mod.pidNumber(target.pid), treeSignal(signal)) catch |err| return switch (err) {
+            error.ProcessNotFound => .missing,
+            error.AccessDenied, error.Unexpected => .failed,
+        };
+        return .delivered;
+    }
+
     fn signalNative(self: *Session, signal: std.c.SIG) bool {
+        if (comptime builtin.target.os.tag == .windows) unreachable;
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         const pid = self.child_pid;
@@ -3916,13 +3979,39 @@ fn launchFailureCode(err: anyerror) contracts.StructuredErrorCode {
     };
 }
 
+/// The POSIX signal a contract signal names. Windows has no such values, so
+/// callers there use `treeSignal` instead and never reach this.
 fn signalValue(signal: contracts.Signal) std.c.SIG {
+    if (comptime builtin.target.os.tag == .windows) unreachable;
     return switch (signal) {
         .hangup => std.c.SIG.HUP,
         .interrupt => std.c.SIG.INT,
         .quit => std.c.SIG.QUIT,
         .terminate => std.c.SIG.TERM,
         .kill => std.c.SIG.KILL,
+    };
+}
+
+/// The platform-neutral verb a contract signal names, for the process-tree
+/// tracker.
+///
+/// Only `kill` asks a process to end immediately; the rest ask it to leave on
+/// its own terms. POSIX keeps that difference, because a shell can act on HUP,
+/// INT, or QUIT and clean up before it exits. Windows cannot deliver any of
+/// them, so every one of them is `terminate` there: a terminal being closed has
+/// no gentler way to end its processes, and ending them is better than leaving
+/// them running with no handle left to reach them.
+fn treeSignal(signal: contracts.Signal) io_mod.Signal {
+    if (comptime builtin.target.os.tag == .windows) return switch (signal) {
+        .kill => .kill,
+        else => .terminate,
+    };
+    return switch (signal) {
+        .hangup => .hangup,
+        .interrupt => .interrupt,
+        .quit => .quit,
+        .terminate => .terminate,
+        .kill => .kill,
     };
 }
 

@@ -5439,6 +5439,14 @@ fn terminalResult(
             .result = result orelse lost_result,
             .error_code = "child_lost",
         },
+        // A paused child stopped because its step budget ran out, not because
+        // it failed. Its session is intact and another message continues it, so
+        // the result it produced is still the child's answer.
+        .paused => .{
+            .ok = false,
+            .result = result,
+            .error_code = "child_paused",
+        },
     };
 }
 

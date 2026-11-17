@@ -75,6 +75,6 @@ test "the log lives beside the temporary folder" {
     // Purely structural: the name is fixed and the folder comes from the
     // environment, so a missing folder means no log rather than a crash.
     var buf: [64]u8 = undefined;
-    const joined = std.mem.print(&buf, "{s}\\fx-image-overlay.log", .{"C:\\Temp"});
+    const joined = try std.mem.print(&buf, "{s}\\fx-image-overlay.log", .{"C:\\Temp"});
     try std.testing.expectEqualStrings("C:\\Temp\\fx-image-overlay.log", joined);
 }

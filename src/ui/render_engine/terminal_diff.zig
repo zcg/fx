@@ -1866,13 +1866,16 @@ test "an image overlay reaches the sink after the text frame commits" {
     var sink = TestSink{};
     defer sink.deinit(alloc);
 
+    // A one-pixel PNG is enough to carry through the frame; the test reads the
+    // escape sequence around it, not the picture.
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     const placements = [_]image_overlay_module.Placement{.{
         .row = 2,
         .column = 3,
         .columns = 12,
         .rows = 4,
         .image_id = 7,
-        .source = .{ .file = "C:\\shots\\a.jpg" },
+        .png = &png,
     }};
     const overlay = image_overlay_module.Overlay{
         .placements = &placements,
@@ -1882,12 +1885,11 @@ test "an image overlay reaches the sink after the text frame commits" {
     const result = try flush_test_frame(&previous, &sink, .{ .image_overlay = &overlay });
     try std.testing.expect(result.is_committed());
 
-    // The image bytes are a separate write, after the text, and they carry a
-    // file placement rather than a PNG payload.
+    // The image bytes are a separate write, after the text, and they carry the
+    // PNG payload itself rather than a path for the terminal to open.
     try std.testing.expect(sink.write_calls >= 2);
     const written = sink.bytes.items;
-    try std.testing.expect(std.mem.find(u8, written, "\x1b_Ga=T,q=2,i=7,c=12,r=4,C=1,t=f;") != null);
-    try std.testing.expect(std.mem.find(u8, written, "Qzpcc2hvdHNcYS5qcGc=") != null);
+    try std.testing.expect(std.mem.find(u8, written, "\x1b_Ga=T,f=100,q=2,i=7,c=12,r=4,C=1;") != null);
     try std.testing.expect(std.mem.find(u8, written, "\x1b8") != null);
 }
 

@@ -3031,6 +3031,14 @@ const TestAuth = struct {
         return null;
     }
 
+    fn advanceAddProvider(_: *TestAuth, _: std.mem.Allocator) ?auth_runtime.AddProviderField {
+        return null;
+    }
+
+    /// Stores the connection names a reload found. The fixture has nowhere to
+    /// put them, so it accepts and drops them.
+    fn setConfiguredProviders(_: *TestAuth, _: std.mem.Allocator, _: []const []const u8) std.mem.Allocator.Error!void {}
+
     fn appendAddProviderByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
         return true;
     }
@@ -3349,6 +3357,8 @@ const TestApp = struct {
     } = .{},
     selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
+    /// The provider runtime a reload writes the new definitions into.
+    provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     input_runtime: @import("../input/runtime.zig").Runtime = .{},
     model_cache: TestModelCache = .{},
     model_cache_warmup_count: usize = 0,
@@ -3366,6 +3376,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.input_runtime.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
+        self.provider_selection.deinit();
     }
 
     pub fn startModelCacheWarmup(self: *TestApp) void {

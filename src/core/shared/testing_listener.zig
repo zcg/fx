@@ -1,6 +1,7 @@
 //! Accepting on a test server's listener so its thread can always be stopped.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("io.zig");
 const net_connect = @import("net_connect.zig");
 
@@ -112,12 +113,29 @@ const Waiting = union(enum) {
 /// non-blocking flag, so there both are set after the accept, as std does.
 /// The caller owns the returned stream.
 fn acceptWaiting(server: *std.Io.net.Server, io: std.Io) AcceptError!Waiting {
+    // Winsock has no `accept4`, no `sockaddr_storage` layout this code can fill
+    // the same way, and no `errno` words. Its own listener object answers the
+    // same question with `accept`, which already returns a non-inheritable
+    // handle, and reports a connection another thread took as a `SocketNotListening`
+    // or `ConnectionAborted` error that this maps onto the same `gone` result.
+    if (comptime builtin.target.os.tag == .windows) {
+        const stream = server.accept(io) catch |err| switch (err) {
+            error.ConnectionAborted => return .{ .gone = .CONNABORTED },
+            error.WouldBlock => return .{ .gone = .AGAIN },
+            else => return err,
+        };
+        return .{ .stream = stream };
+    }
     const listener = server.socket.handle;
     try net_connect.setNonblocking(listener);
     var storage: Threaded.PosixAddress = undefined;
     var length: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
     const fd: posix.fd_t = while (true) {
-        const rc = if (Threaded.socket_flags_unsupported)
+        // `accept4` closes the accepted socket on exec in one call, which
+        // Windows Winsock does not have. There the non-inheritable handle is
+        // already what a spawned process must not receive, so plain `accept`
+        // is the whole call.
+        const rc = if (Threaded.socket_flags_unsupported or builtin.target.os.tag == .windows)
             posix.system.accept(listener, &storage.any, &length)
         else
             posix.system.accept4(listener, &storage.any, &length, posix.SOCK.CLOEXEC);
@@ -389,6 +407,10 @@ test "a waiting accept ends when it is stopped though no client connects" {
 }
 
 test "a waiting accept returns the client that connects" {
+    // This fixture drives `accept4`, `fcntl`, and `POLL`, and checks that an
+    // accepted socket is closed on exec. Windows Winsock has none of those
+    // shapes, and the production accept path there is separate.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var waiter: Waiter = .{};
     try waiter.start();
     connectOnce(&waiter.server) catch |err| {
@@ -402,6 +424,10 @@ test "a waiting accept returns the client that connects" {
 }
 
 test "a waiting accept ends at the stop when another thread takes the connection it saw" {
+    // This fixture drives `accept4`, `fcntl`, and `POLL`, and checks that an
+    // accepted socket is closed on exec. Windows Winsock has none of those
+    // shapes, and the production accept path there is separate.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     // Both threads can see the one connection as ready, and only one accept
     // gets it. The other must go back to waiting for the stop: an accept that
     // blocks there never reads the flag again.
@@ -422,6 +448,9 @@ test "a waiting accept ends at the stop when another thread takes the connection
 }
 
 test "a waiting accept reports a connection that is gone, with the accept error" {
+    // The test takes the connection with a raw `accept` and reads `errno`,
+    // which is the POSIX shape of the race it reproduces.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var backend: std.Io.Threaded = .init_single_threaded;
     const zio = backend.io();
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -451,6 +480,10 @@ test "the report of a gone connection names the port, the poll result and the ac
 }
 
 test "a stream the waiting accept returns blocks and is closed on exec" {
+    // This fixture drives `accept4`, `fcntl`, and `POLL`, and checks that an
+    // accepted socket is closed on exec. Windows Winsock has none of those
+    // shapes, and the production accept path there is separate.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     // The listener does not block, and macOS gives an accepted socket the
     // listener's file status flags.
     var backend: std.Io.Threaded = .init_single_threaded;

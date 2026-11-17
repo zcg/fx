@@ -737,6 +737,16 @@ const ColumnTestApp = struct {
             return self.inventory_refresh_active;
         }
 
+        /// The custom connections this profile saved. The column tests do not
+        /// configure one, so the picker lists only the built-in providers.
+        fn configuredProviderNames(_: *const TestAuth) []const []const u8 {
+            return &.{};
+        }
+
+        /// Stores the connection names a reload found. The column fixture has
+        /// nowhere to put them, so it accepts and drops them.
+        fn setConfiguredProviders(_: *TestAuth, _: std.mem.Allocator, _: []const []const u8) std.mem.Allocator.Error!void {}
+
         fn credentialSource(self: *const TestAuth) ?credentials.Source {
             return self.source;
         }

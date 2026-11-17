@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const net_connect = @import("../../core/shared/net_connect.zig");
 const select_watch = @import("../../core/shared/select_watch.zig");
 const url_policy = @import("url_policy.zig");
 
@@ -1474,6 +1475,25 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
 /// exists where `socket` takes those flags, as std's own sockets are. macOS
 /// takes neither, so there `fcntl` sets both right after it opens.
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
+    // `SOCK_CLOEXEC` and `SOCK_NONBLOCK` are POSIX flags that ask the kernel to
+    // create the socket already non-inheritable and non-blocking. Winsock has no
+    // such flags and no `fcntl` to add them afterwards: the socket it creates is
+    // non-inheritable already, and the non-blocking mode is set with
+    // `ioctlsocket`, which `net_connect.setNonblocking` performs. So Windows
+    // opens the socket plainly and takes that same follow-up path.
+    if (comptime builtin.target.os.tag == .windows) {
+        const fd = while (true) {
+            const rc = net_connect.openStreamSocket(family) catch |err| switch (err) {
+                error.AddressFamilyUnsupported => return error.AddressFamilyUnsupported,
+                error.SystemResources => return error.SystemResources,
+                else => return error.SocketOpenFailed,
+            };
+            break rc;
+        };
+        errdefer closeFd(fd);
+        try setNonblocking(fd);
+        return fd;
+    }
     const flags: u32 = posix.SOCK.STREAM | if (std.Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const fd = while (true) {
         const rc = posix.system.socket(family, flags, 0);
@@ -1496,6 +1516,7 @@ fn openSocket(family: posix.sa_family_t) !posix.fd_t {
 }
 
 fn setCloexec(fd: posix.fd_t) !void {
+    if (comptime builtin.target.os.tag == .windows) return;
     while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
         .SUCCESS => return,
         .INTR => continue,
@@ -1504,6 +1525,9 @@ fn setCloexec(fd: posix.fd_t) !void {
 }
 
 fn setNonblocking(fd: posix.fd_t) !void {
+    if (comptime builtin.target.os.tag == .windows) {
+        return net_connect.setNonblocking(fd) catch error.SocketOptionFailed;
+    }
     const current = while (true) {
         const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
         switch (posix.errno(rc)) {
@@ -4068,6 +4092,10 @@ test "web_fetch deadline adapters retain invalid descriptor causes" {
 }
 
 test "web_fetch sockets are close-on-exec and non-blocking from the start" {
+    // The test reads `FD_CLOEXEC` and `O_NONBLOCK` back with `fcntl`. A
+    // Windows socket has no such flags to read: it is non-inheritable from
+    // creation and its non-blocking mode lives in `FIONBIO`.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     for ([_]posix.sa_family_t{ posix.AF.INET, posix.AF.INET6 }) |family| {
         const fd = openSocket(family) catch |err| switch (err) {
             error.AddressFamilyUnsupported => continue,

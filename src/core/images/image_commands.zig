@@ -1007,7 +1007,7 @@ test "attachClipboard is silent on unsupported platforms" {
     var app = FakeApp{ .alloc = alloc };
     defer app.deinit();
 
-    try Commands(FakeApp).attachClipboard(&app);
+    Commands(FakeApp).attachClipboard(&app);
 
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));

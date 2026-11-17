@@ -8951,14 +8951,11 @@ const LoopbackGatewayFixture = struct {
 
         switch (self.mode) {
             .reset_on_accept => {
-                const reset_on_close: std.posix.linger = .{
-                    .onoff = 1,
-                    .linger = 0,
-                };
-                try std.posix.setsockopt(
+                const reset_on_close = io_mod.lingerReset();
+                try io_mod.setsockopt(
                     stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.LINGER,
+                    io_mod.solSocket(),
+                    io_mod.soLinger(),
                     std.mem.asBytes(&reset_on_close),
                 );
                 self.markStage();
@@ -8969,10 +8966,10 @@ const LoopbackGatewayFixture = struct {
             },
             .request_send_stall => {
                 const receive_buffer: c_int = 1024;
-                std.posix.setsockopt(
+                io_mod.setsockopt(
                     stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.RCVBUF,
+                    io_mod.solSocket(),
+                    io_mod.soRcvbuf(),
                     std.mem.asBytes(&receive_buffer),
                 ) catch {};
                 self.markStage();
@@ -9181,11 +9178,11 @@ const LoopbackGatewayFixture = struct {
                 _ = self.requests_served.fetchAdd(1, .seq_cst);
                 try writeLoopbackGatewayBytes(zio, stream, "HTTP/1.1 200 OK\r\n");
                 sleepBlocking(300);
-                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
-                try std.posix.setsockopt(
+                const rst = io_mod.lingerReset();
+                try io_mod.setsockopt(
                     stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.LINGER,
+                    io_mod.solSocket(),
+                    io_mod.soLinger(),
                     std.mem.asBytes(&rst),
                 );
                 // Returning closes the connection, which now sends a reset.
@@ -9196,11 +9193,11 @@ const LoopbackGatewayFixture = struct {
                 var one: [1]u8 = undefined;
                 var reader = stream.reader(zio, &one);
                 _ = reader.interface.takeByte() catch {};
-                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
-                try std.posix.setsockopt(
+                const rst = io_mod.lingerReset();
+                try io_mod.setsockopt(
                     stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.LINGER,
+                    io_mod.solSocket(),
+                    io_mod.soLinger(),
                     std.mem.asBytes(&rst),
                 );
                 self.markStage();
@@ -9220,11 +9217,11 @@ const LoopbackGatewayFixture = struct {
                     if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
                 }
                 sleepBlocking(200);
-                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
-                try std.posix.setsockopt(
+                const rst = io_mod.lingerReset();
+                try io_mod.setsockopt(
                     stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.LINGER,
+                    io_mod.solSocket(),
+                    io_mod.soLinger(),
                     std.mem.asBytes(&rst),
                 );
                 self.markStage();

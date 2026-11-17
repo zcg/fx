@@ -9839,12 +9839,12 @@ const V1Home = struct {
         for (ids) |id| {
             var dir = try v1.t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
             defer dir.close(io);
-            try dir.setPermissions(io, .fromMode(0o755));
+            try dir.setPermissions(io, io_mod.permissionsForMode(0o755));
             var walker = try dir.walk(a);
             defer walker.deinit();
             while (try walker.next(io)) |entry| switch (entry.kind) {
-                .directory => try dir.setFilePermissions(io, entry.path, .fromMode(0o755), .{}),
-                .file => try dir.setFilePermissions(io, entry.path, .fromMode(0o644), .{}),
+                .directory => try dir.setFilePermissions(io, entry.path, io_mod.permissionsForMode(0o755), .{}),
+                .file => try dir.setFilePermissions(io, entry.path, io_mod.permissionsForMode(0o644), .{}),
                 else => {},
             };
         }
@@ -10381,6 +10381,10 @@ test "recover salvages a damaged v1 session into a fresh v2 root and leaves its 
 }
 
 test "recover on a v1 session an old fx left readable by others answers that none is needed, salvages a damaged one, and both convert (D61, D64)" {
+    // The scenario is an old release having widened a file's mode to 0644, and
+    // recovery narrowing it again. Windows has no mode bits to read back, so
+    // there is nothing here to assert.
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
     const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
@@ -10426,7 +10430,7 @@ test "recover on a v1 session whose lock file others can write says its storage 
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const id = (try v1.fixture("plain", 1))[0];
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "session.lock"), .fromMode(0o666), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "session.lock"), io_mod.permissionsForMode(0o666), .{});
     const err = if (recover(&t.store, alloc, id)) |recovered| {
         var value = recovered;
         value.deinit(alloc);
@@ -10443,7 +10447,7 @@ test "a v1 family whose subagent folder others can write: recover refuses it as 
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), io_mod.permissionsForMode(0o777), .{});
     const err = if (recover(&t.store, alloc, family[0])) |recovered| {
         var value = recovered;
         value.deinit(alloc);
@@ -11372,7 +11376,7 @@ test "a v1 session whose folder others can write is refused as unsafe by show, r
     const ids = try v1.fixture("side", 1);
     const id = ids[0];
     for ([_]std.posix.mode_t{ 0o757, 0o775 }) |mode| {
-        try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(mode), .{});
+        try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), io_mod.permissionsForMode(mode), .{});
         if (readSession(&t.store, alloc, id)) |shown| {
             var value = shown;
             value.deinit(alloc);
@@ -11389,7 +11393,7 @@ test "a v1 session whose folder others can write is refused as unsafe by show, r
         try testing.expectError(error.NotFound, t.store.manager.peek(alloc, id));
     }
     // Readable by others only, it shows and converts (D61).
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o755), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), io_mod.permissionsForMode(0o755), .{});
     var shown = try readSession(&t.store, alloc, id);
     shown.deinit(alloc);
     const s = try openConverted(&t, id);
@@ -11421,7 +11425,7 @@ test "a v1 family whose subagent folder others can write is refused with the sub
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[1], ""), .fromMode(0o757), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[1], ""), io_mod.permissionsForMode(0o757), .{});
     if (recover(&t.store, alloc, family[0])) |recovered| {
         var value = recovered;
         value.deinit(alloc);
@@ -11448,7 +11452,7 @@ test "a v1 family whose root's subagent folder others can write is refused, nami
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), .fromMode(0o777), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), io_mod.permissionsForMode(0o777), .{});
     if (readSession(&t.store, alloc, family[0])) |shown| {
         var value = shown;
         value.deinit(alloc);
@@ -11473,7 +11477,7 @@ test "a v1 family whose children.json others can write is refused before it chan
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent/children.json"), .fromMode(0o646), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent/children.json"), io_mod.permissionsForMode(0o646), .{});
     if (readSession(&t.store, alloc, family[0])) |shown| {
         var value = shown;
         value.deinit(alloc);
@@ -11502,8 +11506,8 @@ test "a writable v1 entry's name reaches the reason terminal-safe, and a name to
     var folder = try t.tmp.dir.openDir(io, try v1.sessionPath(id, ""), .{ .iterate = true });
     defer folder.close(io);
     const hostile = "x\x1b]0;PWNED\x07\x1b[31mred";
-    folder.writeFile(io, .{ .sub_path = hostile, .data = "", .flags = .{ .permissions = .fromMode(0o666) } }) catch return error.SkipZigTest;
-    try folder.setFilePermissions(io, hostile, .fromMode(0o666), .{});
+    folder.writeFile(io, .{ .sub_path = hostile, .data = "", .flags = .{ .permissions = io_mod.permissionsForMode(0o666) } }) catch return error.SkipZigTest;
+    try folder.setFilePermissions(io, hostile, io_mod.permissionsForMode(0o666), .{});
     try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
     const text = t.store.problem.text();
     try testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
@@ -11517,7 +11521,7 @@ test "a writable v1 entry's name reaches the reason terminal-safe, and a name to
     // reason would not fit whole.
     const long: [255]u8 = @splat(0x01);
     folder.writeFile(io, .{ .sub_path = &long, .data = "" }) catch return error.SkipZigTest;
-    try folder.setFilePermissions(io, &long, .fromMode(0o666), .{});
+    try folder.setFilePermissions(io, &long, io_mod.permissionsForMode(0o666), .{});
     try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
     try testing.expectEqualStrings(try std.mem.print(&buffer, "others can write something in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id}), t.store.problem.text());
 }
@@ -11530,7 +11534,7 @@ test "a v1 session whose events file others can write is refused like a writable
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const id = (try v1.fixture("side", 1))[0];
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "events.jsonl"), .fromMode(0o646), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "events.jsonl"), io_mod.permissionsForMode(0o646), .{});
     if (readSession(&t.store, alloc, id)) |shown| {
         var value = shown;
         value.deinit(alloc);
@@ -11559,7 +11563,7 @@ test "a converted session whose v1 folder comes back writable by others is kept,
     try testing.expect(!V1Home.exists(&t, id));
     // The v1 copy is back, and others can write it.
     _ = try v1.fixture("side", 1);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), .fromMode(0o757), .{});
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), io_mod.permissionsForMode(0o757), .{});
     for (0..2) |_| {
         var report = try convertAll(&t.store, alloc);
         defer report.deinit(alloc);

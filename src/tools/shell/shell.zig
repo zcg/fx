@@ -4024,6 +4024,7 @@ const SteeringCancelTest = struct {
             self.environment_arena.allocator(),
             .{ .allocator = alloc, .workspace_root = "/tmp" },
             .clean,
+            null,
         );
     }
 

@@ -620,6 +620,10 @@ pub fn buildBootstrap(
         try output.appendSlice(alloc, switch (kind) {
             .zsh => zsh_command_prelude,
             .bash => bash_unshadow_builtin,
+            // This function writes a POSIX shell script, so it is reached only
+            // for shells that read one. The Windows shells take their own
+            // command path and never arrive here.
+            .pwsh, .powershell, .cmd => "",
         });
         try output.appendSlice(
             alloc,

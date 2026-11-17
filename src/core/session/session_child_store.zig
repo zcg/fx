@@ -1064,7 +1064,6 @@ pub const SessionChildCapability = struct {
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
             else => error.SessionChildStoreFailed,
         };
         capability.impl.allowed_kind = .terminal_state;
@@ -1089,7 +1088,6 @@ pub const SessionChildCapability = struct {
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
             else => error.SessionChildStoreFailed,
         };
         capability.impl.allowed_kind = .terminal_proofs;
@@ -1351,7 +1349,10 @@ pub const SessionChildCapability = struct {
         const route_dir = (self.impl.route(kind, true) catch |err| return switch (err) {
             error.SessionChildReadOnly => error.SessionChildReadOnly,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+            error.PrivateStatePermissionsUnsupported => if (comptime io_mod.modeIsEnforced)
+                error.PrivateStatePermissionsUnsupported
+            else
+                error.SessionChildStoreFailed,
             else => error.SessionChildStoreFailed,
         }).?;
         return io_mod.acquireTimedAdvisoryLockWithOps(
@@ -1364,7 +1365,12 @@ pub const SessionChildCapability = struct {
             error.LockBusy => error.LockBusy,
             error.LockUnsupported => error.LockUnsupported,
             error.DurablePathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+            // The lock's own mode check needs mode bits, so only a platform that
+            // enforces them can answer with this.
+            error.PrivateStatePermissionsUnsupported => if (comptime io_mod.modeIsEnforced)
+                error.PrivateStatePermissionsUnsupported
+            else
+                error.SessionChildStoreFailed,
             else => error.SessionChildStoreFailed,
         };
     }

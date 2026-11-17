@@ -1467,6 +1467,58 @@ const windows_readonly_attribute: u32 = 0x1;
 /// and only the platform edge converts to or from `pid_t`.
 pub const ProcessId = u32;
 
+/// The id number a `pid_t` carries.
+///
+/// POSIX widens its number. A Windows `pid_t` is an opaque handle, and fx's
+/// Windows paths keep the id as a number from the moment a child reports it, so
+/// the handle stores that number in its pointer value: `pidFromNumber` built
+/// it that way, and this reads it back.
+pub fn pidNumber(pid: std.posix.pid_t) ProcessId {
+    if (comptime builtin.target.os.tag == .windows) return @truncate(@intFromPtr(pid));
+    return @intCast(pid);
+}
+
+/// A signal a tracker or a command may send to a process tree, named the same
+/// on every platform.
+///
+/// Windows has no signals: `std.c.SIG` there is a short `enum(u32)` of the C
+/// runtime's own conditions, with no KILL, no STOP, and no CONT, and a process
+/// is ended by `TerminateProcess` instead. fx's tree code needs three verbs on
+/// every platform, so it names them here and each platform carries out the one
+/// it has: POSIX sends the signal, and Windows terminates the process, which is
+/// the whole meaning KILL has there. STOP and CONT have no Windows equivalent
+/// (nothing can halt a process from outside it), so they do nothing, and the
+/// caller's stop-then-kill ordering still ends the tree.
+pub const Signal = enum {
+    /// End the process now. `TerminateProcess` on Windows.
+    kill,
+    /// Halt the process so it can be resumed. Nothing on Windows.
+    stop,
+    /// Resume a halted process. Nothing on Windows.
+    cont,
+    /// Ask the process to end. `TerminateProcess` on Windows, which has no
+    /// cooperative signal, so this is as final as `kill`.
+    terminate,
+    /// The terminal went away. `TerminateProcess` on Windows.
+    hangup,
+    /// The user asked the process to stop. `TerminateProcess` on Windows, which
+    /// cannot deliver it as a keystroke's control character.
+    interrupt,
+    /// The user asked for a core image. `TerminateProcess` on Windows.
+    quit,
+
+    /// The `std.posix.SIG` this names on a platform that has one.
+    pub fn posix(self: Signal) std.posix.SIG {
+        if (comptime builtin.target.os.tag == .windows) unreachable;
+        return switch (self) {
+            .kill => .KILL,
+            .stop => .STOP,
+            .cont => .CONT,
+            .terminate, .hangup, .interrupt, .quit => .TERM,
+        };
+    }
+};
+
 /// Reads a process id from text, for a caller that stored one as digits.
 pub fn parseProcessId(text: []const u8) error{InvalidProcessId}!ProcessId {
     return std.fmt.parseInt(ProcessId, text, 10) catch error.InvalidProcessId;
@@ -1499,6 +1551,28 @@ pub fn pidFromNumber(number: ProcessId) std.posix.pid_t {
         return @ptrFromInt(@as(usize, number));
     }
     return @intCast(number);
+}
+
+/// Sends `signal` to a process by its id number.
+///
+/// Windows has no signals, so `kill`, `terminate`, and `stop` all end the
+/// process with `TerminateProcess`, which is the only way to stop one there.
+/// `cont` has nothing to resume and succeeds without doing anything.
+pub fn signalProcessNumber(number: ProcessId, signal: Signal) error{ ProcessNotFound, AccessDenied, Unexpected }!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (signal == .cont) return;
+        if (number == 0) return error.ProcessNotFound;
+        const process = windows_process.OpenProcess(windows_process_terminate, 0, number) orelse
+            return error.ProcessNotFound;
+        defer _ = windows_process.CloseHandle(process);
+        if (windows_process.TerminateProcess(process, 1) == 0) return error.Unexpected;
+        return;
+    }
+    std.posix.kill(pidFromNumber(number), signal.posix()) catch |err| switch (err) {
+        error.ProcessNotFound => return error.ProcessNotFound,
+        error.PermissionDenied => return error.AccessDenied,
+        else => return error.Unexpected,
+    };
 }
 
 /// Terminates a process by its id number.
@@ -1720,6 +1794,71 @@ pub fn sleep(ns: u64) void {
 /// which refuses a console handle the same way it refuses to write one, so an
 /// interactive keystroke read never completes. A console is read with `ReadConsoleA`
 /// here instead. Both paths return zero at end of file.
+/// Sets one socket option from a byte view of its value.
+///
+/// POSIX takes the option, the level, and the bytes directly. Windows
+/// Winsock has the same three, but Zig 0.17 declares no `std.posix.setsockopt`
+/// arm for it: `std.posix.SOL` and `std.posix.SO` describe the POSIX numbers,
+/// and a Windows option is a different value at the same level. The call here
+/// goes to `ws2_32` with the constants the caller passes, so a caller that
+/// wants `SO_LINGER` there names `std.os.windows.ws2_32.SO.LINGER`.
+pub fn setsockopt(fd: std.posix.fd_t, level: i32, name: i32, value: []const u8) error{SocketOptionFailed}!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (winsock.setsockopt(fd, level, name, value.ptr, @intCast(value.len)) != 0) {
+            return error.SocketOptionFailed;
+        }
+        return;
+    }
+    std.posix.setsockopt(fd, level, name, value) catch return error.SocketOptionFailed;
+}
+
+const winsock = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "ws2_32" fn setsockopt(
+        socket: std.posix.fd_t,
+        level: i32,
+        name: i32,
+        value: *const anyopaque,
+        length: i32,
+    ) c_int;
+};
+
+/// The value `SO_LINGER` takes, in the layout each platform expects.
+///
+/// Both platforms use a two-field struct, but Windows declares a 16-bit
+/// `onoff` and a 16-bit timeout where POSIX uses two 32-bit fields, so the size
+/// passed to `setsockopt` differs and each has to be built as its own type.
+pub const Linger = if (builtin.target.os.tag == .windows) extern struct {
+    onoff: u16,
+    seconds: u16,
+} else extern struct {
+    onoff: c_int,
+    seconds: c_int,
+};
+
+/// The `SO_LINGER` value that makes a close send a reset instead of a FIN, so a
+/// peer that is still reading sees the connection end at once.
+pub fn lingerReset() Linger {
+    return .{ .onoff = 1, .seconds = 0 };
+}
+
+/// The option number `SO_LINGER` has on this platform.
+pub fn soLinger() i32 {
+    if (comptime builtin.target.os.tag == .windows) return std.os.windows.ws2_32.SO.LINGER;
+    return std.posix.SO.LINGER;
+}
+
+/// The option number `SO_RCVBUF` has on this platform.
+pub fn soRcvbuf() i32 {
+    if (comptime builtin.target.os.tag == .windows) return std.os.windows.ws2_32.SO.RCVBUF;
+    return std.posix.SO.RCVBUF;
+}
+
+/// The level `SOL_SOCKET` has on this platform.
+pub fn solSocket() i32 {
+    if (comptime builtin.target.os.tag == .windows) return std.os.windows.ws2_32.SOL.SOCKET;
+    return std.posix.SOL.SOCKET;
+}
+
 pub fn readFd(fd: std.posix.fd_t, out: []u8) !usize {
     if (comptime builtin.target.os.tag == .wasi) return error.Unexpected;
     if (comptime builtin.target.os.tag == .windows) {
@@ -2238,14 +2377,19 @@ const windows_console_info = if (builtin.target.os.tag != .windows) struct {} el
     ) callconv(.winapi) c_int;
 };
 
-/// Reads terminal attributes. Windows keeps its console mode in a `termios`
-/// carrier (see `windowsConsoleAttributes`), Linux issues the kernel ioctl
-/// directly because Zig 0.17 sizes `std.posix.termios` to the kernel struct
-/// while `std.posix.tcgetattr` calls into libc, which writes its larger struct
-/// and overruns the caller's stack, and every errno is an error, including the
-/// EBADF that `std.posix.tcgetattr` treats as unreachable.
+/// Reads terminal attributes.
+///
+/// POSIX only: a Windows console is described by one mode word per handle, not
+/// by a `termios`, and Zig 0.17 makes `std.posix.termios` `void` there. Windows
+/// callers use `term_mode.zig`, which captures the console mode words instead.
+///
+/// Linux issues the kernel ioctl directly because Zig 0.17 sizes
+/// `std.posix.termios` to the kernel struct while `std.posix.tcgetattr` calls
+/// into libc, which writes its larger struct and overruns the caller's stack,
+/// and every errno is an error, including the EBADF that `std.posix.tcgetattr`
+/// treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    if (builtin.target.os.tag == .windows) return windowsConsoleAttributes(fd);
+    if (comptime builtin.target.os.tag == .windows) unreachable;
     if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
     var term = std.mem.zeroes(std.posix.termios);
     while (true) switch (tcgetattrErrno(fd, &term)) {
@@ -2256,93 +2400,6 @@ pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios
     };
 }
 
-/// Windows has no termios. A console's behavior is one mode word per handle,
-/// not the four flag sets a POSIX `termios` carries, so fx keeps the distinction
-/// it actually needs, "is this console in raw mode", in a `termios` value it
-/// never reads field by field on this platform. The input mode word is stored in
-/// the first control-character slot, and `windowsApplyConsoleMode` takes it back
-/// out. Only `tcgetattr`, `tcsetattr`, and the raw-mode helper below touch it.
-fn windowsConsoleAttributes(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    const mode = try windowsGetConsoleMode(fd);
-    var term = std.mem.zeroes(std.posix.termios);
-    const bytes: [4]u8 = @bitCast(mode);
-    @memcpy(term.c_cc[0..4], &bytes);
-    return term;
-}
-
-/// The Windows console mode fx reads and writes. A VT-capable console keeps
-/// processed output and virtual terminal processing on; raw input turns off line
-/// input, echo, and Ctrl+C processing, which is the part of raw mode a console
-/// can express. Window input stays on so a resize still reaches fx.
-const windows_raw_input_mode: u32 = windows_enable_window_input | windows_enable_virtual_terminal_input | windows_enable_extended_flags;
-const windows_cooked_input_mode: u32 = windows_enable_processed_input |
-    windows_enable_line_input |
-    windows_enable_echo_input |
-    windows_enable_window_input |
-    windows_enable_virtual_terminal_input |
-    windows_enable_extended_flags;
-
-const windows_enable_processed_input: u32 = 0x0001;
-const windows_enable_line_input: u32 = 0x0002;
-const windows_enable_echo_input: u32 = 0x0004;
-const windows_enable_window_input: u32 = 0x0008;
-const windows_enable_virtual_terminal_input: u32 = 0x0200;
-const windows_enable_extended_flags: u32 = 0x0080;
-const windows_enable_processed_output: u32 = 0x0001;
-const windows_enable_virtual_terminal_processing: u32 = 0x0004;
-
-const WindowsConsole = if (builtin.target.os.tag != .windows) struct {} else struct {
-    extern "kernel32" fn GetConsoleMode(h_console: std.posix.fd_t, mode: *u32) callconv(.winapi) c_int;
-    extern "kernel32" fn SetConsoleMode(h_console: std.posix.fd_t, mode: u32) callconv(.winapi) c_int;
-    extern "kernel32" fn IsConsoleHandle(h: std.posix.fd_t) callconv(.winapi) c_int;
-};
-
-fn windowsGetConsoleMode(fd: std.posix.fd_t) std.posix.TermiosGetError!u32 {
-    var mode: u32 = 0;
-    if (WindowsConsole.GetConsoleMode(fd, &mode) == 0) return error.NotATerminal;
-    return mode;
-}
-
-fn windowsSetConsoleMode(fd: std.posix.fd_t, mode: u32) std.posix.TermiosSetError!void {
-    if (WindowsConsole.SetConsoleMode(fd, mode) == 0) return error.NotATerminal;
-}
-
-/// Whether the descriptor names a console rather than a redirected file.
-pub fn isConsole(fd: std.posix.fd_t) bool {
-    if (comptime builtin.target.os.tag != .windows) return isTty(fd);
-    var mode: u32 = 0;
-    return WindowsConsole.GetConsoleMode(fd, &mode) != 0;
-}
-
-/// Puts a Windows console into the mode fx draws with: raw input plus escape
-/// processing on the output handle. The caller passes the value `tcgetattr`
-/// returned so it can be restored.
-pub fn windowsEnableRawConsole(
-    input_fd: std.posix.fd_t,
-    output_fd: std.posix.fd_t,
-    saved: std.posix.termios,
-) std.posix.TermiosSetError!void {
-    _ = saved;
-    try windowsSetConsoleMode(input_fd, windows_raw_input_mode);
-    var output_mode: u32 = 0;
-    if (WindowsConsole.GetConsoleMode(output_fd, &output_mode) == 0) return error.NotATerminal;
-    try windowsSetConsoleMode(
-        output_fd,
-        output_mode | windows_enable_processed_output | windows_enable_virtual_terminal_processing,
-    );
-}
-
-/// Restores the mode `windowsConsoleAttributes` captured.
-pub fn windowsRestoreConsole(
-    input_fd: std.posix.fd_t,
-    output_fd: std.posix.fd_t,
-    saved: std.posix.termios,
-) void {
-    var mode: u32 = 0;
-    @memcpy(@as([*]u8, @ptrCast(&mode))[0..4], saved.c_cc[0..4]);
-    windowsSetConsoleMode(input_fd, mode) catch {};
-    _ = output_fd;
-}
 
 /// Linux issues the kernel ioctl: libc there writes a larger termios than Zig's.
 fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
@@ -2357,12 +2414,8 @@ pub fn tcsetattr(
     action: std.posix.TCSA,
     term: std.posix.termios,
 ) std.posix.TermiosSetError!void {
-    if (builtin.target.os.tag == .windows) {
-        // The value `tcgetattr` returned carries the console mode to restore.
-        var mode: u32 = 0;
-        @memcpy(@as([*]u8, @ptrCast(&mode))[0..4], term.c_cc[0..4]);
-        return windowsSetConsoleMode(fd, mode);
-    }
+    // POSIX only, for the same reason `tcgetattr` is: Windows has no termios.
+    if (comptime builtin.target.os.tag == .windows) unreachable;
     while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
@@ -2379,6 +2432,9 @@ fn tcsetattrErrno(fd: std.posix.fd_t, action: std.posix.TCSA, term: *const std.p
 }
 
 test "terminal attributes of a regular file report not a terminal" {
+    // `tcgetattr` and `tcsetattr` are POSIX: a Windows console carries one
+    // mode word per handle, and `term_mode.zig` reads that instead.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
@@ -2391,6 +2447,9 @@ test "terminal attributes of a regular file report not a terminal" {
 }
 
 test "terminal attributes of a closed descriptor are an error, not a panic" {
+    // `tcgetattr` and `tcsetattr` are POSIX: a Windows console carries one
+    // mode word per handle, and `term_mode.zig` reads that instead.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
@@ -2410,6 +2469,9 @@ test "terminal attributes of a closed descriptor are an error, not a panic" {
 }
 
 test "terminal attributes with an invalid action are an error, not a panic" {
+    // `tcgetattr` and `tcsetattr` are POSIX: a Windows console carries one
+    // mode word per handle, and `term_mode.zig` reads that instead.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     // macOS libc refuses the action with EINVAL before any ioctl. On Linux
     // the action selects the ioctl itself, so there is no safe invalid one.
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
@@ -3277,6 +3339,9 @@ test "a folder that need not be private opens whatever its mode, but never throu
 }
 
 test "a lock on an older release's file takes one others can read, keeps its mode, and refuses one others can write" {
+    // The test writes 0o644 and 0o666 on purpose: Windows has no mode bits,
+    // so a file there cannot be made readable-but-not-writable by others.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
@@ -3407,14 +3472,14 @@ test "a directory sync closes what a create and rename left behind" {
     var renamed = try tmp.dir.createFile(io, "second.tmp", .{});
     try renamed.writeStreamingAll(io, "{}");
     renamed.close(io);
-    try tmp.dir.rename(io, "second.tmp", "second.json");
+    try std.Io.Dir.rename(tmp.dir, "second.tmp", tmp.dir, "second.json", io);
 
     try syncVerifiedDir(tmp.dir);
     // A second flush has nothing left to write and still succeeds, rather
     // than reporting the volume as unable to flush a directory.
     try syncVerifiedDir(tmp.dir);
 
-    const bytes = try tmp.dir.readFileAlloc(io, "second.json", std.testing.allocator, 64);
+    const bytes = try tmp.dir.readFileAlloc(io, "second.json", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("{}", bytes);
 }

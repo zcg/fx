@@ -112,7 +112,10 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
 }
 
 /// How a connection's protocol reads a successful streamed reply.
-fn consumer(protocol: definitions.Protocol) transport.ConsumeFn {
+///
+/// The host and the built-in transport both dispatch through this, so a reply
+/// is decoded by its own protocol rather than by assuming one shape.
+pub fn consumer(protocol: definitions.Protocol) transport.ConsumeFn {
     return switch (protocol) {
         .@"openai-chat-completions" => consume,
         .@"openai-responses" => responses.consume,

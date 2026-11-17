@@ -1245,7 +1245,7 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     try std.testing.expect(first.stopped.load(.acquire));
     try std.testing.expect(first.term.? == .signal);
     try std.testing.expect(processes.items[1].not_started);
-    try std.testing.expectEqual(@as(std.posix.pid_t, 0), processes.items[1].pid);
+    try std.testing.expectEqual(@as(ChildPid, 0), processes.items[1].pid);
 }
 
 test "no more server checks run at once than the cap, and the next starts when one ends" {
@@ -1307,7 +1307,7 @@ test "server checks still queued at the deadline are never started and say so" {
     const trace = try readTraceForTest(alloc, tmp);
     for (processes.items[1..]) |p| {
         try std.testing.expect(p.not_started and !p.start_cutoff);
-        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+        try std.testing.expectEqual(@as(ChildPid, 0), p.pid);
         const line = try alloc.print("check {s} was never started, since doctor's limit came while it waited for a slot; dropping it", .{p.name});
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
     }
@@ -1346,7 +1346,7 @@ test "a queued check needs a share of the limit left to start, and one too late 
     try std.testing.expectEqual(processes.items.len, servers.next);
     for (processes.items) |p| {
         try std.testing.expect(p.not_started and p.start_cutoff and p.done.load(.acquire));
-        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+        try std.testing.expectEqual(@as(ChildPid, 0), p.pid);
     }
     // With nothing left to wait for, the wait ends at once.
     try std.testing.expect(wait(now + 60_000, null, processes.items, &waiters, &servers) == null);
@@ -1387,7 +1387,7 @@ test "a signal drops each queued check with a trace line, and gh is never starte
     const trace = try readTraceForTest(alloc, tmp);
     for (names, processes.items) |name, p| {
         try std.testing.expect(p.not_started and !p.start_cutoff);
-        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+        try std.testing.expectEqual(@as(ChildPid, 0), p.pid);
         const line = try alloc.print("check {s} was never started, since doctor got a signal first; dropping it", .{name});
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
     }

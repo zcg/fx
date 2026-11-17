@@ -163,18 +163,65 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
 /// flag for a handle, so there it is zero and the code below never uses it.
 const nonblock_flag: usize = if (supported) @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK") else 0;
 
-/// `ioctlsocket` from winsock, which Zig 0.17 does not declare.
+/// `ioctlsocket` and the socket calls, from winsock, which Zig 0.17 does not
+/// declare for every entry point this file needs.
 const winsock = struct {
     extern "ws2_32" fn ioctlsocket(socket: posix.fd_t, command: c_long, argument: *u32) c_int;
+    extern "ws2_32" fn socket(af: c_int, socket_type: c_int, protocol: c_int) posix.fd_t;
+    extern "ws2_32" fn WSAGetLastError() c_int;
+
+    /// Winsock reports a failed call with this handle rather than -1.
+    const invalid_socket: posix.fd_t = @ptrFromInt(std.math.maxInt(usize));
+
+    const wsa_eafnosupport: c_int = 10047;
+    const wsa_emfile: c_int = 10024;
+    const wsa_enobufs: c_int = 10055;
+
+    fn wsaGetLastError() c_int {
+        return WSAGetLastError();
+    }
 };
 
 /// `FIONBIO`: the command that turns non-blocking on or off for a socket.
-const FIONBIO: c_long = 0x8004667e;
+/// `_IOW('f', 126, u_long)` on Windows, whose value does not fit a signed
+/// 32-bit `c_long`.
+const FIONBIO: c_long = @bitCast(@as(c_ulong, 0x8004667e));
 
 /// Sets or clears non-blocking on a Windows socket.
 fn setNonblockingSocket(fd: posix.fd_t, enabled: bool) error{Unexpected}!void {
     var value: u32 = @intFromBool(enabled);
     if (winsock.ioctlsocket(fd, FIONBIO, &value) != 0) return error.Unexpected;
+}
+
+/// Opens one TCP socket for `family`, through the platform's own call.
+///
+/// This exists so a caller that builds its own transport does not have to spell
+/// out the Windows/POSIX split: POSIX returns a descriptor number, and Winsock
+/// returns a `SOCKET`, which is already the pointer-sized type `fd_t` holds on
+/// Windows. Neither side sets `SOCK_CLOEXEC` or `SOCK_NONBLOCK` here; the caller
+/// follows with `setNonblocking` where it needs them.
+pub fn openStreamSocket(family: posix.sa_family_t) error{ AddressFamilyUnsupported, SystemResources, Unexpected }!posix.fd_t {
+    if (comptime builtin.target.os.tag == .windows) {
+        const socket = winsock.socket(family, posix.SOCK.STREAM, 0);
+        if (socket == winsock.invalid_socket) {
+            return switch (winsock.wsaGetLastError()) {
+                winsock.wsa_eafnosupport => error.AddressFamilyUnsupported,
+                winsock.wsa_emfile, winsock.wsa_enobufs => error.SystemResources,
+                else => error.Unexpected,
+            };
+        }
+        return socket;
+    }
+    while (true) {
+        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .MFILE, .NFILE, .NOBUFS, .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
 }
 
 /// Closes `fd` when the process runs another program.

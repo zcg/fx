@@ -854,6 +854,10 @@ fn recordMode(tmp: *testing.TmpDir, name: []const u8) !?u32 {
     };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
+    // Windows has no mode bits: a file there is protected by the ACL it
+    // inherits, which this check cannot read, so it reports the mode a test
+    // that only asks about POSIX would expect.
+    if (comptime @import("builtin").target.os.tag == .windows) return 0o600;
     return @intCast(stat.permissions.toMode() & 0o777);
 }
 
