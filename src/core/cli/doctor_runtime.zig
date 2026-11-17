@@ -157,7 +157,10 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, .{});
+    // The saved-session checks are not collected here: the caller runs
+    // `appendStateChecks` itself, so plain doctor can start them while the
+    // network checks are running and `--deep` can run them after. Collecting
+    // them here as well would list every session check twice.
     snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
     try appendGhCheck(&checks, alloc);

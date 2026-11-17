@@ -134,6 +134,7 @@ const Writable = enum {
     max_agent_steps,
     max_tool_result_bytes,
     subagent_max_children,
+    subagent_max_depth,
     @"prompt_history.enabled",
     provider_strict,
     session_titles,
@@ -219,6 +220,15 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
             patch.subagent_max_children = children;
             return .{ .patch = patch, .value = .{ .integer = children } };
         },
+        .subagent_max_depth => {
+            const depth = std.fmt.parseUnsigned(u32, raw, 10) catch
+                return invalid(problem, "a whole number of levels, 0 to 2; 0 turns subagents off, and 1 keeps a subagent from starting its own");
+            if (depth < agent_steps.min_subagent_max_depth or depth > agent_steps.max_subagent_max_depth) {
+                return invalid(problem, "a whole number of levels, 0 to 2; 0 turns subagents off, and 1 keeps a subagent from starting its own");
+            }
+            patch.subagent_max_depth = depth;
+            return .{ .patch = patch, .value = .{ .integer = depth } };
+        },
         .max_tool_result_bytes => {
             const bytes = std.fmt.parseUnsigned(u32, raw, 10) catch 0;
             if (bytes < tool_result_limits.min_configured_tool_result_bytes) {
@@ -255,7 +265,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .@"status_line.session" => patch.statusline_item = .{ .item = .session, .enabled = enabled },
         .@"status_line.workspace" => patch.statusline_item = .{ .item = .workspace, .enabled = enabled },
         .ultrafast_mode => patch.ultrafast_mode = enabled,
-        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent, .subagent_max_children => unreachable,
+        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent, .subagent_max_children, .subagent_max_depth => unreachable,
     }
     return .{ .patch = patch, .value = .{ .bool = enabled } };
 }
@@ -470,6 +480,7 @@ pub const resolved_keys = [_][]const u8{
     "slash_menu_categories", "sound.attention_required", "sound.max",
     "sound.turn_end",        "startup_scrollback",       "status_line.context",
     "status_line.session",   "status_line.workspace",    "subagent_max_children",
+    "subagent_max_depth",
     "theme",                 "ultrafast_mode",           "update_channel",
 };
 
@@ -504,6 +515,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);
     if (eql(u8, key, "max_tool_result_bytes")) return integer(arena, state.max_tool_result_bytes);
     if (eql(u8, key, "subagent_max_children")) return integer(arena, state.subagent_max_children);
+    if (eql(u8, key, "subagent_max_depth")) return integer(arena, state.subagent_max_depth);
     if (eql(u8, key, "permission_mode")) return string(state.permission_mode.label());
     if (eql(u8, key, "prompt_history.enabled")) return boolean(state.prompt_history_enabled);
     if (eql(u8, key, "provider")) return string(try arena.dupe(u8, provider.label()));

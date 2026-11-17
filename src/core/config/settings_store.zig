@@ -126,6 +126,7 @@ pub const UserSettingsPatch = struct {
     max_agent_steps: ?u32 = null,
     max_tool_result_bytes: ?u32 = null,
     subagent_max_children: ?u32 = null,
+    subagent_max_depth: ?u32 = null,
     auto_compact_percent: ?u8 = null,
     provider_strict: ?bool = null,
     context: ?bool = null,
@@ -170,6 +171,7 @@ pub const UserSettingsPatch = struct {
             self.max_agent_steps == null and
             self.max_tool_result_bytes == null and
             self.subagent_max_children == null and
+            self.subagent_max_depth == null and
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
@@ -1054,6 +1056,11 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
             return error.InvalidSettingsFormat;
         }
     }
+    if (patch.subagent_max_depth) |depth| {
+        if (depth < agent_steps.min_subagent_max_depth or depth > agent_steps.max_subagent_max_depth) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (patch.auto_compact_percent) |percent| {
         if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
     }
@@ -1372,6 +1379,7 @@ fn applyUserPatchToRoot(
     if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
     if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
     if (patch.subagent_max_children) |value| application.changed = try putInteger(arena, &root.object, "subagent_max_children", value) or application.changed;
+    if (patch.subagent_max_depth) |value| application.changed = try putInteger(arena, &root.object, "subagent_max_depth", value) or application.changed;
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
@@ -1558,13 +1566,14 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [10]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [11]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
         if (patch.max_agent_steps != null) "max_agent_steps" else null,
         if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
         if (patch.subagent_max_children != null) "subagent_max_children" else null,
+        if (patch.subagent_max_depth != null) "subagent_max_depth" else null,
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
