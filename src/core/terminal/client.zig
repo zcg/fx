@@ -1455,6 +1455,10 @@ fn processGoneWithin(pid: std.posix.pid_t, timeout_ms: i64) bool {
 }
 
 test "in-process registry starts writes to and stops a real terminal" {
+    // A live native terminal needs a process group and a pty, which Windows
+    // does not have; the fixture formats the shell's descriptor number as an
+    // integer, and a Windows `fd_t` is a handle.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
@@ -1523,6 +1527,10 @@ test "in-process registry starts writes to and stops a real terminal" {
 }
 
 test "cancelling a start after its terminal launched closes that terminal" {
+    // A live native terminal needs a process group and a pty, and neither
+    // exists on Windows; the fixture it drives reads `poll` results that
+    // `std.posix` only names there.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -1560,6 +1568,10 @@ test "cancelling a start after its terminal launched closes that terminal" {
 }
 
 test "zsh terminal commands keep words that start with = literal" {
+    // A live native terminal needs a process group and a pty, which Windows
+    // does not have; the fixture formats the shell's descriptor number as an
+    // integer, and a Windows `fd_t` is a handle.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
         return error.SkipZigTest;
     var fixture: LiveTerminalFixture = undefined;
@@ -1596,6 +1608,10 @@ test "zsh terminal commands keep words that start with = literal" {
 }
 
 test "closing owned terminals for exit leaves no orphan and records them ended" {
+    // A live native terminal needs a process group and a pty, which Windows
+    // does not have; the fixture formats the shell's descriptor number as an
+    // integer, and a Windows `fd_t` is a handle.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
     defer fixture.deinit();

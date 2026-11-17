@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const glob_pattern = @import("glob_pattern.zig");
@@ -1047,7 +1048,7 @@ test "grep search skips a symlink to a FIFO instead of waiting for a writer" {
     defer alloc.free(real);
     const fifo = try std.Io.Dir.path.joinZ(alloc, &.{ workspace, "pipe" });
     defer alloc.free(fifo);
-    if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
+    if (posix_symbols.mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
     try createSymlinkOrSkip(&workspace_tmp, "../pipe", "docs/trap.txt");
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1059,7 +1060,6 @@ test "grep search skips a symlink to a FIFO instead of waiting for a writer" {
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "docs/real.txt"));
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "grep search scans a file root of any size" {
     const alloc = std.testing.allocator;

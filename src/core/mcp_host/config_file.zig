@@ -4,6 +4,7 @@
 //! numbers all stay as written.
 
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -380,7 +381,6 @@ test "a linked config file is never edited, whether a symlink or a hard link" {
     try testing.expectEqualStrings("{}", shared);
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "read returns a file's text, follows a symlink, and refuses a fifo without blocking" {
     if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
@@ -408,7 +408,7 @@ test "read returns a file's text, follows a symlink, and refuses a fifo without 
     // Opening a fifo for reading waits for a writer that never comes.
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, "fifo.json" }, 0);
-    if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
+    if (posix_symbols.mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
     try testing.expectError(error.DurablePathUnsafe, read(alloc, fifo));
 }
 

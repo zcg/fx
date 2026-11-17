@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -1063,7 +1064,6 @@ test "missing session ID error and unsupported schema error" {
     );
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "reads of an empty or missing home find nothing and create nothing" {
     const alloc = std.testing.allocator;

@@ -211,6 +211,8 @@ test "token pass memory: a malformed file reads as no answer and is replaced" {
 }
 
 test "token pass memory: a FIFO in place of the file reads as no answer" {
+    // The test puts a FIFO where a file belongs, and `mkfifo` is POSIX.
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -231,7 +233,13 @@ test "token pass memory: a FIFO in place of the file reads as no answer" {
     try std.testing.expect(load(alloc, home, id) == null);
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+/// POSIX only, so a Windows build answers with a failure that makes the test
+/// skip instead of asking the linker for a symbol that is not there.
+/// POSIX only. A Windows build gets a stub that reports failure, so the test
+/// that asks for a FIFO skips instead of asking the linker for the symbol.
+const posix_symbols = @import("../shared/posix_symbols.zig");
+
+const mkfifo = posix_symbols.mkfifo;
 
 test "token pass memory: a saved-answers file reads and rewrites on fuzzed bytes" {
     try std.testing.fuzz({}, fuzzSavedAnswers, .{

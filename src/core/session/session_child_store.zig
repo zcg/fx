@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const artifact_digest = @import("artifact_digest.zig");
@@ -1668,6 +1669,8 @@ test "private read-only file remains valid after atomic replacement unlinks it" 
 }
 
 test "managed child capability rejects invalid names and unsafe routes" {
+    // The route is made unsafe by hard-linking a file, which needs `linkat`.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

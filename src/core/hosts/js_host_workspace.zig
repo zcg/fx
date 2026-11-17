@@ -4,6 +4,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const host_link = @import("js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,26 +40,71 @@ comptime {
     std.debug.assert(@sizeOf(ReadRecord) == 8);
 }
 
-extern "fx" fn fx_workspace_available() i32;
-extern "fx" fn fx_workspace_info(out_ptr: [*]u8, out_cap: usize) i32;
-extern "fx" fn fx_workspace_exec(
+const fx_workspace_available = host_link.declare("fx_workspace_available", *const fn () callconv(.c) i32, fx_workspace_available_unlinked);
+
+fn fx_workspace_available_unlinked() callconv(.c) i32 {
+    unreachable;
+}
+
+const fx_workspace_info = host_link.declare("fx_workspace_info", *const fn (out_ptr: [*]u8, out_cap: usize) callconv(.c) i32, fx_workspace_info_unlinked);
+
+fn fx_workspace_info_unlinked(out_ptr: [*]u8, out_cap: usize) callconv(.c) i32 {
+    _ = out_ptr;
+    _ = out_cap;
+    unreachable;
+}
+
+const fx_workspace_exec = host_link.declare("fx_workspace_exec", *const fn (
     command_ptr: [*]const u8,
     command_len: usize,
     timeout_ms: u32,
     output_ptr: [*]u8,
     output_cap: usize,
     result_ptr: *ResultRecord,
-) i32;
+) callconv(.c) i32, fx_workspace_exec_unlinked);
+
+fn fx_workspace_exec_unlinked(
+    command_ptr: [*]const u8,
+    command_len: usize,
+    timeout_ms: u32,
+    output_ptr: [*]u8,
+    output_cap: usize,
+    result_ptr: *ResultRecord,
+) callconv(.c) i32 {
+    _ = command_ptr;
+    _ = command_len;
+    _ = timeout_ms;
+    _ = output_ptr;
+    _ = output_cap;
+    _ = result_ptr;
+    unreachable;
+}
+
 /// Copies up to `out_cap` bytes of one instruction file. Status codes: 0
 /// copied, -1 host failure, -2 no instruction file access, -3 aborted,
 /// -4 rejected path, -5 deadline, -6 missing, -7 invalid UTF-8.
-extern "fx" fn fx_workspace_read_file(
+const fx_workspace_read_file = host_link.declare("fx_workspace_read_file", *const fn (
     path_ptr: [*]const u8,
     path_len: usize,
     out_ptr: [*]u8,
     out_cap: usize,
     result_ptr: *ReadRecord,
-) i32;
+) callconv(.c) i32, fx_workspace_read_file_unlinked);
+
+fn fx_workspace_read_file_unlinked(
+    path_ptr: [*]const u8,
+    path_len: usize,
+    out_ptr: [*]u8,
+    out_cap: usize,
+    result_ptr: *ReadRecord,
+) callconv(.c) i32 {
+    _ = path_ptr;
+    _ = path_len;
+    _ = out_ptr;
+    _ = out_cap;
+    _ = result_ptr;
+    unreachable;
+}
 
 const ImportedHost = struct {
     fn workspaceAvailable() i32 {

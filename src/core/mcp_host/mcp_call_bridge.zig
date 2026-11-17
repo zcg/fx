@@ -286,8 +286,11 @@ fn readRequestLine(arena: Allocator, fd: posix.socket_t) ReadError![]const u8 {
         try io.checkCancel();
         const remaining = deadline - io_mod.milliTimestamp();
         if (remaining <= 0) return error.Silent;
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, @intCast(@min(remaining, poll_ms))) catch return error.ReadFailed;
+        // `readiness` owns this wait: it polls on POSIX and asks the socket
+        // directly on Windows, where Zig 0.17 has no `poll`.
+        var watches = [_]readiness.Watch{.{ .fd = fd }};
+        const ready = readiness.pollDescriptors(&watches, .{ .milliseconds = @intCast(@min(remaining, poll_ms)) }) catch
+            return error.ReadFailed;
         if (ready == 0) continue;
         const rc = std.c.recv(fd, &chunk, chunk.len, 0);
         if (rc < 0) {
@@ -337,12 +340,12 @@ const Watch = struct {
     fn run(self: *Watch) void {
         const io = io_mod.getIo();
         while (!self.done.load(.acquire)) {
-            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, poll_ms) catch return;
+            var watches = [_]readiness.Watch{.{ .fd = self.fd }};
+            const ready = readiness.pollDescriptors(&watches, .{ .milliseconds = poll_ms }) catch return;
             if (ready == 0) continue;
             var probe: [1]u8 = undefined;
             const rc = std.c.recv(self.fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT);
-            const hung_up = (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0;
+            const hung_up = watches[0].events.hung_up or watches[0].events.errored;
             if (rc == 0 or hung_up) {
                 bridge.mutex.lockUncancelable(io);
                 _ = step(.{ .client_gone = self.id });

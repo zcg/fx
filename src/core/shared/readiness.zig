@@ -72,64 +72,75 @@ pub const Watch = struct {
 /// means the timeout passed. `error.Unsupported` means a handle cannot be waited
 /// on at all, which the caller should treat as nothing to report.
 pub fn pollDescriptors(watches: []Watch, timeout: Timeout) error{Unsupported}!usize {
-    if (comptime is_windows) return windowsPoll(watches, timeout);
-    if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
+    // The POSIX body below names `std.posix.pollfd` and `std.posix.POLL`, and
+    // Zig 0.17 resolves both through `ws2_32` on Windows, where they do not
+    // exist. A `comptime` condition alone would still analyze the body, so the
+    // whole thing is a branch the compiler drops.
+    if (comptime is_windows) {
+        return windowsPoll(watches, timeout);
+    } else if (comptime builtin.target.os.tag == .wasi) {
+        return error.Unsupported;
+    } else {
 
-    // `poll` needs a contiguous array of its own structure. fx waits on at most
-    // a handful of descriptors at once, so a fixed buffer covers it without
-    // allocating; a larger set falls back to polling each descriptor in turn.
-    var poll_set: [max_inline_watches]std.posix.pollfd = undefined;
-    if (watches.len <= poll_set.len) {
-        for (watches, 0..) |*watch, i| {
-            poll_set[i] = .{
-                .fd = if (watch.isActive()) watch.fd else -1,
+        // `poll` needs a contiguous array of its own structure. fx waits on at most
+        // a handful of descriptors at once, so a fixed buffer covers it without
+        // allocating; a larger set falls back to polling each descriptor in turn.
+        var poll_set: [max_inline_watches]std.posix.pollfd = undefined;
+        if (watches.len <= poll_set.len) {
+            for (watches, 0..) |*watch, i| {
+                poll_set[i] = .{
+                    .fd = if (watch.isActive()) watch.fd else -1,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                };
+                watch.events = .{};
+            }
+            const ready = std.posix.poll(poll_set[0..watches.len], timeout.toPosixMilliseconds()) catch
+                return error.Unsupported;
+            if (ready == 0) return 0;
+            var reported: usize = 0;
+            for (watches, 0..) |*watch, i| {
+                const revents = poll_set[i].revents;
+                watch.events = .{
+                    .readable = (revents & std.posix.POLL.IN) != 0,
+                    .hung_up = (revents & std.posix.POLL.HUP) != 0,
+                    .errored = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
+                };
+                if (watch.events.any()) reported += 1;
+            }
+            return reported;
+        }
+
+        // More descriptors than the inline buffer holds. Ask about each one with a
+        // zero timeout rather than allocating, since the only caller with this many
+        // is a test.
+        var reported: usize = 0;
+        for (watches) |*watch| {
+            watch.events = .{};
+            if (!watch.isActive()) continue;
+            var one = [_]std.posix.pollfd{.{
+                .fd = watch.fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
-            };
-            watch.events = .{};
-        }
-        const ready = std.posix.poll(poll_set[0..watches.len], timeout.toPosixMilliseconds()) catch
-            return error.Unsupported;
-        if (ready == 0) return 0;
-        var reported: usize = 0;
-        for (watches, 0..) |*watch, i| {
-            const revents = poll_set[i].revents;
+            }};
+            const ready = std.posix.poll(&one, 0) catch return error.Unsupported;
+            if (ready == 0) continue;
             watch.events = .{
-                .readable = (revents & std.posix.POLL.IN) != 0,
-                .hung_up = (revents & std.posix.POLL.HUP) != 0,
-                .errored = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
+                .readable = (one[0].revents & std.posix.POLL.IN) != 0,
+                .hung_up = (one[0].revents & std.posix.POLL.HUP) != 0,
+                .errored = (one[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
             };
             if (watch.events.any()) reported += 1;
         }
         return reported;
     }
-
-    // More descriptors than the inline buffer holds. Ask about each one with a
-    // zero timeout rather than allocating, since the only caller with this many
-    // is a test.
-    var reported: usize = 0;
-    for (watches) |*watch| {
-        watch.events = .{};
-        if (!watch.isActive()) continue;
-        var one = [_]std.posix.pollfd{.{
-            .fd = watch.fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = std.posix.poll(&one, 0) catch return error.Unsupported;
-        if (ready == 0) continue;
-        watch.events = .{
-            .readable = (one[0].revents & std.posix.POLL.IN) != 0,
-            .hung_up = (one[0].revents & std.posix.POLL.HUP) != 0,
-            .errored = (one[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
-        };
-        if (watch.events.any()) reported += 1;
-    }
-    return reported;
 }
 
 /// The most descriptors `pollDescriptors` waits on without asking one at a time.
 /// fx never needs more than a few: a terminal, a pipe, and a socket.
+///
+/// The value is named here for both platforms, but only the POSIX branch builds
+/// the `pollfd` array it sizes.
 const max_inline_watches = 8;
 
 /// Waits until `fd` can be read, or the timeout passes.

@@ -1,0 +1,286 @@
+test
++- run test
+   +- compile test debug native-native-msvc 56 errors
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\Io\Writer.zig:1935:5: error: invalid format string 'd' for type '*anyopaque'
+    @compileError("invalid format string '" ++ fmt ++ "' for type '" ++ @typeName(@TypeOf(value)) ++ "'");
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    printValue__func_12844: C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\Io\Writer.zig:1188:40
+    print__func_12842: C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\Io\Writer.zig:805:25
+    4 reference(s) hidden; use '-freference-trace=6' to see all references
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:1875:23: error: root source file struct 'os.windows.ws2_32' has no member named 'POLL'
+    .windows => ws2_32.POLL,
+                ~~~~~~^~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\os\windows\ws2_32.zig:1:1: note: struct declared here
+const std = @import("../../std.zig");
+^~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:4535:23: error: root source file struct 'os.windows.ws2_32' has no member named 'pollfd'
+    .windows => ws2_32.pollfd,
+                ~~~~~~^~~~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\os\windows\ws2_32.zig:1:1: note: struct declared here
+const std = @import("../../std.zig");
+^~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\fmt.zig:441:33: error: access of union field 'int' while field 'pointer' is active
+    const Accumulate = @Int(info.int.signedness, @max(8, info.int.bits));
+                            ~~~~^~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\lang.zig:640:18: note: union declared here
+pub const Type = union(enum) {
+                 ^~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\fmt.zig:441:33: error: access of union field 'int' while field 'pointer' is active
+    const Accumulate = @Int(info.int.signedness, @max(8, info.int.bits));
+                            ~~~~^~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\lang.zig:640:18: note: union declared here
+pub const Type = union(enum) {
+                 ^~~~~
+src\builtins\gateway\permission_reviewer.zig:631:63: error: enum '@typeInfo(core.permissions.auto_classifier.ParseOutcome).@"union".tag_type.?' has no member named 'clear'
+        std.meta.Tag(permission_auto_classifier.ParseOutcome).clear,
+                                                              ^~~~~
+src\core\permissions\auto_classifier.zig:100:26: note: enum declared here
+pub const ParseOutcome = union(enum) {
+                         ^~~~~
+src\core\app\app_agent_runtime.zig:1217:86: error: no field named 'role' in struct 'core.app.app_agent_runtime.FakeApp__struct_19073'
+                    .starts_subagents = subagent_agent_adapter.startsSubagents(agent.role),
+                                                                                     ^~~~
+src\core\app\app_agent_runtime.zig:2000:17: note: struct declared here
+    main_agent: struct {
+                ^~~~~~
+src\core\app\app_agent_runtime.zig:1617:66: error: no field named 'subagent_agent_step_limit' in struct 'core.app.app_agent_runtime.FakeApp'
+            const step_limit: usize = if (child_run != null) app.subagent_agent_step_limit else app.agent_step_limit;
+                                                                 ^~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\app\app_agent_runtime.zig:1990:17: note: struct declared here
+const FakeApp = struct {
+                ^~~~~~
+src\core\app\app_auth_runtime.zig:795:25: error: no field or member function named 'addProviderFlowActive' in 'core.app.app_auth_runtime.TestAuth'
+            if (app.auth.addProviderFlowActive()) {
+                ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+src\core\app\app_auth_runtime.zig:2835:18: note: struct declared here
+const TestAuth = struct {
+                 ^~~~~~
+src\core\app\app_auth_runtime.zig:826:25: error: no field or member function named 'addProviderFlowActive' in 'core.app.app_auth_runtime.TestAuth'
+            if (app.auth.addProviderFlowActive()) {
+                ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+src\core\app\app_auth_runtime.zig:2835:18: note: struct declared here
+const TestAuth = struct {
+                 ^~~~~~
+src\core\app\app_auth_runtime.zig:1001:17: error: no field named 'provider_selection' in struct 'core.app.app_input_runtime.RoutingFakeApp'
+            app.provider_selection.definitions.deinit(app.alloc);
+                ^~~~~~~~~~~~~~~~~~
+src\core\app\app_input_runtime.zig:3624:24: note: struct declared here
+const RoutingFakeApp = struct {
+                       ^~~~~~
+src\core\app\app_auth_runtime.zig:1063:44: error: no field named 'provider_selection' in struct 'core.app.app_input_runtime.RoutingFakeApp'
+                    const definition = app.provider_selection.definitions.get(target.label()) orelse return;
+                                           ^~~~~~~~~~~~~~~~~~
+src\core\app\app_input_runtime.zig:3624:24: note: struct declared here
+const RoutingFakeApp = struct {
+                       ^~~~~~
+src\core\app\app_auth_runtime.zig:1186:51: error: no field named 'provider_selection' in struct 'core.app.app_input_runtime.RoutingFakeApp'
+            const target = try candidate.bind(app.provider_selection.definitions);
+                                                  ^~~~~~~~~~~~~~~~~~
+src\core\app\app_input_runtime.zig:3624:24: note: struct declared here
+const RoutingFakeApp = struct {
+                       ^~~~~~
+src\core\app\app_bootstrap_runtime.zig:581:17: error: no field named 'subagent_agent_step_limit' in struct 'core.app.app_bootstrap_runtime.TestApp'
+            app.subagent_agent_step_limit = startup.subagent_agent_step_limit;
+                ^~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\app\app_bootstrap_runtime.zig:840:17: note: struct declared here
+const TestApp = struct {
+                ^~~~~~
+src\core\app\provider_picker_runtime.zig:87:85: error: no field or member function named 'configuredProviderNames' in 'core.app.provider_picker_runtime.ColumnTestApp.TestAuth'
+                    count = provider_picker_catalog.providerOptions(&slugs, app.auth.configuredProviderNames());
+                                                                            ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+src\core\app\provider_picker_runtime.zig:729:22: note: struct declared here
+    const TestAuth = struct {
+                     ^~~~~~
+src\core\app\provider_picker_runtime.zig:267:40: error: no field named 'provider_selection' in struct 'core.app.app_input_runtime.RoutingFakeApp'
+            return configured.bind(app.provider_selection.definitions) catch null;
+                                       ^~~~~~~~~~~~~~~~~~
+src\core\app\app_input_runtime.zig:3624:24: note: struct declared here
+const RoutingFakeApp = struct {
+                       ^~~~~~
+src\core\auth\browser_callback.zig:576:26: error: type 'void' does not support struct initialization syntax
+                .onoff = 1,
+                         ^
+src\core\auth\provider_picker_catalog.zig:193:19: error: expected 2 argument(s), found 1
+    const count = providerOptions(&buf);
+                  ^~~~~~~~~~~~~~~
+src\core\auth\provider_picker_catalog.zig:132:5: note: function declared here
+pub fn providerOptions(out: [][]const u8, configured: []const []const u8) usize {
+~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\execution\process_tree.zig:336:37: error: enum 'c.SIG__enum_11' has no member named 'KILL'
+        if (signal == std.posix.SIG.KILL) self.stopProcessesWith(preserved_group, Effects);
+                                    ^~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:2774:17: note: enum declared here
+    .windows => enum(u32) {
+                ^~~~
+src\core\execution\process_tree.zig:890:48: error: expected type '?*anyopaque', found 'comptime_int'
+    try std.testing.expect(shouldSignalProcess(41, null));
+                                               ^~
+src\core\execution\process_tree.zig:797:20: note: parameter type declared here
+    process_group: ?std.posix.pid_t,
+                   ^~~~~~~~~~~~~~~~
+src\core\execution\process_tree.zig:914:10: error: expected type '*anyopaque', found 'comptime_int'
+        .parent_pid = 17,
+        ~^~~~~~~~~~~~~~~
+src\core\execution\process_tree.zig:1031:46: error: expected type '*anyopaque', found 'comptime_int'
+    const command_session: std.posix.pid_t = 500;
+                                             ^~~
+src\core\execution\process_tree.zig:1517:10: error: expected type '*anyopaque', found 'comptime_int'
+        .parent_pid = 1,
+        ~^~~~~~~~~~~~~~
+src\core\hosts\native.zig:274:58: error: enum 'c.SIG__enum_11' has no member named 'STOP'
+    try std.testing.expect(!copySucceeded(.{ .stopped = .STOP }));
+                                                        ~^~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:2774:17: note: enum declared here
+    .windows => enum(u32) {
+                ^~~~
+src\core\session\session_child_store.zig:1032:13: error: expected type '@typeInfo(@typeInfo(@TypeOf(core.session.session_child_store.SessionChildCapability.initWithOptions)).@"fn".return_type.?).error_union.error_set', found 'error{PrivateStatePermissionsUnsupported}'
+            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\session\session_child_store.zig:1032:13: note: 'error.PrivateStatePermissionsUnsupported' not a member of destination error set
+src\core\session\session_child_store.zig:1057:13: error: expected type '@typeInfo(@typeInfo(@TypeOf(core.session.session_child_store.SessionChildCapability.initWithOptions)).@"fn".return_type.?).error_union.error_set', found 'error{PrivateStatePermissionsUnsupported}'
+            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\session\session_child_store.zig:1057:13: note: 'error.PrivateStatePermissionsUnsupported' not a member of destination error set
+src\core\shared\darwin_process_spawn.zig:6:55: error: expected type '*anyopaque', found 'comptime_int'
+const preferred_inherited_fd_target: std.posix.fd_t = 64;
+                                                      ^~
+src\core\shared\darwin_process_spawn.zig:171:24: error: type 'void' has no members
+            std.posix.F.SETFD,
+            ~~~~~~~~~~~^~~~~~
+src\core\shared\darwin_process_spawn.zig:420:74: error: type 'void' has no members
+        const result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+                                                              ~~~~~~~~~~~^~~~~~~
+src\core\shared\darwin_process_spawn.zig:436:43: error: expected integer or vector, found '*anyopaque'
+        const rc = std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0));
+                                          ^~~~~~~~~~~~
+src\core\shared\darwin_process_spawn.zig:444:63: error: expected integer or vector, found '*anyopaque'
+        if (!was_open and is_open) _ = std.posix.system.close(@intCast(fd));
+                                                              ^~~~~~~~~~~~
+src\core\shared\darwin_process_spawn.zig:688:10: error: expected type '?*anyopaque', found 'comptime_int'
+        .pgid = 0,
+        ~^~~~~~~~
+src\core\shared\io.zig:2085:17: error: type 'void' does not support field access
+    @memcpy(term.c_cc[0..4], &bytes);
+            ~~~~^~~~~
+src\core\shared\io.zig:2556:21: error: expected type 'process.Environ.GlobalBlock', found 'process.Environ.PosixBlock'
+    setEnvironBlock(block);
+                    ^~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\process\Environ.zig:48:24: note: struct declared here
+pub const PosixBlock = struct {
+                       ^~~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\process\Environ.zig:35:25: note: struct declared here
+pub const GlobalBlock = struct {
+                        ^~~~~~
+src\core\shared\io.zig:505:50: note: parameter type declared here
+pub fn setEnvironBlock(block: std.process.Environ.Block) void {
+                              ~~~~~~~~~~~~~~~~~~~^~~~~~
+src\core\shared\io.zig:2821:29: error: expected type 'error{AccessDenied,BadPathName,Canceled,DiskQuota,FileNotFound,FileSystem,NameTooLong,NetworkNotFound,NoSpaceLeft,NotDir,PathAlreadyExists,PermissionDenied,ReadOnlyFileSystem,SymLinkLoop,SystemResources,Unexpected}', found 'error{OperationUnsupported}'
+        error.AccessDenied, error.OperationUnsupported => return error.SkipZigTest,
+                            ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\shared\io.zig:2821:29: note: 'error.OperationUnsupported' not a member of destination error set
+src\core\skills\skill_runtime.zig:5359:54: error: struct 'c.AT__struct_29393' has no member named 'FDCWD'
+            const fd = std.posix.openatZ(std.posix.AT.FDCWD, self.path, .{ .ACCMODE = .WRONLY }, 0) catch {
+                                         ~~~~~~~~~~~~^~~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:8525:17: note: struct declared here
+    .windows => struct {
+                ^~~~~~
+src\core\skills\skill_runtime.zig:5400:29: error: struct 'c.AT__struct_29393' has no member named 'FDCWD'
+                std.posix.AT.FDCWD,
+                ~~~~~~~~~~~~^~~~~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:8525:17: note: struct declared here
+    .windows => struct {
+                ^~~~~~
+src\core\subagent\tool_host.zig:2767:12: error: switch must handle all possibilities
+    return switch (observation.outcome orelse return .{
+           ^~~~~~
+src\core\subagent\child_state.zig:76:77: note: unhandled enumeration value: 'paused'
+pub const Outcome = enum { completed, failed, cancelled, interrupted, lost, paused };
+                                                                            ^~~~~~
+src\core\subagent\child_state.zig:76:21: note: enum 'core.subagent.child_state.Outcome' declared here
+pub const Outcome = enum { completed, failed, cancelled, interrupted, lost, paused };
+                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src\core\terminal\native_session.zig:2156:13: error: expected type '@typeInfo(@typeInfo(@TypeOf(core.execution.process_tree.Tracker.refresh)).@"fn".return_type.?).error_union.error_set', found 'error{OutOfMemory}'
+            error.OutOfMemory => return error.OutOfMemory,
+            ^~~~~~~~~~~~~~~~~
+src\core\terminal\native_session.zig:2156:13: note: 'error.OutOfMemory' not a member of destination error set
+src\core\terminal\native_session.zig:2222:27: error: negation of type '*anyopaque'
+        return std.c.kill(-pid.?, signal) == 0;
+                          ^~~~~~
+src\core\terminal\native_session.zig:3890:30: error: enum 'c.SIG__enum_11' has no member named 'HUP'
+        .hangup => std.c.SIG.HUP,
+                             ^~~
+C:\Users\zcg\.local\share\zvm\0.17.0\lib\std\c.zig:2774:17: note: enum declared here
+    .windows => enum(u32) {
+                ^~~~
+src\core\terminal\store.zig:6236:49: error: expected integer or vector, found '*anyopaque'
+    return contracts.ProcessOwner.init(@intCast(pid), token.view());
+                                                ^~~
+src\core\terminal\store.zig:6384:96: error: expected type '*anyopaque', found 'comptime_int'
+    const running_owner = try formatOwnerIdentity(&running_buffer, text_utils.repeat("a", 32), 4242, token);
+                                                                                               ^~~~
+src\core\terminal\store.zig:1343:19: note: parameter type declared here
+    pid: std.posix.pid_t,
+         ~~~~~~~~~^~~~~~
+src\core\terminal\store.zig:6443:79: error: expected type '*anyopaque', found 'comptime_int'
+    const text = try formatOwnerIdentity(&buffer, text_utils.repeat("c", 32), 77, token);
+                                                                              ^~
+src\core\terminal\store.zig:1343:19: note: parameter type declared here
+    pid: std.posix.pid_t,
+         ~~~~~~~~~^~~~~~
+src\core\tooling\tool_runtime.zig:2892:37: error: no field named 'reviewer_effort' in struct 'core.tooling.tool_runtime.TestRuntime'
+            .reviewer_effort = self.reviewer_effort,
+                                    ^~~~~~~~~~~~~~~
+src\core\tooling\tool_runtime.zig:2810:21: note: struct declared here
+const TestRuntime = struct {
+                    ^~~~~~
+src\gateway\client.zig:8434:30: error: type 'void' does not support struct initialization syntax
+                    .onoff = 1,
+                             ^
+src\main.zig:4564:85: error: expected type '[]const u16', found '*const [1][*:0]const u8'
+    var threaded = std.Io.Threaded.init(std.testing.allocator, processIoOptions(.{ .vector = &argv }, .{ .slice = &environ }));
+                                                                                   ~^~~~~~~~~~~~~~
+src\main.zig:4564:85: note: pointer type child '[*:0]const u8' cannot cast into pointer type child 'u16'
+src\mcp\io\process.zig:1244:45: error: type 'void' does not support struct initialization syntax
+    const ends = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+                                           ~^~~~~~~~~~~~~~~~~~~
+src\mcp\io\process.zig:1373:36: error: expected integer or vector, found '*anyopaque'
+        if (std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0)) != -1) n += 1;
+                                   ^~~~~~~~~~~~
+src\tools\web\http_fetch.zig:2826:17: error: expected type '*anyopaque', found 'comptime_int'
+    reader.init(-1, .{});
+                ^~
+src\tools\web\http_fetch.zig:1578:42: note: parameter type declared here
+        fn init(self: *@This(), fd: posix.fd_t, options: FetchOptions) void {
+                                    ~~~~~^~~~~
+src\tools\web\http_fetch.zig:3595:29: error: expected type '*anyopaque', found 'comptime_int'
+        .returned_fds = &.{ -1, -1 },
+                            ^~
+src\tools\web\http_fetch.zig:3675:29: error: expected type '*anyopaque', found 'comptime_int'
+        .returned_fds = &.{ -1, fds[0] },
+                            ^~
+src\tools\web\http_fetch.zig:3699:29: error: expected type '*anyopaque', found 'comptime_int'
+        .returned_fds = &.{ -1, -1 },
+                            ^~
+src\tools\web\http_fetch.zig:3806:28: error: expected type '*anyopaque', found 'comptime_int'
+    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
+                           ^~
+src\tools\web\http_fetch.zig:1839:32: note: parameter type declared here
+fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
+                          ~~~~~^~~~~
+src\tools\web\http_fetch.zig:3883:21: error: type 'void' does not support struct initialization syntax
+        .handler = .{ .handler = noOpSignalHandler },
+                   ~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src\tools\web\http_fetch.zig:4044:14: error: type 'void' not a function
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+        ~~~~~^~~~~~~~~~~
+error: 56 compilation errors
+failed command: "C:\\Users\\zcg\\.local\\share\\zvm\\0.17.0\\zig.exe" test -fno-strip -fno-stack-check -fno-stack-protector -fno-omit-frame-pointer -ferror-tracing -fno-sanitize-thread -funwind-tables -Odebug -target x86_64-native-msvc -mcpu baseline --dep build_options --dep fuzz_corpus --dep fuzz_seed --dep session_manager --dep test_paths "-Mroot=src\\main.zig" "-Mbuild_options=.zig-cache\\o\\250d2e9ed3f6ba46348b52937c048438\\options.zig" "-Mfuzz_corpus=.zig-cache\\o\\a277627e5b44509141fad41b0a35368a\\options.zig" -Odebug -target x86_64-native-msvc -mcpu baseline "-Mfuzz_seed=src\\fuzz_seed.zig" -fno-sanitize-thread -Odebug -target x86_64-native-msvc -mcpu baseline --dep build_options=build_options0 "-Msession_manager=src\\core\\session_manager\\api.zig" "-Mtest_paths=.zig-cache\\o\\6a266567e4588f19df2eeb3ca72d5b9a\\options.zig" "-Mbuild_options0=.zig-cache\\o\\35bd96d8490ca2307d166dc39ea5281f\\options.zig" -lc --cache-dir .zig-cache --global-cache-dir "C:\\Users\\zcg\\AppData\\Local\\zig" --build-root . --name test --zig-lib-dir "C:\\Users\\zcg\\.local\\share\\zvm\\0.17.0\\lib\\" --listen=-
+
+Build Summary: 13/16 steps succeeded (1 failed)
+test transitive failure
++- run test transitive failure
+   +- compile test debug native-native-msvc 56 errors
+
+error: the following build command exited with code 1:
+C:\Users\zcg\AppData\Local\zig\o\869bd899aeea88051c1d6bb96f79eb3e\maker.exe build --zig-lib=C:\Users\zcg\.local\share\zvm\0.17.0\lib --zig=C:\Users\zcg\.local\share\zvm\0.17.0\zig.exe --global-cache=C:\Users\zcg\AppData\Local\zig --seed=0x8f5374f test --prefix .zig-out-verify

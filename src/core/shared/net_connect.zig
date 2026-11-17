@@ -60,6 +60,11 @@ fn netConnectIp(
     const inner = wrapped_inner.?;
     // std doesn't implement connect timeouts yet; those stay with std.
     if (options.timeout != .none or !std.options.networking) return inner.netConnectIp(userdata, address, options);
+    // The cancel-aware path below builds its own socket and waits for it with
+    // `poll`, which Windows does not have. Windows needs none of it either: it
+    // exists so a cancel ends the wait, and std's own connect through the
+    // wrapped `Io` already honors the same cancellation.
+    if (comptime builtin.target.os.tag == .windows) return inner.netConnectIp(userdata, address, options);
     return connect(.{ .userdata = userdata, .vtable = inner }, address, options);
 }
 
@@ -80,7 +85,13 @@ fn connect(
     switch (posix.errno(posix.system.connect(fd, &storage.any, length))) {
         .SUCCESS => {},
         // Interrupted or not, the connection goes on in the kernel.
-        .INPROGRESS, .INTR => try awaitConnected(io, fd),
+        .INPROGRESS, .INTR => {
+            // `awaitConnected` waits with `poll`, which Windows lacks. This
+            // whole function is POSIX-only; the Windows callers hand off to
+            // std's own connect before reaching it.
+            if (comptime builtin.target.os.tag == .windows) return error.Unsupported;
+            try awaitConnected(io, fd);
+        },
         else => |err| return connectError(err),
     }
     try setBlocking(fd);
@@ -88,16 +99,21 @@ fn connect(
 }
 
 fn awaitConnected(io: std.Io, fd: posix.fd_t) net.IpAddress.ConnectError!void {
-    while (true) {
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-        const ready = posix.system.poll(&fds, fds.len, cancel_check_ms);
-        switch (posix.errno(ready)) {
-            .SUCCESS => if (ready > 0) return socketError(fd),
-            .INTR => {},
-            .AGAIN, .NOMEM => return error.SystemResources,
-            else => |err| return posix.unexpectedErrno(err),
+    if (comptime builtin.target.os.tag == .windows) {
+        _ = .{ io, fd };
+        return error.Unsupported;
+    } else {
+        while (true) {
+            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const ready = posix.system.poll(&fds, fds.len, cancel_check_ms);
+            switch (posix.errno(ready)) {
+                .SUCCESS => if (ready > 0) return socketError(fd),
+                .INTR => {},
+                .AGAIN, .NOMEM => return error.SystemResources,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+            try io.checkCancel();
         }
-        try io.checkCancel();
     }
 }
 

@@ -228,7 +228,6 @@ pub const Client = struct {
     }
 };
 
-
 fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {
     const status = custom_status orelse return null;
     if (status.len == 0) return null;

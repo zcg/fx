@@ -24,6 +24,7 @@
 //! for a login's refresh, `tests/tla/mcp_host/RefreshLease.tla`.
 
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -940,7 +941,7 @@ test "the credential file is private, and one this fx can't read is never writte
     try tmp.dir.deleteFile(testing.io, test_path);
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ home, test_path }, 0);
-    if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
+    if (posix_symbols.mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
     try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));
     try testing.expectError(error.CredentialStoreUnreadable, store.lookup(testing.allocator, .{ .name = "plain", .url = url }));
     try testing.expectError(error.CredentialStoreUnreadable, store.check(testing.allocator));
@@ -949,7 +950,6 @@ test "the credential file is private, and one this fx can't read is never writte
     try testing.expectEqual(std.Io.File.Kind.named_pipe, (try tmp.dir.statFile(testing.io, test_path, .{ .follow_symlinks = false })).kind);
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "a refused login removes only its own: one another fx saved since stays" {
     var tmp = testing.tmpDir(.{});

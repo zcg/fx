@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const builtin = @import("builtin");
 const profile_paths = @import("../shared/profile_paths.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -4350,7 +4351,6 @@ fn createTempSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, li
     };
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8) !void {
     if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) {
@@ -4365,7 +4365,7 @@ fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []
     defer alloc.free(path);
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_z = try std.mem.printSentinel(&path_buf, "{s}", .{path}, 0);
-    if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
+    if (posix_symbols.mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
 }
 
 fn openFileDescriptorCount() !usize {

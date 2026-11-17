@@ -564,7 +564,8 @@ pub const Session = struct {
             }
         }
         var log = Log.create(s, dir, "log.jsonl", .{}) catch |io_err| return storage.ioFault(io_err);
-        errdefer log.close();
+        var log_open = true;
+        errdefer if (log_open) log.close();
         session.writeFramed(&log, 1, .header) catch |io_err| return storage.ioFault(io_err);
 
         const rename_first = env.isPlanted(.rename_before_fsync);
@@ -574,7 +575,8 @@ pub const Session = struct {
         };
         session.observe(.publish_synced);
         const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
-        errdefer s.closeFile(lock);
+        var lock_open = true;
+        errdefer if (lock_open) s.closeFile(lock);
         const locked = s.tryLock(lock) catch |io_err| {
             return storage.ioFault(io_err);
         };
@@ -592,7 +594,9 @@ pub const Session = struct {
             // renames through the open descriptors and keeps them.
             if (comptime @import("builtin").target.os.tag == .windows) {
                 s.closeFile(lock);
+                lock_open = false;
                 log.close();
+                log_open = false;
                 try session.publishRename(tmp);
                 const reopened_dir = s.openDir(env.root, session.identity.id) catch |io_err| {
                     return storage.ioFault(io_err);
@@ -766,6 +770,10 @@ pub const Session = struct {
         file_open = false;
         if (known == null) if (s.stat(dir, &hash)) |_| return hash else |_| {};
         s.rename(dir, name, dir, &hash) catch |io_err| return storage.ioFault(io_err);
+        // A blob refuses a write from here on. Windows applies that after the
+        // move because a READONLY file cannot be renamed; POSIX already carried
+        // the mode through.
+        s.makeReadOnly(dir, &hash) catch |io_err| return storage.ioFault(io_err);
         renamed = true;
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         return hash;
@@ -2328,13 +2336,23 @@ pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
         error.NotFound => null,
         else => |io_err| return storage.ioFault(io_err),
     };
-    defer if (lock) |l| s.closeFile(l);
+    var lock_open = true;
+    defer if (lock_open) if (lock) |l| s.closeFile(l);
     if (lock) |l| if (!(s.tryLock(l) catch |io_err| return storage.ioFault(io_err))) return error.Busy;
     const trash = s.ensureDir(env.root, ".trash") catch |io_err| return storage.ioFault(io_err);
     defer s.closeDir(trash);
     s.deleteTree(trash, id_) catch |io_err| return storage.ioFault(io_err);
     s.closeDir(dir);
     dir_open = false;
+    // The lock is closed before the move: Windows refuses to rename a folder
+    // that still holds an open file, and POSIX lets the move through either
+    // way, so closing here is what both platforms need. The lock already did
+    // its work by proving no other process holds the session.
+    if (lock) |l| {
+        s.unlock(l);
+        s.closeFile(l);
+        lock_open = false;
+    }
     s.rename(env.root, id_, trash, id_) catch |err| return notFoundOr(err);
     s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
     env.observeCatalog(id_, .trashed);

@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("io.zig");
 const net_connect = @import("net_connect.zig");
+const readiness = @import("readiness.zig");
 
 const posix = std.posix;
 const Threaded = std.Io.Threaded;
@@ -13,7 +14,7 @@ const log = std.log.scoped(.testing_listener);
 /// again.
 const stop_check_ms = 10;
 
-pub const AcceptError = posix.PollError || std.Io.net.Server.AcceptError;
+pub const AcceptError = posix.PollError || std.Io.net.Server.AcceptError || error{Unsupported};
 
 /// Accepts the next connection on `server`, or returns null once `stopping`
 /// is set. A test server's thread uses this in place of a blocking `accept`,
@@ -48,18 +49,20 @@ fn acceptUntilStop(
     stopping: *const std.atomic.Value(bool),
     on_gone: OnGone,
 ) AcceptError!?std.Io.net.Stream {
-    var fds = [_]posix.pollfd{.{
-        .fd = server.socket.handle,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
+    // `readiness` is the one place that owns this wait: it polls on POSIX and
+    // asks the socket directly on Windows, where Zig 0.17 has no `poll`.
+    var watches = [_]readiness.Watch{.{ .fd = server.socket.handle }};
     while (!stopping.load(.seq_cst)) {
-        fds[0].revents = 0;
-        if (try posix.poll(&fds, stop_check_ms) == 0) continue;
+        watches[0].events = .{};
+        const ready = readiness.pollDescriptors(&watches, .{ .milliseconds = stop_check_ms }) catch
+            return error.Unsupported;
+        if (ready == 0) continue;
         switch (try acceptWaiting(server, io)) {
             .stream => |stream| return stream,
             .gone => |errno| if (on_gone == .report) {
-                reportGone(server.socket.address.getPort(), fds[0].revents, errno);
+                // One bit, from the readable flag, so the report keeps saying
+                // what it always said: this is the event the wait saw.
+                reportGone(server.socket.address.getPort(), if (watches[0].events.readable) @as(i16, 1) else 0, errno);
             },
         }
     }
@@ -472,6 +475,9 @@ test "a waiting accept reports a connection that is gone, with the accept error"
 }
 
 test "the report of a gone connection names the port, the poll result and the accept error" {
+    // The report is built from a `POSIX` event bit, which Windows has no name
+    // for: `std.posix.POLL` resolves through `ws2_32` there.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var buffer: [gone_message_max]u8 = undefined;
     try std.testing.expectEqualStrings(
         "poll reported a connection on port 43210 (revents 0x1), but accept found none (AGAIN)",

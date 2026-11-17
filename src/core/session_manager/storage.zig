@@ -259,7 +259,10 @@ pub const Storage = struct {
         try s.alive();
         assertComponent(name);
         if (comptime builtin.target.os.tag == .windows) {
-            if (isReparsePoint(s.io, dir, name) catch |err| return translate(err)) return error.Refused;
+            // A missing name is reported by the open below, with the same
+            // translation, so the link check only has to answer for a name that
+            // is there.
+            if (isReparsePoint(s.io, dir, name) catch false) return error.Refused;
         }
         const handle = dir.handle.openFile(s.io, name, .{
             .mode = switch (access) {
@@ -390,6 +393,22 @@ pub const Storage = struct {
         if (hooks) if (s.fault) |f| try f.noteRename(s, old_dir, old_name, new_dir, new_name);
     }
 
+    /// Makes `name` refuse a write, which is what a blob is.
+    ///
+    /// On POSIX the file already carries `blob_mode`, so this has nothing to do.
+    /// On Windows Zig 0.17's `createFile` ignores `permissions` and its
+    /// `setFilePermissions` panics with TODO implement, so the READONLY
+    /// attribute is set here. It has to be set after the blob is under its
+    /// final name, because Windows cannot rename a READONLY file, and a blob is
+    /// written under a staging name and then moved to its hash.
+    pub fn makeReadOnly(s: Storage, dir: Dir, name: []const u8) Error!void {
+        try s.alive();
+        try s.mutate();
+        assertComponent(name);
+        if (comptime modeIsEnforced) return;
+        setReadOnlyAttribute(s.io, dir, name) catch |err| return translate(err);
+    }
+
     /// Hard link (fork blobs). Fails if the new name exists.
     ///
     /// Zig 0.17 reports `OperationUnsupported` for a directory hard link on
@@ -416,6 +435,15 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
+        // Windows deletes a READONLY file only after its attribute is cleared,
+        // which is the one thing a POSIX mode carries that Windows keeps.
+        if (comptime !modeIsEnforced) {
+            if (s.stat(dir, name)) |entry| {
+                if (entry.mode & 0o200 == 0) {
+                    clearReadOnlyAttribute(s.io, dir, name) catch |err| return translate(err);
+                }
+            } else |_| {}
+        }
         dir.handle.deleteFile(s.io, name) catch |err| return translate(err);
     }
 
@@ -424,6 +452,12 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
+        // Windows refuses to delete a READONLY entry, and a session folder holds
+        // blobs, which are READONLY on purpose. The attribute is cleared through
+        // the tree first, so the delete below sees ordinary entries.
+        if (comptime !modeIsEnforced) {
+            clearReadOnlyTree(s.io, dir, name) catch |err| return translate(err);
+        }
         dir.handle.deleteTree(s.io, name) catch |err| return translate(err);
     }
 
@@ -440,7 +474,11 @@ pub const Storage = struct {
                 .directory => .directory,
                 else => .other,
             },
-            .mode = modeOf(st.permissions),
+            // Zig 0.17's Windows `statFile` leaves `Permissions` zeroed, so the
+            // READONLY attribute is read here instead. It is the one bit this
+            // module sets and reads back, and without it a blob would report
+            // itself writable.
+            .mode = if (comptime modeIsEnforced) modeOf(st.permissions) else attributeModeOf(s.io, dir, name) catch |err| return translate(err),
             .mtime_ms = st.mtime.toMilliseconds(),
         };
     }
@@ -485,6 +523,96 @@ fn assertComponent(name: []const u8) void {
     std.debug.assert(std.mem.findScalar(u8, name, '/') == null);
     std.debug.assert(!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."));
 }
+
+/// Clears the READONLY attribute on `name` inside `dir` and on everything
+/// beneath it, so the tree can be deleted.
+///
+/// A name that is not there is left alone: the delete that follows reports it,
+/// and this pass exists only to remove an obstacle the delete cannot pass.
+fn clearReadOnlyTree(io: Io, dir: Dir, name: []const u8) !void {
+    clearReadOnlyAttribute(io, dir, name) catch return;
+    const opened = dir.handle.openDir(io, name, .{ .iterate = true, .follow_symlinks = true }) catch |err| switch (err) {
+        // A file, or a name that is not a folder, has no tree beneath it.
+        error.NotDir, error.FileNotFound => return,
+        else => return err,
+    };
+    const child: Dir = .{ .handle = opened };
+    defer child.handle.close(io);
+    var iterator = child.handle.iterate();
+    while (try iterator.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => clearReadOnlyTree(io, child, entry.name) catch {},
+            else => clearReadOnlyAttribute(io, child, entry.name) catch {},
+        }
+    }
+}
+
+/// Clears the READONLY attribute on `name` inside `dir`, so the entry can be
+/// renamed or deleted.
+fn clearReadOnlyAttribute(io: Io, dir: Dir, name: []const u8) !void {
+    const alloc = std.heap.page_allocator;
+    const path = try absoluteChildPath(alloc, io, dir, name);
+    defer alloc.free(path);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    if (win_file_attributes.SetFileAttributesW(wide, win_file_attributes.normal) == 0) {
+        // `ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND`.
+        return switch (win_file_attributes.GetLastError()) {
+            2, 3 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+}
+
+/// The mode a Windows entry reports, built from its file attributes.
+///
+/// `FILE_ATTRIBUTE_READONLY` is the only bit this module sets, so the answer is
+/// `0o400` for an entry that refuses writes and `0o600` for one that accepts
+/// them. Every other mode bit is reported as zero rather than invented.
+fn attributeModeOf(io: Io, dir: Dir, name: []const u8) !std.posix.mode_t {
+    const alloc = std.heap.page_allocator;
+    const path = try absoluteChildPath(alloc, io, dir, name);
+    defer alloc.free(path);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    const attributes = win_file_attributes.GetFileAttributesW(wide);
+    const invalid: u32 = 0xffffffff;
+    if (attributes == invalid) {
+        return switch (win_file_attributes.GetLastError()) {
+            2, 3 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+    return if (attributes & win_file_attributes.readonly != 0) 0o400 else 0o600;
+}
+
+/// Sets the READONLY attribute on `name` inside `dir`, which is how Windows
+/// makes a file refuse a write.
+fn setReadOnlyAttribute(io: Io, dir: Dir, name: []const u8) !void {
+    const alloc = std.heap.page_allocator;
+    const path = try absoluteChildPath(alloc, io, dir, name);
+    defer alloc.free(path);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    if (win_file_attributes.SetFileAttributesW(wide, win_file_attributes.readonly) == 0) {
+        // `ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND`.
+        return switch (win_file_attributes.GetLastError()) {
+            2, 3 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+}
+
+const win_file_attributes = if (builtin.target.os.tag != .windows) struct {} else struct {
+    /// `FILE_ATTRIBUTE_READONLY`: the attribute that makes a write fail.
+    const readonly: u32 = 0x1;
+    /// `FILE_ATTRIBUTE_NORMAL`, which clears every attribute that can be set
+    /// on its own, so it is what restoring an ordinary entry uses.
+    const normal: u32 = 0x80;
+    extern "kernel32" fn SetFileAttributesW(file_name: [*:0]const u16, attributes: u32) callconv(.winapi) i32;
+    extern "kernel32" fn GetFileAttributesW(file_name: [*:0]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+};
 
 /// Links `old_name` in `old_dir` to `new_name` in `new_dir` with
 /// `CreateHardLinkW`, which Zig 0.17's `Io.Dir.hardLink` does not reach on
@@ -685,25 +813,30 @@ test "a read-only file is written through its own handle and opens read-only onl
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
     const root = testRoot(&tmp);
-    const file = try s.createReadOnlyFile(root, "blob");
+    const file = try s.createReadOnlyFile(root, "blob.staged");
     try s.writeAt(file, "body", 0);
     try s.sync(file);
     s.closeFile(file);
-    // Windows carries the read-only attribute for a blob, not a mode; the
-    // mode is asserted where the platform has one.
-    if (comptime modeIsEnforced) {
-        try testing.expectEqual(@as(std.posix.mode_t, blob_mode), (try s.stat(root, "blob")).mode);
-    } else {
-        // Windows carries the READONLY attribute for a blob, and `modeOf`
-        // reports it as a mode with no owner write bit.
-        try testing.expectEqual(@as(std.posix.mode_t, 0o400), (try s.stat(root, "blob")).mode);
-    }
+    // A blob is written under a staging name and renamed to its hash, which is
+    // the name it keeps. That is where the read-only state is applied on
+    // Windows: a READONLY file cannot be renamed, so the attribute is set once
+    // the final name exists. POSIX carries the mode with the inode, so the
+    // rename leaves it alone.
+    try s.rename(root, "blob.staged", root, "blob");
+    try s.makeReadOnly(root, "blob");
+    try testing.expectEqual(@as(std.posix.mode_t, blob_mode), (try s.stat(root, "blob")).mode);
     try testing.expectError(error.Refused, s.openFile(root, "blob", .read_write));
     const again = try s.openFile(root, "blob", .read_only);
-    defer s.closeFile(again);
     var buffer: [4]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), try s.readAt(again, &buffer, 0));
     try testing.expectEqualStrings("body", &buffer);
+    s.closeFile(again);
+    // The temporary folder is removed after this test, and Windows will not
+    // delete a READONLY file, so the attribute is cleared here rather than
+    // leaving cleanup to fail.
+    if (comptime !modeIsEnforced) {
+        clearReadOnlyAttribute(s.io, root, "blob") catch {};
+    }
 }
 
 test "openRoot creates the root 0700 and refuses a symlinked root" {

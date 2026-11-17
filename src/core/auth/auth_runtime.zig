@@ -6757,7 +6757,15 @@ test "a prompt that leaves during its credential refresh lets the refresh finish
     var transport: HeldRefreshTransport = .{};
     var runtime: Runtime = .{ .oauth_transport = transport.provider() };
     runtime.prompt_credential_refresh_task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
-    while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+    // The worker reaches the transport within a few scheduler slices. A bound
+    // turns a worker that never gets there, which is a hang, into a failure
+    // that names itself.
+    var spins: usize = 0;
+    while (!transport.token_request_seen.load(.seq_cst)) {
+        std.Thread.yield() catch {};
+        spins += 1;
+        if (spins > 2_000_000) return error.TokenRequestNeverSeen;
+    }
 
     // The prompt leaves while the token request is on the wire. Nothing waits
     // for the issuer, and nothing cuts the request off: the runtime keeps it.
@@ -6786,7 +6794,15 @@ test "process exit leaves a prompt's credential refresh running instead of waiti
     var runtime: Runtime = .{ .oauth_transport = transport.provider() };
     defer runtime.deinit(alloc);
     runtime.prompt_credential_refresh_task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
-    while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+    // The worker reaches the transport within a few scheduler slices. A bound
+    // turns a worker that never gets there, which is a hang, into a failure
+    // that names itself.
+    var spins: usize = 0;
+    while (!transport.token_request_seen.load(.seq_cst)) {
+        std.Thread.yield() catch {};
+        spins += 1;
+        if (spins > 2_000_000) return error.TokenRequestNeverSeen;
+    }
     runtime.cancelPromptCredentialRefresh();
     const task = runtime.abandoned_prompt_refreshes.items[0];
 

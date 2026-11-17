@@ -614,7 +614,7 @@ fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
                     debug_trace.logf(
                         "terminal_host",
                         "resumed terminal child after foreground race pid={d}",
-                        .{pid},
+                        .{io_mod.pidNumber(pid)},
                     );
                 } else {
                     observe_stops = false;
@@ -2155,7 +2155,7 @@ const Session = struct {
         self.mutex.unlock(zio);
         if (!running or pid == null or token == null) return false;
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid.?}) catch
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{io_mod.pidNumber(pid.?)}) catch
             return false;
         if (self.durable.profile.process_provider.matchToken(
             self.alloc,
@@ -2198,7 +2198,7 @@ const Session = struct {
         const pid_text = std.mem.print(
             &pid_buffer,
             "{d}",
-            .{target.pid},
+            .{io_mod.pidNumber(target.pid)},
         ) catch return false;
         return self.durable.profile.process_provider.matchToken(
             self.alloc,
@@ -2306,7 +2306,7 @@ const Session = struct {
         self.mutex.unlock(zio);
         if (!running or pid == null or token == null) return false;
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid.?}) catch
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{io_mod.pidNumber(pid.?)}) catch
             return false;
         if (self.durable.profile.process_provider.matchToken(
             self.alloc,
@@ -2553,7 +2553,7 @@ const Session = struct {
             return;
         };
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid}) catch {
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{io_mod.pidNumber(pid)}) catch {
             self.failClosed(.session_lost);
             return;
         };
@@ -2566,7 +2566,7 @@ const Session = struct {
             debug_trace.logf(
                 "terminal_host",
                 "terminal child identity unavailable id={s} pid={d}",
-                .{ self.id, pid },
+                .{ self.id, io_mod.pidNumber(pid) },
             );
             self.failClosed(.process_identity_unavailable);
             return;

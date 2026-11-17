@@ -480,8 +480,8 @@ pub const resolved_keys = [_][]const u8{
     "slash_menu_categories", "sound.attention_required", "sound.max",
     "sound.turn_end",        "startup_scrollback",       "status_line.context",
     "status_line.session",   "status_line.workspace",    "subagent_max_children",
-    "subagent_max_depth",
-    "theme",                 "ultrafast_mode",           "update_channel",
+    "subagent_max_depth",    "theme",                    "ultrafast_mode",
+    "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its

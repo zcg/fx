@@ -626,7 +626,7 @@ fn closeTestFd(fd: std.posix.fd_t) void {
 
 test "enableRawMode preserves already queued input" {
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (comptime !supports_test_pty) return error.SkipZigTest;
 
     const pty = try TestPty.open();
     defer pty.close();
@@ -670,7 +670,7 @@ test "enableRawMode preserves already queued input" {
 
 test "enableRawMode preserves carriage return input" {
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (comptime !supports_test_pty) return error.SkipZigTest;
 
     const pty = try TestPty.open();
     defer pty.close();

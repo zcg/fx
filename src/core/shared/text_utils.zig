@@ -39,7 +39,6 @@ pub fn isTerminalSafeText(text: []const u8) bool {
 /// line breaks and tabs are its only control bytes, and the rest is valid
 /// UTF-8 with no C1 control. The check walks the text the way the writer
 /// does, so the two cannot disagree about one byte.
-
 /// Removes every terminal control sequence `text` carries except the SGR ones
 /// fx itself writes for color and weight.
 ///

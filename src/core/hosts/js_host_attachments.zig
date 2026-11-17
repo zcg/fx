@@ -3,12 +3,33 @@
 //! outbound payloads out of linear memory when the core publishes them.
 const std = @import("std");
 const host_attachments = @import("host_attachments.zig");
+const host_link = @import("js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 
-extern "fx" fn fx_attachment_size(id: host_attachments.Id) i32;
-extern "fx" fn fx_attachment_take(id: host_attachments.Id, output_ptr: [*]u8, output_cap: usize) i32;
-extern "fx" fn fx_attachment_put(input_ptr: [*]const u8, input_len: usize) i32;
+const fx_attachment_size = host_link.declare("fx_attachment_size", *const fn (id: host_attachments.Id) callconv(.c) i32, fx_attachment_size_unlinked);
+
+fn fx_attachment_size_unlinked(id: host_attachments.Id) callconv(.c) i32 {
+    _ = id;
+    unreachable;
+}
+
+const fx_attachment_take = host_link.declare("fx_attachment_take", *const fn (id: host_attachments.Id, output_ptr: [*]u8, output_cap: usize) callconv(.c) i32, fx_attachment_take_unlinked);
+
+fn fx_attachment_take_unlinked(id: host_attachments.Id, output_ptr: [*]u8, output_cap: usize) callconv(.c) i32 {
+    _ = id;
+    _ = output_ptr;
+    _ = output_cap;
+    unreachable;
+}
+
+const fx_attachment_put = host_link.declare("fx_attachment_put", *const fn (input_ptr: [*]const u8, input_len: usize) callconv(.c) i32, fx_attachment_put_unlinked);
+
+fn fx_attachment_put_unlinked(input_ptr: [*]const u8, input_len: usize) callconv(.c) i32 {
+    _ = input_ptr;
+    _ = input_len;
+    unreachable;
+}
 
 pub const store: host_attachments.Store = .{ .take_fn = take, .put_fn = put };
 

@@ -161,6 +161,16 @@ pub fn build(b: *std.Build) void {
         const exe_tests = b.addTest(.{
             .root_module = exe.root_module,
         });
+        // Some of fx's modules declare the JavaScript host's `extern "fx"`
+        // functions, which name a library `fx`. An executable leaves them
+        // unresolved, but Zig's Windows test link resolves every library
+        // reference and asks for `fx.lib`, which nothing writes. Building the
+        // tests position independent is the switch `install-test` already sets
+        // for this same reason, and it lets the names stay unresolved.
+        if (target.result.os.tag == .windows) {
+            exe_tests.pie = true;
+            exe_tests.name = "fx-dev";
+        }
         const run_exe_tests = b.addRunArtifact(exe_tests);
         run_exe_tests.step.dependOn(b.getInstallStep());
         // Tests launch the installed fx binary, and the session boundary test

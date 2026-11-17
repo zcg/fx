@@ -501,6 +501,9 @@ test "read-only opens accept a file that a concurrent atomic replacement unlinks
 }
 
 test "read-only regular file policy accepts hardlinks while durable policy rejects" {
+    // A hard link is made with `linkat`, which Windows has no name for in
+    // Zig's C bindings, and the policy it checks reads link counts.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2389,17 +2392,22 @@ const windows_console_info = if (builtin.target.os.tag != .windows) struct {} el
 /// and every errno is an error, including the EBADF that `std.posix.tcgetattr`
 /// treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    if (comptime builtin.target.os.tag == .windows) unreachable;
-    if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
-    var term = std.mem.zeroes(std.posix.termios);
-    while (true) switch (tcgetattrErrno(fd, &term)) {
-        .SUCCESS => return term,
-        .INTR => continue,
-        .BADF, .NOTTY => return error.NotATerminal,
-        else => |err| return std.posix.unexpectedErrno(err),
-    };
+    // A Windows console is described by one mode word per handle, not by a
+    // `termios`, and Zig 0.17 makes `std.posix.termios` `void` there. Windows
+    // callers use `term_mode.zig`, so this body is dropped from that build.
+    if (comptime builtin.target.os.tag == .windows) {
+        unreachable;
+    } else {
+        if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
+        var term = std.mem.zeroes(std.posix.termios);
+        while (true) switch (tcgetattrErrno(fd, &term)) {
+            .SUCCESS => return term,
+            .INTR => continue,
+            .BADF, .NOTTY => return error.NotATerminal,
+            else => |err| return std.posix.unexpectedErrno(err),
+        };
+    }
 }
-
 
 /// Linux issues the kernel ioctl: libc there writes a larger termios than Zig's.
 fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
@@ -2415,8 +2423,10 @@ pub fn tcsetattr(
     term: std.posix.termios,
 ) std.posix.TermiosSetError!void {
     // POSIX only, for the same reason `tcgetattr` is: Windows has no termios.
-    if (comptime builtin.target.os.tag == .windows) unreachable;
-    while (true) switch (tcsetattrErrno(fd, action, &term)) {
+    if (comptime builtin.target.os.tag == .windows) {
+        _ = .{ fd, action, term };
+        unreachable;
+    } else while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
         .BADF, .NOTTY => return error.NotATerminal,
@@ -2878,6 +2888,8 @@ test "cloneEnvironMap copies installed raw environment state" {
 }
 
 test "libc environment lookups follow a host that grows the environment" {
+    // `setenv` and `unsetenv` are POSIX; the Windows C runtime has neither.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !builtin.link_libc) return error.SkipZigTest;
     const libc = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

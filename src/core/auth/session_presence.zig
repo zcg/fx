@@ -214,10 +214,18 @@ test "missing native profile root is unavailable" {
     );
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+/// POSIX only, and named inside the test that uses it so a Windows build never
+/// asks the linker for it.
+/// POSIX only. A Windows build gets a stub that reports failure, so the test
+/// that asks for a FIFO skips instead of asking the linker for the symbol.
+const posix_symbols = @import("../shared/posix_symbols.zig");
+
+const mkfifo = posix_symbols.mkfifo;
 
 test "a private sign-in file is present, and a fifo in its place is unavailable without blocking" {
-    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
+    // The test puts a FIFO where a file belongs, and `mkfifo` is POSIX.
+    if (comptime @import("builtin").target.os.tag == .windows or
+        @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

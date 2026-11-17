@@ -35,6 +35,7 @@
 //! - `tests/tla/session_manager/rollout/pr-1116/PR1116Terminal.tla`: hosted terminal state
 
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
@@ -10901,9 +10902,7 @@ fn legacyFence(a: Allocator, id: []const u8) ![]const u8 {
 test "a FIFO in a v1 session never blocks the listing or its conversion, which refuses it and keeps v1 (D68)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
-    const C = struct {
-        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
-    };
+
     for ([_][]const u8{ "events.jsonl", "session.json", "permissions.json" }) |name| {
         var t: TestHome = undefined;
         try t.init();
@@ -10914,7 +10913,7 @@ test "a FIFO in a v1 session never blocks the listing or its conversion, which r
         const rel = try v1.sessionPath(ids[1], name);
         try t.tmp.dir.deleteFile(io, rel);
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        if (C.mkfifo(try std.mem.printSentinel(&buf, "{s}/{s}", .{ t.home, rel }, 0), 0o600) != 0) return error.SkipZigTest;
+        if (posix_symbols.mkfifo(try std.mem.printSentinel(&buf, "{s}/{s}", .{ t.home, rel }, 0), 0o600) != 0) return error.SkipZigTest;
         // A blocking open of the FIFO would wait for a writer that never comes.
         var cancel = std.atomic.Value(bool).init(false);
         var list = try listSummaries(&t.store, alloc, null, &cancel);

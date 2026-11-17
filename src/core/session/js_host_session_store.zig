@@ -1,5 +1,6 @@
 const std = @import("std");
 const session_codec = @import("session_codec.zig");
+const host_link = @import("../hosts/js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -31,7 +32,7 @@ pub const Metadata = struct {
     }
 };
 
-extern "fx" fn fx_session_load(
+const fx_session_load = host_link.declare("fx_session_load", *const fn (
     id_ptr: [*]const u8,
     id_len: usize,
     bytes_ptr: [*]u8,
@@ -39,9 +40,28 @@ extern "fx" fn fx_session_load(
     revision_ptr: [*]u8,
     revision_cap: usize,
     revision_len_out: *usize,
-) i32;
+) callconv(.c) i32, fx_session_load_unlinked);
 
-extern "fx" fn fx_session_commit(
+fn fx_session_load_unlinked(
+    id_ptr: [*]const u8,
+    id_len: usize,
+    bytes_ptr: [*]u8,
+    bytes_cap: usize,
+    revision_ptr: [*]u8,
+    revision_cap: usize,
+    revision_len_out: *usize,
+) callconv(.c) i32 {
+    _ = id_ptr;
+    _ = id_len;
+    _ = bytes_ptr;
+    _ = bytes_cap;
+    _ = revision_ptr;
+    _ = revision_cap;
+    _ = revision_len_out;
+    unreachable;
+}
+
+const fx_session_commit = host_link.declare("fx_session_commit", *const fn (
     id_ptr: [*]const u8,
     id_len: usize,
     bytes_ptr: [*]const u8,
@@ -51,17 +71,58 @@ extern "fx" fn fx_session_commit(
     revision_ptr: [*]u8,
     revision_cap: usize,
     revision_len_out: *usize,
-) i32;
+) callconv(.c) i32, fx_session_commit_unlinked);
 
-extern "fx" fn fx_session_list(
-    response_ptr: [*]u8,
-    response_cap: usize,
-) i32;
-
-extern "fx" fn fx_session_remove(
+fn fx_session_commit_unlinked(
     id_ptr: [*]const u8,
     id_len: usize,
-) i32;
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
+    expected_revision_ptr: [*]const u8,
+    expected_revision_len: usize,
+    revision_ptr: [*]u8,
+    revision_cap: usize,
+    revision_len_out: *usize,
+) callconv(.c) i32 {
+    _ = id_ptr;
+    _ = id_len;
+    _ = bytes_ptr;
+    _ = bytes_len;
+    _ = expected_revision_ptr;
+    _ = expected_revision_len;
+    _ = revision_ptr;
+    _ = revision_cap;
+    _ = revision_len_out;
+    unreachable;
+}
+
+const fx_session_list = host_link.declare("fx_session_list", *const fn (
+    response_ptr: [*]u8,
+    response_cap: usize,
+) callconv(.c) i32, fx_session_list_unlinked);
+
+fn fx_session_list_unlinked(
+    response_ptr: [*]u8,
+    response_cap: usize,
+) callconv(.c) i32 {
+    _ = response_ptr;
+    _ = response_cap;
+    unreachable;
+}
+
+const fx_session_remove = host_link.declare("fx_session_remove", *const fn (
+    id_ptr: [*]const u8,
+    id_len: usize,
+) callconv(.c) i32, fx_session_remove_unlinked);
+
+fn fx_session_remove_unlinked(
+    id_ptr: [*]const u8,
+    id_len: usize,
+) callconv(.c) i32 {
+    _ = id_ptr;
+    _ = id_len;
+    unreachable;
+}
 
 pub fn load(alloc: Allocator, id: []const u8) !?Loaded {
     var encoded_capacity = initial_session_bytes;

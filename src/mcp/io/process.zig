@@ -1306,6 +1306,8 @@ test "the helper hears each server group that starts and each one that is reaped
 }
 
 test "once the program is gone, the helper kills a server that ignores SIGTERM and closed stdin, after 2 s" {
+    // The helper's stdin is closed with `std.c.close`, which is POSIX.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     // It ignores both, and so does its sleep.
     const argv = shell("trap '' TERM; echo ready >&2; exec 0</dev/null; while :; do sleep 1; done");
     var p: Process = undefined;

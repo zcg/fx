@@ -28,6 +28,7 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -6613,10 +6614,16 @@ fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, w
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     errdefer alloc.free(home);
-    // fx keeps `.fx` private, and resuming a session verifies that.
-    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ home, ".fx" });
-    defer alloc.free(fx_dir);
-    if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
+    // fx keeps `.fx` private, and resuming a session verifies that. A Windows
+    // file has an inherited ACL rather than a mode, so the narrowing is a POSIX
+    // step and the private-mode check that follows it passes there by itself.
+    {
+        const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ home, ".fx" });
+        defer alloc.free(fx_dir);
+        // A Windows file carries an inherited ACL instead of a mode, and the
+        // shared helper answers that case as an already-private folder.
+        if (posix_symbols.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
+    }
     return .{ .home = home, .workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace") };
 }
 

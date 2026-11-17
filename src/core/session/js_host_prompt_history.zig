@@ -1,33 +1,77 @@
 const std = @import("std");
 const prompt_history_provider = @import("prompt_history_provider.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const host_link = @import("../hosts/js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 const initial_capacity: usize = 4 * 1024;
 const max_response_bytes: usize = 1024 * 1024;
 
-extern "fx" fn fx_prompt_history_available() i32;
+const fx_prompt_history_available = host_link.declare("fx_prompt_history_available", *const fn () callconv(.c) i32, fx_prompt_history_available_unlinked);
 
-extern "fx" fn fx_prompt_history_load(
+fn fx_prompt_history_available_unlinked() callconv(.c) i32 {
+    unreachable;
+}
+
+const fx_prompt_history_load = host_link.declare("fx_prompt_history_load", *const fn (
     workspace_ptr: [*]const u8,
     workspace_len: usize,
     limit: usize,
     out_ptr: [*]u8,
     out_cap: usize,
-) i32;
+) callconv(.c) i32, fx_prompt_history_load_unlinked);
 
-extern "fx" fn fx_prompt_history_append(
+fn fx_prompt_history_load_unlinked(
+    workspace_ptr: [*]const u8,
+    workspace_len: usize,
+    limit: usize,
+    out_ptr: [*]u8,
+    out_cap: usize,
+) callconv(.c) i32 {
+    _ = workspace_ptr;
+    _ = workspace_len;
+    _ = limit;
+    _ = out_ptr;
+    _ = out_cap;
+    unreachable;
+}
+
+const fx_prompt_history_append = host_link.declare("fx_prompt_history_append", *const fn (
     timestamp_ms: i64,
     workspace_ptr: [*]const u8,
     workspace_len: usize,
     text_ptr: [*]const u8,
     text_len: usize,
-) i32;
+) callconv(.c) i32, fx_prompt_history_append_unlinked);
 
-extern "fx" fn fx_prompt_history_clear(
+fn fx_prompt_history_append_unlinked(
+    timestamp_ms: i64,
     workspace_ptr: [*]const u8,
     workspace_len: usize,
-) i32;
+    text_ptr: [*]const u8,
+    text_len: usize,
+) callconv(.c) i32 {
+    _ = timestamp_ms;
+    _ = workspace_ptr;
+    _ = workspace_len;
+    _ = text_ptr;
+    _ = text_len;
+    unreachable;
+}
+
+const fx_prompt_history_clear = host_link.declare("fx_prompt_history_clear", *const fn (
+    workspace_ptr: [*]const u8,
+    workspace_len: usize,
+) callconv(.c) i32, fx_prompt_history_clear_unlinked);
+
+fn fx_prompt_history_clear_unlinked(
+    workspace_ptr: [*]const u8,
+    workspace_len: usize,
+) callconv(.c) i32 {
+    _ = workspace_ptr;
+    _ = workspace_len;
+    unreachable;
+}
 
 pub fn available() bool {
     return fx_prompt_history_available() == 1;

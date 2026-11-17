@@ -759,11 +759,15 @@ fn closedByServer(kept: *std.http.Client.Connection) bool {
         };
     }
     // POSIX answers with poll. Windows has no such call in Zig 0.17, so the
-    // Windows arm above asks the socket directly; the poll below is never
-    // compiled there.
-    if (comptime builtin.target.os.tag == .windows) unreachable;
-    var ready = [_]std.posix.pollfd{.{ .fd = socket, .events = std.posix.POLL.IN, .revents = 0 }};
-    return (std.posix.poll(&ready, 0) catch return true) > 0;
+    // Windows arm above asks the socket directly. The POSIX body names
+    // `std.posix.pollfd` and `std.posix.POLL`, so it is a branch the Windows
+    // build drops rather than one it merely never reaches.
+    if (comptime builtin.target.os.tag == .windows) {
+        return true;
+    } else {
+        var ready = [_]std.posix.pollfd{.{ .fd = socket, .events = std.posix.POLL.IN, .revents = 0 }};
+        return (std.posix.poll(&ready, 0) catch return true) > 0;
+    }
 }
 
 /// A Content-Type naming JSON, with any parameters such as `charset`.
