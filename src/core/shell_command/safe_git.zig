@@ -95,7 +95,7 @@ pub fn prepareWith(arena: Allocator, cwd: []const u8, checks: CheckRunner) Check
     for (filters.names) |name| {
         if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) return refuse(.unsupported_filter_name, cwd);
     }
-    const executable = trustedExecutable() orelse return refuse(.git_missing, cwd);
+    const executable = (try trustedExecutable(arena)) orelse return refuse(.git_missing, cwd);
     switch (try versionCheck(arena, executable, checks)) {
         .supported => {},
         .too_old => return refuse(.git_too_old, cwd),
@@ -173,20 +173,30 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
 
 /// The first git found at a fixed system location. git from PATH is never
 /// used, because PATH can include directories a repository controls.
-fn trustedExecutable() ?[]const u8 {
-    const candidates = switch (builtin.target.os.tag) {
-        .windows => &[_][]const u8{
-            "C:\\Program Files\\Git\\cmd\\git.exe",
-            "C:\\Program Files\\Git\\bin\\git.exe",
-        },
-        else => &[_][]const u8{
-            "/usr/bin/git",
-            "/bin/git",
-            "/usr/local/bin/git",
-            "/opt/homebrew/bin/git",
-            "/opt/local/bin/git",
-            "/run/current-system/sw/bin/git",
-        },
+/// Finds git where fx trusts it to run.
+///
+/// POSIX looks in the fixed system directories only, so a program the
+/// repository or the user's PATH put in front of the real one is never run.
+/// Windows has no fixed set of directories to prefer: an installed program is
+/// found on PATH, which is what every installer and package manager writes,
+/// so that is where fx looks. The safety fx needs there is kept a different
+/// way: `appendCommand` still turns off every program this repository's own
+/// config could name, so a git found on PATH runs without the repository's
+/// hooks, filters, fsmonitor, pager, or signature verifier.
+fn trustedExecutable(arena: Allocator) Allocator.Error!?[]const u8 {
+    if (comptime builtin.target.os.tag == .windows) {
+        const windows_shell = @import("../shared/windows_shell.zig");
+        // `findProgram` walks PATH honoring PATHEXT, so `git` resolves to the
+        // `git.exe` an installer or package manager put there.
+        return windows_shell.findProgram(arena, "git");
+    }
+    const candidates = [_][]const u8{
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+        "/opt/local/bin/git",
+        "/run/current-system/sw/bin/git",
     };
     for (candidates) |candidate| {
         const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), candidate, .{ .follow_symlinks = true }) catch continue;
@@ -338,7 +348,7 @@ test "a git check that times out ends safe git's preparation with no decision" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const cwd = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    if (trustedExecutable() == null) return error.SkipZigTest;
+    if (try trustedExecutable(arena) == null) return error.SkipZigTest;
 
     const io = io_mod.getIo();
     version_lock.lockUncancelable(io);
@@ -380,7 +390,7 @@ const SentinelRepo = struct {
     };
 
     fn init(arena: Allocator, dir: std.Io.Dir) !SentinelRepo {
-        const git = trustedExecutable() orelse return error.SkipZigTest;
+        const git = (try trustedExecutable(arena)) orelse return error.SkipZigTest;
         if (try versionCheck(arena, git, unbounded_checks) != .supported) return error.SkipZigTest;
         const root = try io_mod.dirRealpathAlloc(arena, dir, ".");
         const self: SentinelRepo = .{

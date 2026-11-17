@@ -412,6 +412,35 @@ fn existingFile(alloc: Allocator, path: []const u8) !?[]u8 {
     return try alloc.dupe(u8, path);
 }
 
+/// Looks a bare executable name up on PATH, honoring PATHEXT.
+///
+/// Windows stores a program under an extension from `PATHEXT`, so `git` on
+/// the path is the file `git.exe`, `git.cmd`, `git.bat`, or `git.com`. Asking
+/// for the bare name would report a program that is installed as missing.
+/// A user's `PATHEXT` may add more; these cover the ones a program is
+/// installed under, in the order `cmd` looks for them.
+pub const program_extensions = [_][]const u8{ ".exe", ".cmd", ".bat", ".com" };
+
+/// Finds `name` as a program on PATH, returned as an owned absolute path, or
+/// null when no directory on PATH holds it.
+pub fn findProgram(alloc: Allocator, name: []const u8) !?[]u8 {
+    const path = envVar(alloc, "PATH") orelse return null;
+    defer alloc.free(path);
+    var it = std.mem.splitScalar(u8, path, ';');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const bare = try std.Io.Dir.path.join(alloc, &.{ dir, name });
+        defer alloc.free(bare);
+        if (try existingFile(alloc, bare)) |found| return found;
+        for (program_extensions) |extension| {
+            const with_extension = try std.mem.concat(alloc, u8, &.{ bare, extension });
+            defer alloc.free(with_extension);
+            if (try existingFile(alloc, with_extension)) |found| return found;
+        }
+    }
+    return null;
+}
+
 /// Whether `path` names a file a shell can be started from. A `shell` setting
 /// that holds a path is used as written, so this is the only check it gets.
 pub fn existingShell(path: []const u8) bool {
