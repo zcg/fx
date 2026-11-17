@@ -126,6 +126,7 @@ pub fn parseArgs(
 const Writable = enum {
     auto_compact_percent,
     auto_upgrade,
+    cache_warming,
     collapse_tool_calls,
     context,
     effort,
@@ -168,6 +169,14 @@ pub const WriteProblem = union(enum) {
 /// fails for a key `fx config` doesn't change or a value the key can't take.
 pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSetting, InvalidConfigValue }!Change {
     const key = options.key.?;
+    if (config_runtime.tool_placement.toolOfKey(key)) |tool| {
+        if (options.action == .unset) return .{ .patch = .{ .remove = key }, .value = null };
+        const placement = config_runtime.tool_placement.Placement.parse(options.value.?) orelse return invalid(problem, "toolbox or direct");
+        return .{
+            .patch = .{ .tool_placement = .{ .tool = @tagName(tool), .placement = @tagName(placement) } },
+            .value = .{ .string = @tagName(placement) },
+        };
+    }
     const writable = std.meta.stringToEnum(Writable, key) orelse {
         problem.* = .{ .refused = ownerHint(key) };
         return error.RefusedConfigSetting;
@@ -230,6 +239,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
     const enabled = parseSwitch(raw) orelse return invalid(problem, "true or false");
     switch (writable) {
         .auto_upgrade => patch.auto_upgrade = enabled,
+        .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
         .fast_mode => patch.fast_mode = enabled,
@@ -270,7 +280,7 @@ fn wordsProblem(problem: *?[]const u8, text: []const u8) error{InvalidConfigArgs
 
 /// Whether `fx config set` and `unset` change `key`.
 pub fn settable(key: []const u8) bool {
-    return std.meta.stringToEnum(Writable, key) != null;
+    return std.meta.stringToEnum(Writable, key) != null or config_runtime.tool_placement.toolOfKey(key) != null;
 }
 
 /// What to use instead of `fx config` for a setting it doesn't change.
@@ -292,6 +302,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
+        .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
     };
     for (hints) |entry| {
         for (entry.keys) |name| {
@@ -470,7 +481,7 @@ const files_only_keys = [_][]const u8{
     "enableAllProjectMcpServers", "enabledMcpjsonServers",  "fast_mode_model_bound",
     "grok_model",                 "model",                  "models",
     "permission",                 "providers",              "skill_symlink_authorities",
-    "workspaces",                 "yolo_acknowledged",
+    "tool_placement",             "workspaces",             "yolo_acknowledged",
 };
 
 /// The value a run uses for `key`, read from a state that
@@ -521,6 +532,9 @@ pub fn effectiveValue(
     }
     if (eql(u8, key, "ultrafast_mode")) return boolean(state.ultrafast_mode);
     if (eql(u8, key, "update_channel")) return string(state.update_channel.label());
+    if (config_runtime.tool_placement.toolOfKey(key)) |tool| {
+        return string(@tagName(config_runtime.tool_placement.placementOf(state.tool_placement, tool)));
+    }
     return .unresolved;
 }
 
@@ -560,7 +574,7 @@ pub fn effectiveEntries(
             .value => |value| try out.append(arena, labeled(set, entry.key, value)),
         }
     }
-    for (resolved_keys) |key| {
+    for (resolved_keys ++ config_runtime.tool_placement.setting_keys) |key| {
         if (seen.contains(key)) continue;
         switch (try effectiveValue(arena, state, provider, key)) {
             .value => |value| try out.append(arena, .{ .key = key, .value = value, .origin = .default }),

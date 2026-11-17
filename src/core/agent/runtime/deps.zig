@@ -8,6 +8,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -179,6 +180,19 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+/// A refreshed login for the request that asked for it. Every field is
+/// allocated with the allocator the hook was given, and the caller owns it;
+/// the caller zeroes `token` when it frees it.
+pub const RefreshedGatewayCredential = struct {
+    token: []u8,
+    /// The Vercel team the refreshed login sends. Null keeps the request's
+    /// team, which is what a host that refuses a team change during a request
+    /// returns.
+    gateway_team: ?[]u8 = null,
+    /// That team's slug, which fx shows the user.
+    gateway_team_label: ?[]u8 = null,
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
@@ -189,6 +203,13 @@ pub const AgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    /// True where a turn's images are files the user named by path, as in the
+    /// TUI and `fx ask`. The rules of each image's folder then reach the model
+    /// the way a tool call's do: a note on the turn's own message, so the
+    /// instructions stay as they were cached. Hosts whose images carry no
+    /// workspace path leave it false. Other attached files reach the model the
+    /// same way through the prompt's `attached_files`.
+    image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
@@ -203,6 +224,17 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
+    /// Whether turn `turn_id`, which ends interrupted, ends because the user
+    /// cancelled it rather than because steering ended it. Asked before the
+    /// turn is reported, since a prompt typed once it is reported can join
+    /// its ending as steering. Hosts without steering leave it unset.
+    turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
+    /// Stops the commands that steering moved to the background during turn
+    /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
+    /// Called once the turn is reported, so a command that ignores SIGTERM
+    /// and takes seconds to stop does not hold the turn's end. Hosts without
+    /// steering leave it unset.
+    stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
@@ -211,7 +243,6 @@ pub const AgentRuntimeDeps = struct {
     /// advertise. A returned definition is advertised before admission, so
     /// the call runs under the normal MCP validation and permission path.
     resolve_unselected_mcp_tool: ?*const fn (ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?@import("../../tooling/tool_mcp_runtime.zig").SelectedTool = null,
-    prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.
@@ -271,6 +302,11 @@ pub const AgentRuntimeDeps = struct {
     /// Source-limit notices use a session-scoped deduplicating path when the
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
+    /// A notice the person should see once in a live session, however many
+    /// turns repeat its cause. The host shows it where they read the
+    /// transcript and drops a text it has already shown. Null: the host has
+    /// no session to remember it in, and the notice is not shown.
+    push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
@@ -281,16 +317,20 @@ pub const AgentRuntimeDeps = struct {
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
-    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
+    /// `rejected_token` is the access token the provider just answered 401
+    /// for, with `.force`; see `auth_runtime.refreshCredentialForAccount`.
+    refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) anyerror!?RefreshedGatewayCredential = null,
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
-    /// Reports that the model catalog is known to be failed or unreachable, so
-    /// capability drops are provenance-attributed instead of silent. Null means
-    /// the host cannot tell, and capability drops stay quiet.
-    model_catalog_unavailable: ?*const fn (ctx: *anyopaque) bool = null,
+    /// The failure that keeps the model catalog down, so capability drops are
+    /// provenance-attributed instead of silent and the notice can name the
+    /// cause. Returns null while the catalog loads, after it loaded, or when a
+    /// failed refresh kept an earlier copy. A null callback means the host
+    /// cannot tell, and capability drops stay quiet.
+    model_catalog_failure: ?*const fn (ctx: *anyopaque) ?model_catalog.FailureCategory = null,
     format_tool_execution_error: *const fn (ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) anyerror![]const u8,
     record_tool_call_rejected: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     /// Records a call that reached the tool's own preflight/content checks and

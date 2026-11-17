@@ -1,0 +1,433 @@
+diff --git a/src/core/config/settings_store.zig b/src/core/config/settings_store.zig
+index b6c1cc17e..71a168fc5 100644
+--- a/src/core/config/settings_store.zig
++++ b/src/core/config/settings_store.zig
+@@ -5,14 +5,17 @@ const mem_utils = @import("../shared/mem_utils.zig");
+ const profile_paths = @import("../shared/profile_paths.zig");
+ const types = @import("../shared/types.zig");
+ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
++const agent_steps = @import("agent_steps.zig");
+ const compactor = @import("../compactor/compactor.zig");
+ const context_limits = @import("context_limits.zig");
+ const project_config = @import("../mcp/project_config.zig");
+ const model_provider = @import("model_provider.zig");
++const configured_provider = @import("configured_provider.zig");
+ const workspace_access = @import("../workspace/workspace_access.zig");
+ const sort_utils = @import("../shared/sort_utils.zig");
+ const update_target = @import("../upgrade/update_target.zig");
+ const settings_keys = @import("settings_keys.zig");
++const session_store_paths = @import("../session/session_store_paths.zig");
+ const theme_mod = @import("../shared/theme.zig");
+ 
+ const Allocator = std.mem.Allocator;
+@@ -121,6 +124,7 @@ pub const UserSettingsPatch = struct {
+     auto_upgrade: ?bool = null,
+     max_agent_steps: ?u32 = null,
+     max_tool_result_bytes: ?u32 = null,
++    subagent_max_children: ?u32 = null,
+     auto_compact_percent: ?u8 = null,
+     provider_strict: ?bool = null,
+     context: ?bool = null,
+@@ -128,6 +132,14 @@ pub const UserSettingsPatch = struct {
+     /// so it falls back to its default. Distinct from the fields above, where
+     /// null means "leave unchanged".
+     remove: ?[]const u8 = null,
++    /// Saves a named connection and its API key under `providers`.
++    provider_definition: ?ConfiguredProviderPatch = null,
++    /// On Windows, the shell commands run in: pwsh, bash, or cmd. Written once
++    /// from the first detection so later runs read it instead of probing.
++    shell: ?[]const u8 = null,
++    /// Removes a named connection and, with it, any stored key. Distinct from a
++    /// null `provider_definition`, which means "leave unchanged".
++    remove_provider: ?[]const u8 = null,
+ 
+     fn isEmpty(self: UserSettingsPatch) bool {
+         return self.model_preference == null and
+@@ -153,13 +165,26 @@ pub const UserSettingsPatch = struct {
+             self.auto_upgrade == null and
+             self.max_agent_steps == null and
+             self.max_tool_result_bytes == null and
++            self.subagent_max_children == null and
+             self.auto_compact_percent == null and
+             self.provider_strict == null and
+             self.context == null and
+-            self.remove == null;
++            self.remove == null and
++            self.provider_definition == null and
++            self.remove_provider == null and
++            self.shell == null;
+     }
+ };
+ 
++/// One named connection and key saved under `providers`.
++pub const ConfiguredProviderPatch = struct {
++    name: []const u8,
++    previous_name: ?[]const u8 = null,
++    protocol: []const u8,
++    base_url: []const u8,
++    key: []const u8,
++};
++
+ pub const ModelPreferencePatch = struct {
+     provider: model_provider.ProviderId,
+     model: []const u8,
+@@ -418,22 +443,24 @@ pub const Store = struct {
+         errdefer durable_home.close(zio);
+ 
+         if (mode == .writable) {
+-            durable_home.setPermissions(zio, std.Io.File.Permissions.fromMode(0o700)) catch {
++            io_mod.setPermissions(durable_home, io_mod.permissionsForMode(0o700)) catch {
+                 return error.PrivateStatePermissionsUnsupported;
+             };
+         }
+         const stat = try durable_home.stat(zio);
+         if (stat.kind != .directory) return error.DurablePathUnsafe;
+-        var durable_mode = stat.permissions.toMode() & 0o777;
+-        if (mode == .writable and durable_mode != 0o700) {
+-            return error.PrivateStatePermissionsUnsupported;
++        var durable_mode: u32 = if (comptime io_mod.modeIsEnforced) stat.permissions.toMode() & 0o777 else 0;
++        if (comptime io_mod.modeIsEnforced) {
++            if (mode == .writable and durable_mode != 0o700) {
++                return error.PrivateStatePermissionsUnsupported;
++            }
+         }
+         var tightened_home = false;
+         if (mode == .read_only and tighten and durableModeWritableByGroupOrOther(durable_mode)) {
+-            durable_home.setPermissions(zio, std.Io.File.Permissions.fromMode(withoutGroupOrOtherWrite(durable_mode))) catch {
++            io_mod.setPermissions(durable_home, io_mod.permissionsForMode(withoutGroupOrOtherWrite(durable_mode))) catch {
+                 return error.PrivateStatePermissionsUnsupported;
+             };
+-            durable_mode = (try durable_home.stat(zio)).permissions.toMode() & 0o777;
++            durable_mode = if (comptime io_mod.modeIsEnforced) (try durable_home.stat(zio)).permissions.toMode() & 0o777 else 0;
+             tightened_home = true;
+         }
+         if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
+@@ -792,20 +819,22 @@ pub const Store = struct {
+         const stat = try file.stat(zio);
+         try io_mod.verifyOpenedRegularFile(stat, open_mode);
+         if (self.mode == .writable) {
+-            file.setPermissions(zio, std.Io.File.Permissions.fromMode(0o600)) catch {
++            io_mod.setPermissions(file, io_mod.permissionsForMode(0o600)) catch {
+                 return error.PrivateStatePermissionsUnsupported;
+             };
+         }
+         const verified_stat = if (self.mode == .writable) try file.stat(zio) else stat;
+-        var primary_mode = verified_stat.permissions.toMode() & 0o777;
+-        if (self.mode == .writable and primary_mode != 0o600) {
+-            return error.PrivateStatePermissionsUnsupported;
++        var primary_mode: u32 = if (comptime io_mod.modeIsEnforced) verified_stat.permissions.toMode() & 0o777 else 0;
++        if (comptime io_mod.modeIsEnforced) {
++            if (self.mode == .writable and primary_mode != 0o600) {
++                return error.PrivateStatePermissionsUnsupported;
++            }
+         }
+         if (self.mode == .read_only and self.tighten_loose_modes and durableModeWritableByGroupOrOther(primary_mode)) {
+-            file.setPermissions(zio, std.Io.File.Permissions.fromMode(withoutGroupOrOtherWrite(primary_mode))) catch {
++            io_mod.setPermissions(file, io_mod.permissionsForMode(withoutGroupOrOtherWrite(primary_mode))) catch {
+                 return error.PrivateStatePermissionsUnsupported;
+             };
+-            primary_mode = (try file.stat(zio)).permissions.toMode() & 0o777;
++            primary_mode = if (comptime io_mod.modeIsEnforced) (try file.stat(zio)).permissions.toMode() & 0o777 else 0;
+             self.tightened.settings = true;
+         }
+         if (self.mode == .read_only and durableModeWritableByGroupOrOther(primary_mode)) {
+@@ -989,6 +1018,15 @@ pub fn validateProviderSlug(slug: []const u8) bool {
+ 
+ fn validateUserPatch(patch: UserSettingsPatch) !void {
+     if (patch.model_preference) |preference| try validateModel(preference.model);
++    if (patch.provider_definition) |definition| {
++        // `putConfiguredProvider` validates the same fields at write time;
++        // validating here keeps a bad patch from reaching the write at all.
++        if (definition.name.len == 0 or definition.name.len > 64) return error.InvalidProviderName;
++        for (definition.name) |byte| {
++            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidProviderName;
++        }
++        if (definition.protocol.len == 0 or definition.base_url.len == 0) return error.InvalidProviderDefinition;
++    }
+     if (patch.theme) |theme| {
+         if (theme_mod.classifyValue(theme)) |choice| switch (choice) {
+             .pin_light, .pin_dark => {},
+@@ -998,6 +1036,11 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
+     if (patch.max_tool_result_bytes) |bytes| {
+         if (bytes < tool_result_limits.min_configured_tool_result_bytes) return error.InvalidSettingsFormat;
+     }
++    if (patch.subagent_max_children) |children| {
++        if (children < agent_steps.min_subagent_max_children or children > agent_steps.max_subagent_max_children) {
++            return error.InvalidSettingsFormat;
++        }
++    }
+     if (patch.auto_compact_percent) |percent| {
+         if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
+     }
+@@ -1240,6 +1283,15 @@ fn applyUserPatchToRoot(
+     if (patch.model_preference) |preference| {
+         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
+     }
++    if (patch.provider_definition) |definition| {
++        application.changed = try putConfiguredProvider(arena, &root.object, definition) or application.changed;
++    }
++    if (patch.remove_provider) |name| {
++        application.changed = removeConfiguredProvider(&root.object, name) or application.changed;
++    }
++    if (patch.shell) |value| {
++        application.changed = try putString(arena, &root.object, "shell", value) or application.changed;
++    }
+     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
+     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", value.label()) or application.changed;
+     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
+@@ -1298,6 +1350,7 @@ fn applyUserPatchToRoot(
+     if (patch.auto_upgrade) |value| application.changed = try putBool(arena, &root.object, "auto_upgrade", value) or application.changed;
+     if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
+     if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
++    if (patch.subagent_max_children) |value| application.changed = try putInteger(arena, &root.object, "subagent_max_children", value) or application.changed;
+     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
+     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
+     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
+@@ -1473,12 +1526,13 @@ fn cleanupLegacyWorkspacePreferences(
+ 
+ /// The settings paths a patch from `fx config set` or `unset` writes that the
+ /// `/settings` cleanup above doesn't already cover.
+-fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
++fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
+     return .{
+         if (patch.theme != null) "theme" else null,
+         if (patch.auto_upgrade != null) "auto_upgrade" else null,
+         if (patch.max_agent_steps != null) "max_agent_steps" else null,
+         if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
++        if (patch.subagent_max_children != null) "subagent_max_children" else null,
+         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
+         if (patch.provider_strict != null) "provider_strict" else null,
+         if (patch.context != null) "context" else null,
+@@ -1711,9 +1765,10 @@ fn appendUniqueWorkspaceIdentity(
+ fn removeWorkspaceIfEmpty(root: *std.json.Value, workspace_root: []const u8) void {
+     const workspaces = root.object.getPtr("workspaces") orelse return;
+     if (workspaces.* != .object) return;
+-    const workspace = workspaces.object.get(workspace_root) orelse return;
++    const key = session_store_paths.findWorkspaceKey(workspaces.object, workspace_root) orelse return;
++    const workspace = workspaces.object.get(key) orelse return;
+     if (workspace != .object or workspace.object.count() != 0) return;
+-    _ = workspaces.object.orderedRemove(workspace_root);
++    _ = workspaces.object.orderedRemove(key);
+     if (workspaces.object.count() == 0) _ = root.object.orderedRemove("workspaces");
+ }
+ 
+@@ -1735,7 +1790,7 @@ fn applyProjectMcpMutationToRoot(
+     mutation: ProjectMcpMutation,
+ ) !PatchApplication {
+     const existing_workspace = if (root.object.get("workspaces")) |workspaces|
+-        if (workspaces == .object) workspaces.object.get(mutation.workspace_root) else null
++        if (workspaces == .object) session_store_paths.workspaceOverride(workspaces.object, mutation.workspace_root) else null
+     else
+         null;
+     var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+@@ -1794,11 +1849,13 @@ fn workspaceObject(
+         try root.object.put(arena, "workspaces", .{ .object = .empty });
+         break :blk root.object.getPtr("workspaces").?;
+     };
+-    const workspace = if (workspaces.object.getPtr(workspace_root)) |value| blk: {
++    const normalized_root = session_store_paths.normalizeWorkspaceRoot(workspace_root);
++    const workspace = if (session_store_paths.findWorkspaceKey(workspaces.object, normalized_root)) |existing_key| blk: {
++        const value = workspaces.object.getPtr(existing_key).?;
+         if (value.* != .object) return error.InvalidSettingsFormat;
+         break :blk value;
+     } else blk: {
+-        const owned_root = try arena.dupe(u8, workspace_root);
++        const owned_root = try arena.dupe(u8, normalized_root);
+         try workspaces.object.put(arena, owned_root, .{ .object = .empty });
+         break :blk workspaces.object.getPtr(owned_root).?;
+     };
+@@ -1889,6 +1946,104 @@ fn renamedGroup(
+     return &root.getPtr(current).?.object;
+ }
+ 
++/// Saves one named connection under `providers`, creating the object when the
++/// settings have none. An existing connection of the same name is replaced
++/// whole: a half-edited definition is worse than a retyped one.
++fn putConfiguredProvider(
++    arena: Allocator,
++    root: *std.json.ObjectMap,
++    definition: ConfiguredProviderPatch,
++) !bool {
++    if (definition.name.len == 0 or definition.name.len > 64) return error.InvalidProviderName;
++    for (definition.name) |byte| {
++        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidProviderName;
++    }
++    if (definition.protocol.len == 0 or definition.base_url.len == 0) return error.InvalidProviderDefinition;
++    var changed = false;
++    const providers = if (root.getPtr("providers")) |value| blk: {
++        if (value.* != .object) return error.InvalidSettingsFormat;
++        break :blk &value.object;
++    } else blk: {
++        try root.put(arena, "providers", .{ .object = .empty });
++        changed = true;
++        break :blk &root.getPtr("providers").?.object;
++    };
++    const previous_name = definition.previous_name orelse definition.name;
++    const renamed = !std.mem.eql(u8, previous_name, definition.name);
++    if (renamed and providers.contains(definition.name)) return error.DuplicateProvider;
++    var body: std.json.ObjectMap = if (providers.get(previous_name)) |prior|
++        if (prior == .object) prior.object else return error.InvalidSettingsFormat
++    else
++        .empty;
++    try body.put(arena, "protocol", .{ .string = definition.protocol });
++    try body.put(arena, "base_url", .{ .string = definition.base_url });
++    var auth: std.json.ObjectMap = .empty;
++    try auth.put(arena, "type", .{ .string = "bearer" });
++    try auth.put(arena, "key", .{ .string = definition.key });
++    try body.put(arena, "auth", .{ .object = auth });
++    var candidate: std.json.ObjectMap = .empty;
++    try candidate.put(arena, definition.name, .{ .object = body });
++    var validated = try configured_provider.Registry.parse(arena, .{ .object = candidate });
++    validated.deinit(arena);
++    if (renamed) {
++        _ = providers.orderedRemove(previous_name);
++        if (root.getPtr("models")) |models| {
++            if (models.* == .object) if (models.object.fetchOrderedRemove(previous_name)) |prior| {
++                try models.object.put(arena, definition.name, prior.value);
++            };
++        }
++        if (root.getPtr("provider")) |provider| {
++            if (provider.* == .string and std.mem.eql(u8, provider.string, previous_name)) provider.string = definition.name;
++        }
++    }
++    const existing = providers.getPtr(definition.name);
++    if (existing) |prior| {
++        // Replacing whole: the object above is already complete.
++        prior.* = .{ .object = body };
++        return true;
++    }
++    // A newly added connection goes first, and the ones added before it shift
++    // down. The picker lists them in file order, so the connection a user just
++    // set up is the one they see at the top the next time they open it,
++    // instead of somewhere below every vendor they have ever tried.
++    var reordered: std.json.ObjectMap = .empty;
++    try reordered.put(arena, definition.name, .{ .object = body });
++    var prior_entries = providers.iterator();
++    while (prior_entries.next()) |entry| {
++        try reordered.put(arena, entry.key_ptr.*, entry.value_ptr.*);
++    }
++    providers.* = reordered;
++    return true;
++}
++
++/// Removes one named connection. The `providers` object itself is left in place
++/// even when it empties, so a settings file does not lose a section the user may
++/// add to again; the model saved for that connection is removed with it.
++///
++/// A `provider` that names the removed connection is cleared too. Leaving it
++/// behind points the profile at a connection that no longer exists, and the next
++/// start cannot resolve a provider at all.
++fn removeConfiguredProvider(root: *std.json.ObjectMap, name: []const u8) bool {
++    var changed = false;
++    if (root.getPtr("providers")) |value| {
++        if (value.* == .object) {
++            if (value.object.orderedRemove(name)) changed = true;
++        }
++    }
++    if (root.getPtr("models")) |value| {
++        if (value.* == .object) {
++            if (value.object.orderedRemove(name)) changed = true;
++        }
++    }
++    if (root.getPtr("provider")) |value| {
++        if (value.* == .string and std.mem.eql(u8, value.string, name)) {
++            _ = root.orderedRemove("provider");
++            changed = true;
++        }
++    }
++    return changed;
++}
++
+ fn putModelPreference(
+     arena: Allocator,
+     root: *std.json.ObjectMap,
+@@ -2149,7 +2304,7 @@ fn validateCandidate(
+         return error.InvalidSettingsFormat;
+     };
+     if (workspaces != .object) return error.InvalidSettingsFormat;
+-    const workspace = workspaces.object.get(workspace_root) orelse {
++    const workspace = session_store_paths.workspaceOverride(workspaces.object, workspace_root) orelse {
+         if (workspace_may_be_absent) return;
+         return error.InvalidSettingsFormat;
+     };
+@@ -2778,7 +2933,7 @@ test "user patch snapshots and removes legacy workspace copies" {
+     );
+     defer recovery.close(io_mod.getIo());
+     const recovery_stat = try recovery.stat(io_mod.getIo());
+-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), recovery_stat.permissions.toMode() & 0o777);
++    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), recovery_stat.permissions.toMode() & 0o777);
+     const recovered = try io_mod.readFileToEnd(alloc, &recovery, max_settings_bytes + 1);
+     defer alloc.free(recovered);
+     try std.testing.expectEqualStrings(original, recovered);
+@@ -3417,7 +3572,7 @@ test "missing user settings is created through private durable commit" {
+     var outcome = try store.applyUserPatch(alloc, .{ .startup_scrollback = false });
+     defer outcome.deinit(alloc);
+     const stat = try store.primaryStatForTest();
+-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
++    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+ }
+ 
+ test "invalid primary is not replaced by backup or mutation" {
+@@ -3452,7 +3607,7 @@ test "invalid primary is not replaced by backup or mutation" {
+             corrupt_count += 1;
+             try std.testing.expect(parseSequence(entry.name) != null);
+             const stat = try backups.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
+-            try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
++            if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+         }
+     }
+     try std.testing.expectEqual(@as(usize, 1), corrupt_count);
+@@ -3587,7 +3742,7 @@ test "second settings commit creates a sequenced private backup" {
+         backup_count += 1;
+         try std.testing.expect(parseSequence(entry.name) != null);
+         const stat = try backups.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
+-        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
++        if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+     }
+     try std.testing.expectEqual(@as(usize, 1), backup_count);
+ }
+@@ -3655,7 +3810,7 @@ test "read only settings rejects group or world writable policy files" {
+ 
+     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+     defer root_dir.close(io_mod.getIo());
+-    root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o777)) catch return error.SkipZigTest;
++    io_mod.setPermissions(root_dir, io_mod.permissionsForMode(0o777)) catch return error.SkipZigTest;
+ 
+     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+     defer alloc.free(home);
+@@ -3664,9 +3819,9 @@ test "read only settings rejects group or world writable policy files" {
+         Store.initFromHome(alloc, home, .read_only),
+     );
+ 
+-    root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o755)) catch return error.SkipZigTest;
++    io_mod.setPermissions(root_dir, io_mod.permissionsForMode(0o755)) catch return error.SkipZigTest;
+     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
+-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o666)) catch {
++    io_mod.setPermissions(file, io_mod.permissionsForMode(0o666)) catch {
+         file.close(io_mod.getIo());
+         return error.SkipZigTest;
+     };
+@@ -3688,9 +3843,9 @@ test "tightening read-only open removes group and other write access and records
+     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"auto\"}\n");
+     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+     defer root_dir.close(io_mod.getIo());
+-    root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o775)) catch return error.SkipZigTest;
++    io_mod.setPermissions(root_dir, io_mod.permissionsForMode(0o775)) catch return error.SkipZigTest;
+     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
+-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o664)) catch {
++    io_mod.setPermissions(file, io_mod.permissionsForMode(0o664)) catch {
+         file.close(io_mod.getIo());
+         return error.SkipZigTest;
+     };
+@@ -3711,9 +3866,9 @@ test "tightening read-only open removes group and other write access and records
+         try std.testing.expect(store.tightened.home and store.tightened.settings);
+     }
+     const home_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{});
+-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), home_stat.permissions.toMode() & 0o777);
++    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), home_stat.permissions.toMode() & 0o777);
+     const file_stat = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
+-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), file_stat.permissions.toMode() & 0o777);
++    if (comptime io_mod.modeIsEnforced) try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), file_stat.permissions.toMode() & 0o777);
+ 
+     var again = try Store.initFromHomeTighteningReadOnly(alloc, home);
+     defer again.deinit(alloc);

@@ -1,0 +1,14 @@
+diff --git a/src/core/app/app_session_runtime.zig b/src/core/app/app_session_runtime.zig
+index 2cdeb98dc..96348b3c6 100644
+--- a/src/core/app/app_session_runtime.zig
++++ b/src/core/app/app_session_runtime.zig
+@@ -4413,6 +4413,9 @@ pub fn Runtime(comptime App: type) type {
+                 host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
+                 // A subagent's own host can message the subagent's parent.
+                 host.owner_has_parent = agent.role == .subagent;
++                // Only main starts children, and only as many as the profile
++                // allows (`subagent_max_children`).
++                host.setMaxChildren(app.subagent_max_children);
+                 // What a restart left owed reaches this agent now.
+                 host.resumeReports(v2);
+             }

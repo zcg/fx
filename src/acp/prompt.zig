@@ -6,10 +6,13 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
+const token_pass_team = @import("../core/gateway/token_pass_team.zig");
 const js_host_tools = if (host_target.is_wasm)
     @import("../core/hosts/js_host_tools.zig")
 else
@@ -39,12 +42,13 @@ const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
 const catalog_state = @import("../core/mcp/catalog_state.zig");
-const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
+const mcp_tools = @import("../core/mcp/features/tools.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
+const permissions = @import("../core/permissions/permissions.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
@@ -60,6 +64,7 @@ const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_model_contract = @import("../core/subagent/model_contract.zig");
 const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
+const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -258,6 +263,12 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     observer: ?*observation.Observer = null,
+    /// The web host's steering as this turn saw it: open at least once, and
+    /// closed by the turn itself at its finalizing boundary. Steering that
+    /// was open and that the host closed is the user's cancel; a host that
+    /// never opened steering cancels nothing this way.
+    saw_host_steering_open: bool = false,
+    closed_host_steering: bool = false,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -350,15 +361,17 @@ const AcpContext = struct {
     fn sendToolCallPending(self: *AcpContext, arena: Allocator, call: ToolCall) ![]const u8 {
         if (self.published_tool_calls.getKey(call.id)) |published| return published;
         const registry = self.toolRegistry();
-        const mcp_identity = if (registry.lookup(call.name) == null) self.mcpToolIdentity(arena, call.name) else null;
-        if (mcp_identity) |identity| self.rememberToolIdentity(call.name, identity);
-        const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
-        const name = acpToolName(call.name);
+        // A toolbox run shows as the tool it runs.
+        const shown = try tool_call_presentation.shownCall(arena, call);
+        const mcp_identity = if (registry.lookup(shown.name) == null) self.mcpToolIdentity(arena, shown.name) else null;
+        if (mcp_identity) |identity| self.rememberToolIdentity(shown.name, identity);
+        const presentation = tool_call_presentation.describeToolCall(registry, arena, shown, mcp_identity);
+        const name = acpToolName(shown.name);
         const kind = mapToolKind(name);
         const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(
             arena,
-            call.name,
-            call.arguments_json,
+            shown.name,
+            shown.arguments_json,
         );
         defer arena.free(masked_arguments);
         var parsed_arguments: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
@@ -663,11 +676,81 @@ const ResumeRerun = struct {
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
     if (state.host_tools.tools.len == 0) return null;
-    if (comptime host_target.is_wasm) return js_host_tools.provider();
     return .{
         .context = @ptrCast(state),
-        .call_fn = callHostTool,
+        .call_fn = callHostToolWithSchemaTypes,
     };
+}
+
+/// Calls a host tool on this backend with `hostToolArguments`, so both
+/// backends send the same input.
+fn callHostToolWithSchemaTypes(
+    raw_state: *anyopaque,
+    alloc: Allocator,
+    name: []const u8,
+    call_id: []const u8,
+    arguments_json: []const u8,
+    max_result_bytes: usize,
+    cancel_flag: ?*std.atomic.Value(bool),
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const sent = try hostToolArguments(arena_state.allocator(), state.host_tools.dynamic_tools, name, arguments_json);
+    if (comptime host_target.is_wasm) {
+        return js_host_tools.provider().call(alloc, name, call_id, sent, max_result_bytes, cancel_flag);
+    }
+    return callHostTool(raw_state, alloc, name, call_id, sent, max_result_bytes, cancel_flag);
+}
+
+/// The arguments to send host tool `name`. A value the model wrote as JSON
+/// text where the tool's `inputSchema` names another type is sent as that
+/// type, as MCP calls are (`src/core/mcp_host/model.zig`); otherwise the
+/// model's own bytes. Allocated in `arena`.
+fn hostToolArguments(
+    arena: Allocator,
+    tools: []const agent_stream_provider.DynamicFunctionTool,
+    name: []const u8,
+    arguments_json: []const u8,
+) Allocator.Error![]const u8 {
+    const tool = for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) break tool;
+    } else return arguments_json;
+    const schema_json = try std.json.Stringify.valueAlloc(arena, tool.input_schema, .{});
+    const repaired = (try mcp_tools.repairArgumentTypes(arena, schema_json, arguments_json)) orelse return arguments_json;
+    for (repaired.fields) |field| {
+        debug_trace.logf("acp", "host tool argument sent as its schema's type tool={s} field={s} type={t}", .{ name, field.name, field.json_type });
+    }
+    return repaired.arguments_json;
+}
+
+test "host tool arguments are sent as the types the tool's schema names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const schema = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        "{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\"},\"exact\":{\"type\":\"boolean\"},\"tags\":{\"type\":\"array\"},\"label\":{\"type\":\"string\"},\"any\":{}}}",
+        .{},
+    );
+    const tools = [_]agent_stream_provider.DynamicFunctionTool{.{ .name = "count", .description = "", .input_schema = schema }};
+
+    try std.testing.expectEqualStrings(
+        "{\"limit\":40,\"exact\":true,\"tags\":[\"a\"],\"label\":\"40\"}",
+        try hostToolArguments(arena, &tools, "count", "{\"limit\":\"40\",\"exact\":\"true\",\"tags\":\"[\\\"a\\\"]\",\"label\":\"40\"}"),
+    );
+    // Text that is not exactly a value of the field's type, a field with no
+    // single type, a tool with no registered schema, and arguments that are
+    // not an object are sent as the model wrote them.
+    for ([_]struct { tool: []const u8, arguments: []const u8 }{
+        .{ .tool = "count", .arguments = "{\"limit\":\"forty\"}" },
+        .{ .tool = "count", .arguments = "{\"any\":\"40\",\"label\":\"x\"}" },
+        .{ .tool = "missing", .arguments = "{\"limit\":\"40\"}" },
+        .{ .tool = "count", .arguments = "[\"40\"]" },
+    }) |case| {
+        try std.testing.expectEqual(case.arguments.ptr, (try hostToolArguments(arena, &tools, case.tool, case.arguments)).ptr);
+    }
 }
 
 fn callHostTool(
@@ -861,14 +944,58 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
     try out.append(alloc, ')');
 }
 
+/// The sign-in one turn sends, copied when the turn starts: publishing a
+/// refreshed credential frees the server's copy (`server.adoptServerCredential`),
+/// so a turn, report turns included, never borrows it.
+const TurnSignIn = struct {
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+
+    /// The caller owns the result and frees it with `deinit`.
+    fn capture(alloc: Allocator, state: *const server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
+        const api_key = try alloc.dupe(u8, session.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team = if (state.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .api_key = api_key,
+            .credential_source = session.credential_source,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+        };
+    }
+
+    /// The job borrows these copies until `deinit`.
+    fn apply(self: TurnSignIn, job: *worker_runtime.QueuedPrompt) void {
+        job.api_key = self.api_key;
+        job.credential_source = self.credential_source;
+        job.account_id = self.account_id;
+        job.gateway_team = self.gateway_team;
+    }
+
+    fn deinit(self: *TurnSignIn, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.gateway_team) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
+/// `usage_total` gets the usage of every turn the prompt runs, its own and
+/// each report turn after it, as each ends: the response reports the whole
+/// prompt's usage (`publishPromptOutcome` in `server.zig`).
 pub fn handlePrompt(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
+    usage_total: *types.Usage,
 ) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
@@ -957,13 +1084,9 @@ pub fn handlePrompt(
         };
     }
 
-    try refreshProjectContext(
-        state,
-        alloc,
-        prompt_input.targets,
-        prompt_input.omissions,
-        prompt_input.omission_summary,
-    );
+    // The prompt's attached files stay out of the instructions: the runtime
+    // delivers their folders' rules as a note on the turn's own message.
+    try refreshProjectContext(state, alloc);
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -1077,6 +1200,7 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .behind_toolbox = state.toolbox_behind.slice(),
     });
     defer tool_projection.deinit(alloc);
 
@@ -1115,28 +1239,33 @@ pub fn handlePrompt(
         try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
-    const job: worker_runtime.QueuedPrompt = .{
+    var sign_in = try TurnSignIn.capture(alloc, state, session);
+    defer sign_in.deinit(alloc);
+    var job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
         .model = session.model,
-        .api_key = @constCast(session.api_key),
-        .credential_source = session.credential_source,
-        .account_id = if (session.account_id) |account_id| @constCast(account_id) else null,
+        .api_key = &.{},
         .provider = session.provider,
-        .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
         .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
+        .attached_files = .{
+            .targets = prompt_input.targets,
+            .omissions = prompt_input.omissions,
+            .omission_summary = prompt_input.omission_summary,
+        },
         .recovery_checkpoint = recovery_checkpoint,
         // An ACP client keeps what the turn sent before it stopped; an engine
         // in a new process says it holds none of it.
         .recovery_source_already_presented = recovery_checkpoint != null and !prompt_input.fresh_output,
     };
+    sign_in.apply(&job);
 
     // A turn whose completions report no tokens sends no `usage_update`.
     session.context_used.store(0, .release);
@@ -1153,9 +1282,17 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     });
     agent_config.session_child_capability = sessionChildCapability(session);
+    agent_config.toolbox_behind = state.toolbox_behind.slice();
+    // The toolbox menu lists the configured MCP servers, by name. The host's
+    // own tools stay in the tools fx sends: a durable session reruns them by
+    // their name after a crash, which a call through toolbox wouldn't carry.
+    if (comptime !host_target.is_wasm) if (session.mcp_host) |h| {
+        const toolbox_arena = dynamic_tool_arena.allocator();
+        agent_config.toolbox_mcp_servers = try h.catalog.serverNames(toolbox_arena);
+    };
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
-    agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
+    const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
             .kind = .acp,
@@ -1163,7 +1300,12 @@ pub fn handlePrompt(
             .session_id = session.session_id,
         },
         .outcome_allocator = alloc,
-    }, agent_config, job) catch |err| {
+    }, agent_config, job);
+    // The next turn starts the agent's usage over, so this turn's is added to
+    // the prompt's now, however it ended. The agent's own count stays as it
+    // is: a checkpoint saves it.
+    usage_total.add(session.session_rt.agent.turn_usage);
+    first_turn catch |err| {
         if (err == error.TurnYielded) {
             // The journal keeps the turn open for a later resume; nothing
             // ends it here.
@@ -1189,7 +1331,7 @@ pub fn handlePrompt(
         }
     };
     try endJournalTurn(alloc, state.alloc, session);
-    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job)) |outcome| {
+    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
         prompt_input.retainImageSnapshots();
         return outcome;
     }
@@ -1227,10 +1369,17 @@ fn maybeStartAcpTitleTask(
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
-    const title_model = bundle.title_model orelse return;
+    const provider_title_model = bundle.title_model orelse return;
+    // A Token Pass session of a team with Token Pass titles itself with a
+    // Token Pass model.
+    const title_model = if (session.provider == .gateway)
+        token_pass_team.modelForSideCall(.title, session.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    if (session.credential_source != .host_managed and session.api_key.len == 0) return;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
@@ -1240,6 +1389,7 @@ fn maybeStartAcpTitleTask(
         .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .credential_source = session.credential_source,
+        .reads_shared_sign_in = true,
         .stream_provider = agent_stream,
     }) catch return;
     task.spawn() catch |err| {
@@ -1250,14 +1400,16 @@ fn maybeStartAcpTitleTask(
     session.title_task = task;
 }
 
-/// Joins the bounded title task and installs the generated title unless the
-/// session already carries a user-set title. No-op without a pending task.
+/// Gives the title task a short grace after the turn, then installs the
+/// generated title unless the session already carries a user-set title. A
+/// title still pending after the grace is dropped, and the session keeps the
+/// title derived from its first prompt. No-op without a pending task.
 fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState) void {
     _ = state;
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(&session.cancel_flag, session_title_generation.after_turn_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1317,15 +1469,19 @@ pub fn runSubagentChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            // A subagent runs no child of its own, so the schema it is shown
-            // leaves the tool out (authority.max_subagent_depth).
-            .subagent_available = false,
+            // A child starts subagents of its own only when the configured
+            // depth allows a level below its own: the server's host runs one
+            // level of children, so with the default depth 1 the schema a
+            // child is shown leaves the tool out.
+            .subagent_available = state.subagent_max_depth > 1,
+            .behind_toolbox = state.toolbox_behind.slice(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
     return subagent_agent_adapter.run(.{
+        .toolbox_behind = state.toolbox_behind.slice(),
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
@@ -1345,9 +1501,6 @@ pub fn runSubagentChild(
 fn refreshProjectContext(
     state: *server.ServerState,
     alloc: Allocator,
-    targets: []const context_contract.ApplicableTarget,
-    omissions: []const context_contract.ContextOmissionInput,
-    omission_summary: ?context_contract.ContextOmissionSummary,
 ) context_contract.ProviderError!void {
     state.context_snapshot.deinit(alloc);
     if (!state.context_enabled) return;
@@ -1355,9 +1508,6 @@ fn refreshProjectContext(
     state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
-        .targets = targets,
-        .omissions = omissions,
-        .omission_summary = omission_summary,
         .context_limits = state.context_limits,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
@@ -1377,7 +1527,7 @@ fn initialDynamicTools(
     const session = if (ctx.state.active_session) |*active| active else return host_tools;
     const loaded = if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
         arena,
-        session.permission_rules,
+        permissions.mcpRules(ctx.captured_permission_mode orelse session.permission_mode, session.permission_rules),
         ctx.state.context_limits,
         .unrestricted,
         &session.cancel_flag,
@@ -1935,7 +2085,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
         .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -1974,12 +2123,14 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        // The same path: once per session, as a notice where the client shows them.
+        .push_session_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
-        .model_catalog_unavailable = modelCatalogUnavailable,
+        .model_catalog_failure = modelCatalogFailure,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .record_tool_call_failed = recordToolCallFailed,
@@ -2028,7 +2179,10 @@ fn takeSteeringBoundary(
             return .{ .continue_turn = messages };
         }
         if (steered) return .{ .continue_turn = &.{} };
-        if (close_if_empty) js_host_steering.close();
+        if (close_if_empty) {
+            ctx.closed_host_steering = true;
+            js_host_steering.close();
+        }
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
@@ -2064,16 +2218,30 @@ fn takeSteeringBoundary(
     return .{ .continue_turn = messages };
 }
 
+/// The host closes steering when the user cancels the turn, and the
+/// `session/cancel` it also sends waits on stdin until the prompt returns.
+/// Between sends nothing else carries the cancel, so a retry wait would sit
+/// it out. A host that never opened steering never closes it this way.
+fn cancelOnHostSteeringClosed(ctx: *AcpContext) void {
+    if (!ctx.saw_host_steering_open or ctx.closed_host_steering) return;
+    const session = if (ctx.state.active_session) |*active| active else return;
+    if (session.cancel_flag.swap(true, .seq_cst)) return;
+    debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=host_steering_closed", .{});
+}
+
 /// The web core's cooperative pulse while a model reply streams: steering its
 /// host holds interrupts the reply under the same rule as the native kernel's.
 fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (js_host_steering.state()) {
-        .closed => {},
-        .open => |open| if (open.handoff) {
-            server.noteHostSteeringHandoff(ctx.state);
-        } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
-            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+        .closed => cancelOnHostSteeringClosed(ctx),
+        .open => |open| {
+            ctx.saw_host_steering_open = true;
+            if (open.handoff) {
+                server.noteHostSteeringHandoff(ctx.state);
+            } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
+                debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+            }
         },
     }
 }
@@ -2129,15 +2297,20 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw));
-    return server.refreshModelCredential(
+    // The server refuses a team change during a request, so the request
+    // keeps its team.
+    const token = (try server.refreshModelCredential(
         @ptrCast(ctx.state),
         alloc,
         source,
         mode,
         expected_account_id,
-    );
+        rejected_token,
+    )) orelse return null;
+    return .{ .token = token };
 }
 
 /// The prompt's session while it is still the active one.
@@ -2155,9 +2328,9 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     active.context_used.store(std.math.cast(usize, used) orelse std.math.maxInt(usize), .release);
 }
 
-fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+fn modelCatalogFailure(raw_ctx: *anyopaque) ?gateway_model_catalog.FailureCategory {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.state.capability_resolver.state == .failed;
+    return ctx.state.capability_resolver.downFailure();
 }
 
 fn resolveModelCapabilities(
@@ -2168,7 +2341,7 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    return ctx.state.capability_resolver.resolve(
+    return ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
@@ -2183,6 +2356,7 @@ fn resolveModelCapabilities(
         },
         model,
         bundle.fallbackModelCapabilities(model),
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -2198,7 +2372,7 @@ fn resolveModelOverride(
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.state.capability_resolver.resolve(
+    _ = ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         catalog_provider,
         .{
@@ -2213,6 +2387,7 @@ fn resolveModelOverride(
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
+        gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
@@ -2278,6 +2453,9 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
+        // ACP's turns have no id here, so its list is read afresh at each
+        // step; its reports never join a turn, so a change shows at once.
+        .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
     }, arena, messages);
 }
 
@@ -2286,21 +2464,8 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    if (ctx.state.cfg.minimal_kernel) return;
-    const active_session = if (ctx.state.active_session) |*session| session else null;
-    var snapshot = if (active_session) |session|
-        if (session.mcp_host) |h|
-            try h.catalog.modelSnapshot(arena)
-        else
-            try mcp_model_catalog.Snapshot.empty(arena)
-    else
-        try mcp_model_catalog.Snapshot.empty(arena);
-    defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+    // The toolbox menu lists the MCP servers (toolbox_mcp_servers), so there
+    // is no MCP block here.
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -2327,11 +2492,6 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -2926,7 +3086,7 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// shows on the subagent call that sent the work. A turn
 /// started this way is the child's, never the user's, so its root context
 /// stays the user's own request. Returns the prompt's outcome when a turn
-/// ends it early.
+/// ends it early. Each turn's usage is added to `usage_total` when it ends.
 fn runReportTurns(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
@@ -2935,6 +3095,7 @@ fn runReportTurns(
     deps: *const agent_runtime.AgentRuntimeDeps,
     agent_config: agent_runtime.Config,
     base: worker_runtime.QueuedPrompt,
+    usage_total: *types.Usage,
 ) !?TerminalOutcome {
     const tree = state.subagent_host orelse return null;
     while (true) {
@@ -2980,19 +3141,26 @@ fn runReportTurns(
         }
         const history = try session.session_rt.snapshotHistory(alloc);
         defer types.freeHistoryTurnSlice(alloc, history);
+        // The first turn's sign-in may have been refreshed since; send the
+        // current one, as a turn the user starts does.
+        var sign_in = try TurnSignIn.capture(alloc, state, session);
+        defer sign_in.deinit(alloc);
         var job = base;
+        sign_in.apply(&job);
         job.turn_id = 0;
         job.prompt = next.prompt;
         job.author = next.author;
         job.delivery = .continuation;
         job.images = &.{};
         job.authorized_image_catalog = &.{};
+        // The first turn's attachments have delivered their folders' rules.
+        job.attached_files = .{};
         job.history = history;
         job.unversioned_history_count = session.session_rt.unversionedHistoryEnd();
         job.recovery_checkpoint = null;
         job.recovery_source_already_presented = false;
         debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
-        agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
+        const report_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
             .view = state.lifecycle_view,
             .scope = .{
                 .kind = .acp,
@@ -3000,7 +3168,9 @@ fn runReportTurns(
                 .session_id = session.session_id,
             },
             .outcome_allocator = alloc,
-        }, agent_config, job) catch |err| {
+        }, agent_config, job);
+        usage_total.add(session.session_rt.agent.turn_usage);
+        report_turn catch |err| {
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
@@ -5145,19 +5315,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = state.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     state.context_enabled = false;
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
 
@@ -5165,7 +5335,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, alloc, &.{}, &.{}, null),
+        refreshProjectContext(&state, alloc),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
@@ -5186,12 +5356,13 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         error.WriteFailed,
     };
 
+    var usage: types.Usage = .{};
     for (errors) |expected_error| {
         AcpContextRegistryFixture.reset();
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, alloc, &msg, "code", .ask),
+            handlePrompt(&state, alloc, &msg, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(state.active_session.?.pending_prompt_id == null);
@@ -5205,7 +5376,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try refreshProjectContext(&state, alloc);
 
     var ctx = AcpContext{
         .alloc = alloc,
@@ -5232,11 +5403,10 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try deps.append_static_context.?(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", messages.items[1].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("ACP registry transient", messages.items[3].content.?);
+    try std.testing.expectEqualStrings("ACP registry transient", messages.items[2].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", AcpContextRegistryFixture.static_context.?);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
     try std.testing.expectEqual(
@@ -5764,6 +5934,52 @@ test "ACP full advertisement includes direct provider search with explicit permi
     defer projection.deinit(std.testing.allocator);
     try std.testing.expect(tool_projection_mod.containsName(projection.advertised_names, "web_search"));
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
+}
+
+test "ACP turn sign-in outlives a refreshed credential the server publishes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    state.gateway_team = try alloc.dupe(u8, "team_before");
+
+    var first = try TurnSignIn.capture(alloc, &state, &state.active_session.?);
+    defer first.deinit(alloc);
+    var job: worker_runtime.QueuedPrompt = .{
+        .prompt = &.{},
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    first.apply(&job);
+
+    // A step's refresh publishes a new credential and frees the old one.
+    var refreshed: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "refreshed-api-key"),
+        .source = .ai_gateway_api_key,
+        .team_id = try alloc.dupe(u8, "team_after"),
+    };
+    server.adoptServerCredential(&state, &refreshed);
+    refreshed.deinit(alloc);
+    try std.testing.expectEqualStrings("test-api-key", job.api_key);
+    try std.testing.expectEqualStrings("team_before", job.gateway_team.?);
+
+    // The report turn after it sends the published one.
+    var next = try TurnSignIn.capture(alloc, &state, &state.active_session.?);
+    defer next.deinit(alloc);
+    var report_job = job;
+    next.apply(&report_job);
+    try std.testing.expectEqualStrings("refreshed-api-key", report_job.api_key);
+    try std.testing.expectEqualStrings("team_after", report_job.gateway_team.?);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, report_job.credential_source.?);
 }
 
 test "ACP prompt agent config carries request options from active session" {

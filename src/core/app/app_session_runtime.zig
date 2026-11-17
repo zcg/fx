@@ -22,10 +22,13 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
@@ -54,10 +57,12 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
+const full_transcript_metadata = @import("../output/full_transcript_metadata.zig");
 const history_range = @import("../shared/history_range.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -66,6 +71,7 @@ const operation_control = @import("../mcp/operation_control.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
+const tool_group_projection = @import("../../ui/transcript/tool_group_projection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
@@ -92,7 +98,21 @@ const resumePageLimitForRows = session_persistence.resumePageLimitForRows;
 
 /// What the footer draws of `menu`.
 pub fn forkMenuProjection(menu: *const session_persistence.ForkMenu) render_input.ForkMenuProjection {
-    return .{ .points = menu.points, .selected = menu.selected, .window_start = menu.window_start };
+    return .{
+        .points = menu.points,
+        .selected = menu.selected,
+        .window_start = menu.window_start,
+        .question = if (menu.question) |children| copyableCount(children) else null,
+    };
+}
+
+/// How many of `children` a fork can take a copy of (D97).
+fn copyableCount(children: []const session_adapter.Child) usize {
+    var count: usize = 0;
+    for (children) |child| {
+        if (subagent_child_state.copyableAtFork(child)) count += 1;
+    }
+    return count;
 }
 
 const Allocator = std.mem.Allocator;
@@ -538,22 +558,13 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Gives an instance launched in a profile the profile's model, unless
-        /// `--model`, `--provider`, or `FX_MODEL` chose one for the process,
-        /// which still wins, as it does over the first instance's profile.
-        pub fn applyProfileModel(app: *App, agent: *AppAgent, model: []const u8) !void {
-            if (agent.session_persistence.process_model_override != null) return;
-            const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
-            const owned = try app.alloc.dupe(u8, model);
-            app.alloc.free(preferences.model);
-            preferences.model = owned;
-        }
-
-        /// Gives an instance launched after the first the model the launch
-        /// chose with `--model`, `--provider`, or `FX_MODEL`, which the first
-        /// instance takes through the app's selection at startup. An instance's
+        /// Gives an instance launched after the first, at launch and after each
+        /// `/new`, the model the launch chose with `--model`, `--provider`, or
+        /// `FX_MODEL`, which the first instance takes through the app's
+        /// selection at startup. An instance's
         /// model is its own session preference, and its fresh session still
-        /// saves the configured one, as the first instance's does.
+        /// saves the one it started with, its profile's or the configured one,
+        /// as the first instance's does.
         pub fn applyProcessModelOverride(app: *App, agent: *AppAgent) !void {
             const model = agent.session_persistence.process_model_override orelse return;
             const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
@@ -624,18 +635,51 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn beginFreshPersistedSession(app: *App, agent: *AppAgent) !void {
+            return beginFresh(app, agent, .later, null);
+        }
+
+        /// Starts the session an instance opens with. In a profile, it starts
+        /// with and saves the profile's model and effort, so resuming it
+        /// brings them back; `--model`, `--effort`, and `FX_MODEL` shape only
+        /// the run that passed them. A session `/new` starts later begins
+        /// with what the one it replaces had saved (`installFreshLiveSession`).
+        pub fn beginInstanceSession(app: *App, agent: *AppAgent) !void {
+            return beginFresh(app, agent, .instance_start, null);
+        }
+
+        const FreshStart = enum { instance_start, later };
+
+        /// `carried`, when given, is what the new session starts with in
+        /// place of the workspace's preferences. The caller keeps it.
+        fn beginFresh(app: *App, agent: *AppAgent, start: FreshStart, carried: ?session_codec.DurableSessionPreferences) !void {
             closeWritableSession(app, agent);
             // A fresh session starts with no usage, whether or not it persists.
             agent.total_input_tokens = 0;
             agent.total_output_tokens = 0;
             agent.total_web_search_requests = 0;
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
-                try beginFreshJsHostSession(app, agent);
+                try beginFreshJsHostSession(app, agent, carried);
             }
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store);
+            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store, start, carried);
+        }
+
+        /// The preferences `agent`'s open session has saved, or null when it
+        /// has no session or they can't be read. Caller owns.
+        fn savedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
+                if (jsHostSavedPreferences(app, agent)) |preferences| return preferences;
+            }
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return null;
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return null;
+            return v2.currentPreferences(app.alloc) catch |err| {
+                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ v2.id(), @errorName(err) });
+                return null;
+            };
         }
 
         /// The transcript window drops entries only once the session log holds
@@ -663,9 +707,28 @@ pub fn Runtime(comptime App: type) type {
 
         /// A v2 session starts in memory; its folder appears with the first
         /// turn (D2), so a launch that never prompts leaves nothing behind.
-        fn beginFreshV2Session(app: *App, agent: *AppAgent, v2_store: *session_adapter.Store) !void {
-            const preferences = agent.session_persistence.workspace_preferences orelse
+        fn beginFreshV2Session(
+            app: *App,
+            agent: *AppAgent,
+            v2_store: *session_adapter.Store,
+            start: FreshStart,
+            carried: ?session_codec.DurableSessionPreferences,
+        ) !void {
+            const seed = carried orelse agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
+            var preferences = try seed.dupe(app.alloc);
+            defer preferences.deinit(app.alloc);
+            if (comptime agents.hasAgentField(App, "profile")) {
+                if (start == .instance_start) {
+                    const profile = &agent.profile.profile;
+                    if (profile.model) |model| {
+                        const owned = try app.alloc.dupe(u8, model);
+                        app.alloc.free(preferences.model);
+                        preferences.model = owned;
+                    }
+                    if (profile.effort) |effort| preferences.effort = effort;
+                }
+            }
             try replacePreferences(
                 app.alloc,
                 &agent.session_persistence.session_preferences,
@@ -684,8 +747,20 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.degraded_warning_emitted = false;
         }
 
-        fn beginFreshJsHostSession(app: *App, agent: *AppAgent) !void {
-            const preferences = agent.session_persistence.workspace_preferences orelse
+        /// The preferences `agent`'s JS-host session has saved, or null when
+        /// it has none or they can't be copied. Caller owns.
+        fn jsHostSavedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            const owner = if (agent.session_persistence.js_host_session) |*value| value else return null;
+            return owner.state.preferences.dupe(app.alloc) catch |err| {
+                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ owner.state.id, @errorName(err) });
+                return null;
+            };
+        }
+
+        /// `carried`, when given, is what the new session starts with in
+        /// place of the workspace's preferences, as in `beginFresh`.
+        fn beginFreshJsHostSession(app: *App, agent: *AppAgent, carried: ?session_codec.DurableSessionPreferences) !void {
+            const preferences = carried orelse agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
             try replacePreferences(
                 app.alloc,
@@ -799,7 +874,7 @@ pub fn Runtime(comptime App: type) type {
                 error.SessionScrollbackHandoffGeometryChanged => {
                     agent.session_persistence.pending_live_session_policy = null;
                     agent.session_persistence.pending_live_session_wait = null;
-                    app.shell.cancelSessionScrollbackHandoff();
+                    app.shell.cancelSessionScrollbackHandoff("geometry_changed");
                     releaseLiveSessionTransitionHold(app, agent);
                     debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
@@ -833,15 +908,36 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             agent.session_persistence.pending_live_session_policy = null;
             agent.session_persistence.pending_live_session_wait = null;
-            app.shell.cancelSessionScrollbackHandoff();
+            try giveUpScrollbackHandoff(app, reason);
             releaseLiveSessionTransitionHold(app, agent);
             debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
             try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
         }
 
+        /// Gives up a scrollback handoff that still has rows to write. When
+        /// its frame already pushed some rows into scrollback, the terminal
+        /// is cleared and the transcript printed again, as after a resize, so
+        /// the switch's next handoff does not push those rows a second time.
+        fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
+            if (comptime !@hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff") or !@hasField(App, "metrics")) return;
+            const pending = app.shell.pending_session_scrollback_handoff orelse return;
+            app.shell.cancelSessionScrollbackHandoff(reason);
+            if (pending.remaining_rows < pending.total_rows) {
+                try app.shell.requestTerminalReset(&app.metrics);
+                debug_trace.logf("session", "event=scrollback_handoff_reset reason={s} pushed_rows={d}", .{ reason, pending.total_rows - pending.remaining_rows });
+            }
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App, agent: *AppAgent) !void {
             if (agent.session_persistence.pending_live_session_policy == null) return;
             const processing = agent.worker.isProcessing();
+            // The handoff goes on only while the agent is idle, and no agent's
+            // transcript can be swapped in until it ends. A turn that starts
+            // meanwhile, such as one a subagent's report starts, would hold
+            // the handoff, and every hidden agent, until it ends, and that
+            // turn may wait on a hidden agent. So the handoff yields; the
+            // change hands the rows off again once the agent is idle.
+            if (processing) try giveUpScrollbackHandoff(app, "agent_busy");
             const now = operation_control.monotonicMillis(io_mod.getIo());
             var wait = agent.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
             if (wait == .worker and !processing) wait = .{ .geometry = now };
@@ -902,9 +998,50 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.pending_live_session_wait = null;
                 releaseLiveSessionTransitionHold(app, agent);
             }
-            try beginFreshPersistedSession(app, agent);
+            // The new session keeps what the one it replaces had saved: its
+            // profile's model and effort, or a /model or /effort choice, never
+            // a run flag.
+            var carried = agent.session_persistence.next_session_preferences;
+            agent.session_persistence.next_session_preferences = null;
+            defer if (carried) |*value| value.deinit(app.alloc);
+            const keeps_process_model = runsProcessModel(app, agent);
+            try beginFresh(app, agent, .later, carried);
             enableSessionStores(app, agent);
+            // An instance launched after the first runs its session's model,
+            // so the --model or FX_MODEL it ran is laid over it again; the
+            // first keeps the app's selection across sessions.
+            if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
+            try noteStoppedSubagentTasks(app, agent);
+        }
+
+        fn stopSubagentsForSwitch(app: *App, agent: *AppAgent) !usize {
+            if (comptime !@hasField(App, "child_agents")) return 0;
+            return @import("app_agents_runtime.zig").Runtime(App).stopSubagentsForSwitch(app, agent);
+        }
+
+        /// Says, in the session a switch opened, how many subagent tasks the
+        /// switch stopped; the subagents stay in the session it left (D97).
+        fn noteStoppedSubagentTasks(app: *App, agent: *AppAgent) !void {
+            const stopped = agent.session_persistence.switch_stopped_tasks;
+            agent.session_persistence.switch_stopped_tasks = 0;
+            if (stopped == 0) return;
+            var buf: [128]u8 = undefined;
+            const body = if (stopped == 1)
+                "stopped 1 running subagent task; the subagent stays in the previous session"
+            else
+                try std.mem.print(&buf, "stopped {d} running subagent tasks; the subagents stay in the previous session", .{stopped});
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = body }, true);
+        }
+
+        /// Whether `agent`, an instance launched after the first, runs the
+        /// model `--model` or `FX_MODEL` chose, not one picked since with
+        /// `/model`.
+        fn runsProcessModel(app: *App, agent: *AppAgent) bool {
+            if (comptime !agents.hasAgentField(App, "role")) return false;
+            if (agent == &app.main_agent or agent.role != .instance) return false;
+            if (agent.session_persistence.session_preferences == null) return false;
+            return provider_runtime.runsProcessModel(app, agent);
         }
 
         fn releaseLiveSessionTransitionHold(app: *App, agent: *AppAgent) void {
@@ -933,6 +1070,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
+            debug_trace.logf("session", "event=live_session_resume_redraw dropped=terminal_screen_and_scrollback reason=switched_session_redraws_conversation", .{});
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
         }
@@ -954,7 +1092,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
-            app.pacer.clear(app.alloc);
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "session_switch");
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app, agent);
             } else {
@@ -999,6 +1137,15 @@ pub fn Runtime(comptime App: type) type {
                 app.subagents.clearProjection(app.alloc);
             }
 
+            // What the session saved, read before it closes, for a fresh
+            // session `installFreshLiveSession` starts next; a resume leaves
+            // it to the next transition, which reads it again.
+            if (agent.session_persistence.next_session_preferences) |*previous| previous.deinit(app.alloc);
+            agent.session_persistence.next_session_preferences = savedPreferences(app, agent);
+            // The session's subagents stop before its host joins their slot
+            // threads, as /close and quit stop them (D97;
+            // `tests/tla/session_manager/Wiring.tla` SwitchEnds).
+            agent.session_persistence.switch_stopped_tasks = try stopSubagentsForSwitch(app, agent);
             closeWritableSession(app, agent);
             app.stopStream(agent);
             app.shell.clearTranscript(app.alloc);
@@ -1035,7 +1182,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The update's notice, in the fresh session an update relaunch
-        /// opens when the session it handed over had no turn to resume (D81).
+        /// opens when the session it handed over had no turn to resume (D81),
+        /// drawn on a cleared terminal like a resumed one.
         pub fn writeUpgradeNotice(
             app: *App,
             version: []const u8,
@@ -1043,6 +1191,7 @@ pub fn Runtime(comptime App: type) type {
             previous_revision: []const u8,
             revision: []const u8,
         ) !void {
+            try requestUpgradeRelaunchRedraw(app);
             var body: std.Io.Writer.Allocating = .init(app.alloc);
             defer body.deinit();
             try writeUpgradeNoticeBody(&body.writer, .{
@@ -1134,7 +1283,17 @@ pub fn Runtime(comptime App: type) type {
             const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, v2_target, app.workspace_root, .app);
             try installResumedV2Session(app, agent, v2, notice);
             errdefer closeWritableSession(app, agent);
+            if (notice == .upgrade) try requestUpgradeRelaunchRedraw(app);
             try app.commitStartupResumeReplayAnchor();
+        }
+
+        /// An update relaunch takes over the previous build's screen. Its
+        /// first frame clears the terminal and its scrollback and draws the
+        /// conversation from the top, as a resize does, instead of drawing a
+        /// second copy below the old one.
+        fn requestUpgradeRelaunchRedraw(app: *App) !void {
+            debug_trace.logf("session", "event=upgrade_relaunch_redraw dropped=terminal_screen_and_scrollback reason=relaunched_build_redraws_conversation", .{});
+            try app.shell.requestTerminalReset(&app.metrics);
         }
 
         fn resumeRequestedJsHostSession(app: *App, agent: *AppAgent) !void {
@@ -1244,7 +1403,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session.reset(app.alloc);
             app.shell.clearTranscript(app.alloc);
             clearCachedSessionTitle(app, agent);
-            try beginFreshJsHostSession(app, agent);
+            try beginFreshJsHostSession(app, agent, null);
             try finishLiveSessionTransition(app);
         }
 
@@ -1277,6 +1436,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionWarmup(app: *App) void {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+            // The subagents the session started before count at once, so the
+            // footer offers the list before it is first opened.
+            if (comptime @hasField(App, "child_agents")) @import("app_agents_runtime.zig").Runtime(App).listRestoredSubagents(app);
         }
 
         pub fn resumeSelectedSession(app: *App, agent: *AppAgent) !bool {
@@ -1294,6 +1456,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, agent, v2, .session);
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
             startPendingResume(app, agent);
             return true;
         }
@@ -1326,15 +1489,50 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Forks the session before the fork menu's selected prompt and
-        /// switches to the fork, which opens before the source closes (D58).
-        /// Returns that prompt's text for the composer; caller owns it.
-        pub fn forkBeforeSelectedPrompt(app: *App, agent: *AppAgent) ![]u8 {
+        /// Enter on `/fork`'s menu, and the answer to its question (D97). On
+        /// the prompts, Enter (`bring` null) asks whether the fork takes
+        /// copies of the subagents the session had at the chosen prompt, or
+        /// forks at once when it had none to copy. The answer forks with a
+        /// copy of each of them or of none. Returns the chosen prompt's text
+        /// for the composer once it forked, else null; caller owns it.
+        pub fn submitForkMenu(app: *App, agent: *AppAgent, bring: ?bool) !?[]u8 {
+            const menu = &agent.session_persistence.fork_menu;
+            if (menu.question) |children| {
+                const yes = bring orelse return null;
+                if (!yes) return try forkBeforeSelectedPrompt(app, agent, &.{});
+                var arena = std.heap.ArenaAllocator.init(app.alloc);
+                defer arena.deinit();
+                var copies: std.ArrayList(session_adapter.Session.ChildCopy) = .empty;
+                for (children) |child| {
+                    if (!subagent_child_state.copyableAtFork(child)) continue;
+                    try copies.append(arena.allocator(), try subagent_child_state.forkCopy(arena.allocator(), child));
+                }
+                return try forkBeforeSelectedPrompt(app, agent, copies.items);
+            }
+            const source = agent.session_persistence.v2 orelse return error.SessionStoreUnavailable;
+            const children = try source.forkChildren(app.alloc, menu.points[menu.selected].turn);
+            if (copyableCount(children) == 0) {
+                session_adapter.freeChildren(app.alloc, children);
+                return try forkBeforeSelectedPrompt(app, agent, &.{});
+            }
+            menu.question = children;
+            app.shell.render_requests.request(.footer);
+            return null;
+        }
+
+        /// Forks the session before the fork menu's selected prompt, with
+        /// `copies` of its subagents (D97), and switches to the fork, which
+        /// opens before the source closes (D58). Returns that prompt's text
+        /// for the composer; caller owns it.
+        fn forkBeforeSelectedPrompt(app: *App, agent: *AppAgent, copies: []const session_adapter.Session.ChildCopy) ![]u8 {
             const menu = &agent.session_persistence.fork_menu;
             const points = menu.points;
             const point = points[menu.selected];
+            // `copies` borrow the question's children until the fork is made.
+            const question = menu.question;
             menu.* = .{};
             defer session_adapter.Session.freeForkPoints(app.alloc, points);
+            defer if (question) |children| session_adapter.freeChildren(app.alloc, children);
             const source = agent.session_persistence.v2 orelse return error.SessionStoreUnavailable;
             const source_id = try app.alloc.dupe(u8, source.id());
             defer app.alloc.free(source_id);
@@ -1345,6 +1543,7 @@ pub fn Runtime(comptime App: type) type {
                 .workspace = app.workspace_root,
                 .host = .app,
                 .title = cachedSessionTitle(agent),
+                .children = copies,
             });
             var fork_owned = true;
             errdefer if (fork_owned) fork.close();
@@ -1353,6 +1552,7 @@ pub fn Runtime(comptime App: type) type {
             try installResumedV2Session(app, agent, fork, .{ .fork = source_id });
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
             return prompt;
         }
 
@@ -1417,6 +1617,16 @@ pub fn Runtime(comptime App: type) type {
             return v2.saveRecovery(record);
         }
 
+        /// Saves the row of a call a command made through `fx mcp call` in
+        /// the open turn, so a resume shows it in its shell call's group
+        /// (D99). A session that is not saved keeps nothing.
+        pub fn saveBridgeCall(agent: *AppAgent, record: types.BridgeCallRecord) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            try v2.saveBridgeCall(record);
+        }
+
         /// Record whether restored history references shell execution handles
         /// this process does not own. Registry membership, not the resume
         /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
@@ -1449,6 +1659,7 @@ pub fn Runtime(comptime App: type) type {
                 v2.close();
             }
             try restoreChildState(app, agent, resumed.state);
+            if (resumed.title) |title| if (cachedSessionTitle(agent) == null) try setCachedSessionTitle(app, agent, title);
             if (comptime @hasDecl(@TypeOf(agent.session), "configureWebFetchArtifactBlobs")) {
                 if (v2.childCapability()) |capability| {
                     agent.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
@@ -1532,8 +1743,7 @@ pub fn Runtime(comptime App: type) type {
                     .projection = &projection,
                     .labels = &historical_labels,
                 };
-                try writeResumeNotice(app, agent, &sink, display, notice);
-                const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
+                const holds_previous = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -1551,8 +1761,7 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, agent, &sink, display, notice);
-                _ = try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
+                _ = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -1842,7 +2051,8 @@ pub fn Runtime(comptime App: type) type {
             cancelSessionPicker(app, agent);
             if (comptime !agents.hasAgentField(App, "session")) return;
             if (agent.session_persistence.v2 != null) return;
-            beginFreshPersistedSession(app, agent) catch |err| {
+            // With no session yet, this is the one the instance opens with.
+            beginInstanceSession(app, agent) catch |err| {
                 debug_trace.logf(
                     "session",
                     "fresh session after picker cancel unavailable err={s}",
@@ -1905,11 +2115,23 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null);
         }
 
+        /// Tells the agent's worker that a finished turn is committed, or
+        /// failed to commit, so mail held for it may start the next turn
+        /// (`WorkerRuntime.acknowledgeFinishCommitted`).
+        fn acknowledgeFinishCommitted(agent: *AppAgent) void {
+            if (comptime @hasField(AppAgent, "worker") and
+                @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishCommitted"))
+            {
+                agent.worker.acknowledgeFinishCommitted();
+            }
+        }
+
         pub fn appendFinishedPrompt(
             app: *App,
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            defer acknowledgeFinishCommitted(agent);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
@@ -1945,13 +2167,17 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !HistoryAppendOutcome {
-            return appendHistoryTurnWithPendingPresentation(
+            const outcome = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 finished.turn,
                 .visual_epoch,
                 finished.snapshot_file_ownership,
             );
+            // An uncommitted turn stays with the pacer, which commits it later
+            // through `appendFinishedPrompt`.
+            if (outcome == .committed) acknowledgeFinishCommitted(agent);
+            return outcome;
         }
 
         const AppendHistoryMode = enum {
@@ -2252,13 +2478,43 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.v2) |v2| {
                 if (result.session_error != null) return result;
                 const preferences = agent.session_persistence.session_preferences orelse return result;
-                v2.setPreferences(preferences) catch |err| {
+                // An instance launched after the first runs the --model or
+                // FX_MODEL model in its preferences; the session keeps its own
+                // unless this change picked one.
+                var without_run_model: ?session_codec.DurableSessionPreferences = null;
+                defer if (without_run_model) |*value| value.deinit(app.alloc);
+                if (patch.model == null and runsProcessModel(app, agent)) {
+                    without_run_model = withSavedModel(app.alloc, v2, preferences) catch |err| {
+                        result.session_error = err;
+                        warnDegraded(app, agent, err) catch {};
+                        return result;
+                    };
+                }
+                v2.setPreferences(without_run_model orelse preferences) catch |err| {
                     result.session_error = err;
                     warnDegraded(app, agent, err) catch {};
                 };
                 return result;
             }
             return result;
+        }
+
+        /// `preferences` with the model and provider `v2` has saved in place of
+        /// theirs. Caller owns.
+        fn withSavedModel(
+            alloc: Allocator,
+            v2: *session_adapter.Session,
+            preferences: session_codec.DurableSessionPreferences,
+        ) !session_codec.DurableSessionPreferences {
+            var saved = try v2.currentPreferences(alloc);
+            defer saved.deinit(alloc);
+            var copy = try preferences.dupe(alloc);
+            errdefer copy.deinit(alloc);
+            const model = try alloc.dupe(u8, saved.model);
+            alloc.free(copy.model);
+            copy.model = model;
+            copy.provider = saved.provider;
+            return copy;
         }
 
         pub fn activeSessionId(agent: *AppAgent) ?[]const u8 {
@@ -2310,10 +2566,17 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        /// Terminal tabs show the session title once one exists; before the
-        /// first prompt they identify the running build and workspace.
+        /// Terminal tabs show the agent on screen: its session title once one
+        /// exists, before its first prompt the running build and workspace.
+        /// Another agent's title leaves the tab alone until it is on screen.
         pub fn syncTerminalTitle(app: *App, agent: *AppAgent) void {
             if (comptime !provider_runtime.supported(App)) return;
+            // The agent the user sees, not a hidden one the loop is visiting,
+            // as the terminal's program status does.
+            if (comptime @hasField(App, "agent_on_screen")) {
+                const on_screen: *const AppAgent = if (app.agent_on_screen) |child| &child.agent else &app.main_agent;
+                if (agent != on_screen) return;
+            }
             syncTerminalTitleWith(app, agent, terminalTitle(app));
         }
 
@@ -2380,16 +2643,26 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "sessionTitleModel")) return;
 
             const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
-            const title_model = app.sessionTitleModel();
-            if (!session_title_generation.shouldGenerate(.{
+            const title_model = titleModelFor(app, agent, app.sessionTitleModel());
+            const session_id = activeSessionId(agent) orelse return;
+            const gate: session_title_generation.Gate = .{
                 .setting_enabled = app.session_title_generation,
                 .provider_supports_titles = title_model != null,
                 .session_untitled = agent.session_title.items.len == 0 and
                     agent.session.agent.history.items.len == 0,
                 .recovery_replay = false,
                 .task_running = agent.session_persistence.title_generation.task != null,
-            })) return;
-            const session_id = activeSessionId(agent) orelse return;
+                .title_started = agent.session_persistence.title_generation.startedFor(session_id),
+            };
+            if (!session_title_generation.shouldGenerate(gate)) {
+                var without_record = gate;
+                without_record.title_started = false;
+                if (session_title_generation.shouldGenerate(without_record)) {
+                    debug_trace.logf("session", "event=title_generation_skipped reason=already_started session={s}", .{session_id});
+                }
+                return;
+            }
+
             const credential = app.auth.gatewayCredential() orelse return;
 
             const task = session_title_generation.Task.create(.{
@@ -2400,6 +2673,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = credential.gateway_team,
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
+                .reads_shared_sign_in = true,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {
                 agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
@@ -2414,6 +2688,16 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.title_generation.start(task);
         }
 
+        /// The provider's title model, or a Token Pass model when the team
+        /// has Token Pass and the agent's AI Gateway model is a Token Pass
+        /// model.
+        fn titleModelFor(app: *App, agent: *AppAgent, provider_title_model: ?[]const u8) ?[]const u8 {
+            const default_model = provider_title_model orelse return null;
+            if (comptime !provider_runtime.supported(App)) return default_model;
+            if (provider_runtime.providerOf(app, agent) != .gateway) return default_model;
+            return token_pass_team.modelForSideCall(.title, provider_runtime.modelOf(app, agent), default_model);
+        }
+
         /// Applies a finished background title generation on the main loop.
         /// Returns true when the session title changed.
         pub fn pollSessionTitleGeneration(app: *App, agent: *AppAgent) !bool {
@@ -2424,7 +2708,10 @@ pub fn Runtime(comptime App: type) type {
             const task = agent.session_persistence.title_generation.takeCompleted() orelse return false;
             defer task.destroy();
             agent.session_persistence.title_generation.recordFinished(task);
-            const title = task.takeTitle() orelse return false;
+            const title = task.takeTitle() orelse {
+                debug_trace.logf("session", "event=title_generation_apply result=unavailable session={s}", .{task.session_id});
+                return false;
+            };
             defer std.heap.c_allocator.free(title);
             const active_id = activeSessionId(agent) orelse {
                 debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
@@ -2477,20 +2764,35 @@ pub fn Runtime(comptime App: type) type {
             EmptyTitle,
             TitleTooLong,
             InvalidTitle,
+            MultilineTitle,
             NoActiveSession,
         };
 
         /// Validates a user-supplied session title. Returns the trimmed slice,
-        /// which borrows from `raw`.
+        /// without one pair of quotes wrapped around the whole title, which
+        /// borrows from `raw`.
         pub fn validateSessionTitle(raw: []const u8) RenameError![]const u8 {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len == 0) return error.EmptyTitle;
-            if (trimmed.len > session_display_metadata.max_title_bytes) return error.TitleTooLong;
-            if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidTitle;
-            for (trimmed) |byte| {
+            const title = std.mem.trim(u8, withoutWrappingQuotes(std.mem.trim(u8, raw, " \t\r\n")), " \t");
+            if (title.len == 0) return error.EmptyTitle;
+            if (title.len > session_display_metadata.max_title_bytes) return error.TitleTooLong;
+            if (!std.unicode.utf8ValidateSlice(title)) return error.InvalidTitle;
+            if (std.mem.findAny(u8, title, "\r\n") != null) return error.MultilineTitle;
+            for (title) |byte| {
                 if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
             }
-            return trimmed;
+            return title;
+        }
+
+        /// `"deploy fix"` names the session `deploy fix`; a quote that only
+        /// opens, or one inside the title, stays.
+        fn withoutWrappingQuotes(text: []const u8) []const u8 {
+            if (text.len < 2) return text;
+            const quote = text[0];
+            if (quote != '"' and quote != '\'') return text;
+            if (text[text.len - 1] != quote) return text;
+            const inner = text[1 .. text.len - 1];
+            if (std.mem.findScalar(u8, inner, quote) != null) return text;
+            return inner;
         }
 
         /// Renames the active session in memory and in session metadata.
@@ -2546,6 +2848,14 @@ pub fn Runtime(comptime App: type) type {
             }
             const host = agent.session_persistence.subagent_host orelse return;
             host.rebindHost(app, subagentAuthorityResolver(app));
+            bindToolboxBehind(app, host);
+        }
+
+        /// Points `host`'s children at the app's tools behind toolbox, so a
+        /// child whose profile lists one keeps toolbox to reach it. Bound
+        /// again after the app moves, as the host's callbacks are.
+        fn bindToolboxBehind(app: *App, host: *subagent_tool_host.Runtime) void {
+            if (comptime @hasField(App, "toolbox_behind")) host.authority_resolver.toolbox_behind = &app.toolbox_behind;
         }
 
         /// Stops the subagent host, joining its child threads, before the
@@ -2740,6 +3050,17 @@ pub fn Runtime(comptime App: type) type {
                 ) !void {
                     if (comptime @hasDecl(SinkApp, "attachHistoricalToolCallWithoutResult")) {
                         try self.app.attachHistoricalToolCallWithoutResult(entry_id, call);
+                    }
+                }
+
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalBridgeCall")) {
+                        try self.app.attachHistoricalBridgeCall(entry_id, tool, outcome);
                     }
                 }
 
@@ -2939,10 +3260,12 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
-                    // A report's turn comes back as its card, as it showed live.
-                    if (try subagent_reports.card(self.projection.alloc, user)) |shown| {
+                    // A report's turn comes back as its subagent row, as it
+                    // showed live.
+                    if (try subagent_reports.row(self.projection.alloc, user)) |shown| {
                         defer shown.deinit(self.projection.alloc);
-                        for (shown.notices()) |notice| _ = try self.projection.appendNotice(notice);
+                        const entry_id = try self.projection.appendToolStatus(shown.outcome, shown.status);
+                        try self.projection.attachHistoricalToolDetail(entry_id, subagent_reports.Row.call, .subagent, shown.result(self.projection.created_at_ms));
                         return;
                     }
                     _ = try self.projection.appendUserTurn(user);
@@ -3040,6 +3363,15 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalToolCallWithoutResult(entry_id, call);
                 }
 
+                fn attachHistoricalBridgeCall(
+                    self: *Self,
+                    entry_id: u32,
+                    tool: []const u8,
+                    outcome: types.ToolOutcomeKind,
+                ) !void {
+                    try self.projection.attachHistoricalBridgeCall(entry_id, tool, outcome);
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     self.projection.attachHistoricalCommandOutput(entry_id);
                 }
@@ -3057,6 +3389,9 @@ pub fn Runtime(comptime App: type) type {
                         command_artifact_handle,
                         replayed_output,
                     );
+                    // The live row's command metadata, so the compact view
+                    // shows the command's short form, as it did live.
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn appendQuestionResolution(
@@ -3259,14 +3594,19 @@ pub fn Runtime(comptime App: type) type {
             gop.value_ptr.* = .{ .label = label, .reflow = reflow };
         }
 
-        /// Replays an older compaction cycle of `agent`, whose transcript is
-        /// on screen, from its session log into a detached transcript for
-        /// Ctrl+O: `back` cycles before the held entries, 1 being the newest.
-        /// Reads only that cycle, after finding its start by walking back
-        /// from the cycles already found.
+        /// Reads an older compaction cycle of `agent`, whose transcript is
+        /// on screen, from its session log for Ctrl+O: `back` cycles before
+        /// the held entries, 1 being the newest. Finds where the cycle
+        /// starts here, walking back from the cycles already found, and
+        /// reads only that cycle's turns, on a background thread;
+        /// `pollTranscriptArchive` replays them once they are read. A read of
+        /// the same cycle already running goes on.
         pub fn loadTranscriptArchive(app: *App, agent: *AppAgent, back: u32) !void {
             if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return error.TranscriptArchiveUnavailable;
             if (back == 0) return error.TranscriptArchiveUnavailable;
+            const read = &agent.session_persistence.transcript_archive_read;
+            const generation = app.shell.transcript_archive_generation;
+            if (read.pendingFor(back, generation)) return;
             const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const started_ns = io_mod.nanoTimestamp();
             const newest = (try v2.previousCompactionCursor(app.alloc, null)).cursor orelse return error.TranscriptArchiveUnavailable;
@@ -3279,64 +3619,146 @@ pub fn Runtime(comptime App: type) type {
                 cache.damaged_from = null;
                 cache.held_start = if (holds_previous) cache.startOf(1, try v2.previousCompactionCursor(app.alloc, newest)) else newest;
             }
-            // A read that stops at a damaged line still shows what it read.
-            var read_damaged = false;
-            while (true) {
-                while (cache.starts.items.len < back) {
-                    // Below `back`, a u32, so the cast holds.
-                    const next_back: u32 = @intCast(cache.starts.items.len + 1);
-                    const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
-                        return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
-                    try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
-                }
-                const start = cache.starts.items[back - 1];
-
-                var projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1);
-                defer projection.deinit();
-                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
-                projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
-                var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
-                defer labels.deinit(app.alloc);
-                var sink = DetachedHistorySink(@TypeOf(projection)){
-                    .app = app,
-                    .projection = &projection,
-                    .labels = &labels,
-                };
-                const Visitor = struct {
-                    app: *App,
-                    agent: *AppAgent,
-                    sink: *@TypeOf(sink),
-                    labels: *HistoricalSessionLabels,
-                    has_prior_turns: bool = false,
-
-                    pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                        return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
-                    }
-                };
-                var visitor = Visitor{ .app = app, .agent = agent, .sink = &sink, .labels = &labels };
-                if (try v2.visitHistoryCycle(app.alloc, start, &visitor)) read_damaged = true;
-                if (projection.runtime.notebook.entries.items.len == 0) if (start) |empty_start| {
-                    // Two compactions with no turn between leave an empty
-                    // cycle; it is not a page of its own, so the cycle before
-                    // it takes its place. Each skip moves to an older
-                    // compaction line, so this ends.
-                    cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
-                    cache.starts.shrinkRetainingCapacity(back);
-                    debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
-                    continue;
-                };
-                const archived = try projection.intoArchivedRuntime();
-                const entries = archived.notebook.entries.items.len;
-                const damaged = read_damaged or cache.damages(back);
-                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived, damaged);
-                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} us={d}", .{
-                    back,
-                    entries,
-                    damaged,
-                    @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
-                });
-                return;
+            while (cache.starts.items.len < back) {
+                // Below `back`, a u32, so the cast holds.
+                const next_back: u32 = @intCast(cache.starts.items.len + 1);
+                const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
+                    return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
+                try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
             }
+            const start = cache.starts.items[back - 1];
+            const reader = try v2.cycleReader(std.heap.c_allocator);
+            try read.start(reader, .{ .back = back, .start = start, .generation = generation });
+            debug_trace.logf("full_transcript_cache", "archive_read_started back={d} generation={d} find_us={d}", .{
+                back,
+                generation,
+                @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+            });
+        }
+
+        /// The detached transcript a finished read's turns replay into, a
+        /// few turns per loop turn (`pollTranscriptArchive`).
+        const ArchiveReplay = struct {
+            alloc: Allocator,
+            projection: resume_projection.ResumeProjection,
+            labels: HistoricalSessionLabels,
+            has_prior_turns: bool = false,
+            /// The next turn to replay.
+            next: usize = 0,
+            replay_ns: i128 = 0,
+            /// The longest loop turn spent replaying.
+            longest_slice_ns: i128 = 0,
+
+            fn create(app: *App, back: u32) !*ArchiveReplay {
+                const self = try app.alloc.create(ArchiveReplay);
+                errdefer app.alloc.destroy(self);
+                self.* = .{
+                    .alloc = app.alloc,
+                    .projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1),
+                    .labels = .{ .workspace_root = app.workspace_root },
+                };
+                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
+                self.projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
+                return self;
+            }
+
+            fn destroy(context: *anyopaque) void {
+                const self: *ArchiveReplay = @ptrCast(@alignCast(context));
+                self.projection.deinit();
+                self.labels.deinit(self.alloc);
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// How long one loop turn replays a read's turns before it lets
+        /// input and painting run; a turn always replays whole.
+        const archive_replay_slice_ns: i128 = 4 * std.time.ns_per_ms;
+
+        /// Replays the cycle a background read of `agent`'s session log
+        /// finished into a detached transcript, a few turns per call, and
+        /// installs it for Ctrl+O once every turn is in. A read that a
+        /// compaction, resume, or drop made stale is dropped. Returns whether
+        /// it installed one.
+        pub fn pollTranscriptArchive(app: *App, agent: *AppAgent) !bool {
+            if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return false;
+            const read = &agent.session_persistence.transcript_archive_read;
+            if (read.dropIfStale(app.shell.transcript_archive_generation)) return false;
+            const task = read.completed() orelse return false;
+            const back = task.request.back;
+            const outcome = advanceTranscriptArchiveReplay(app, agent, task) catch |err| {
+                read.finish();
+                return err;
+            };
+            switch (outcome) {
+                .replaying => return false,
+                .installed => {
+                    read.finish();
+                    return true;
+                },
+                .empty_cycle_skipped => {
+                    // This read is done, so the next one is not taken for it.
+                    read.finish();
+                    try loadTranscriptArchive(app, agent, back);
+                    return false;
+                },
+            }
+        }
+
+        const ArchiveReplayOutcome = enum { replaying, installed, empty_cycle_skipped };
+
+        /// One loop turn of `pollTranscriptArchive`'s replay of `task`'s
+        /// turns, and the install once they are all in.
+        fn advanceTranscriptArchiveReplay(app: *App, agent: *AppAgent, task: *session_persistence.TranscriptArchiveRead.Task) !ArchiveReplayOutcome {
+            if (task.failure) |err| return err;
+            const back = task.request.back;
+            const cache = &agent.session_persistence.transcript_archive_boundaries;
+            const replay: *ArchiveReplay = if (task.replay) |held| @ptrCast(@alignCast(held.state)) else blk: {
+                const created = try ArchiveReplay.create(app, back);
+                task.replay = .{ .state = created, .deinit_fn = ArchiveReplay.destroy };
+                break :blk created;
+            };
+            var sink = DetachedHistorySink(resume_projection.ResumeProjection){
+                .app = app,
+                .projection = &replay.projection,
+                .labels = &replay.labels,
+            };
+            const slice_started_ns = io_mod.nanoTimestamp();
+            while (replay.next < task.turns.items.len) {
+                try replayHistoryToSinkIncremental(app, agent, &sink, task.turns.items[replay.next..][0..1], &replay.has_prior_turns, &replay.labels);
+                replay.next += 1;
+                if (io_mod.nanoTimestamp() - slice_started_ns >= archive_replay_slice_ns) break;
+            }
+            const slice_ns = io_mod.nanoTimestamp() - slice_started_ns;
+            replay.replay_ns += slice_ns;
+            replay.longest_slice_ns = @max(replay.longest_slice_ns, slice_ns);
+            if (replay.next < task.turns.items.len) return .replaying;
+            const projection = &replay.projection;
+            if (projection.runtime.notebook.entries.items.len == 0) if (task.request.start) |empty_start| {
+                // Two compactions with no turn between leave an empty cycle;
+                // it is not a page of its own, so the cycle before it takes
+                // its place. Each skip moves to an older compaction line, so
+                // this ends.
+                const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+                if (cache.starts.items.len < back) return error.TranscriptArchiveUnavailable;
+                cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
+                cache.starts.shrinkRetainingCapacity(back);
+                debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
+                return .empty_cycle_skipped;
+            };
+            const archived = try projection.intoArchivedRuntime();
+            const entries = archived.notebook.entries.items.len;
+            // A read that stops at a damaged line still shows what it read.
+            const damaged = task.damaged or cache.damages(back);
+            try app.shell.installTranscriptArchive(app.alloc, back, task.request.start != null, archived, damaged);
+            debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} read_us={d} replay_us={d} longest_slice_us={d}", .{
+                back,
+                entries,
+                damaged,
+                @divTrunc(task.read_ns, std.time.ns_per_us),
+                @divTrunc(replay.replay_ns, std.time.ns_per_us),
+                @divTrunc(replay.longest_slice_ns, std.time.ns_per_us),
+            });
+            return .installed;
         }
 
         /// Whether `agent`'s transcript is the one on the screen's slot: the
@@ -3423,17 +3845,36 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn writeResumeNotice(
+        /// Replays `history` to `sink` with the resume notice. A fork's notice
+        /// names the command that reopens its source, so it follows the
+        /// replay, where it stays in view however long the session is; the
+        /// other notices open it. Returns what `replayResumedHistoryToSink`
+        /// returns.
+        fn replayWithResumeNotice(
             app: *App,
             agent: *AppAgent,
             sink: anytype,
             display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
-        ) !void {
+            history: []const types.HistoryTurn,
+            labels: *HistoricalSessionLabels,
+        ) !bool {
             // Only a real title enters the cache: the fallback placeholder must
             // not count as an existing title, or background title generation
             // would consider the session already named and never run.
             if (display.present) try setCachedSessionTitle(app, agent, display.title);
+            if (notice != .fork) try writeResumeNotice(app, sink, display, notice);
+            const holds_previous = try replayResumedHistoryToSink(app, agent, sink, history, labels);
+            if (notice == .fork) try writeResumeNotice(app, sink, display, notice);
+            return holds_previous;
+        }
+
+        fn writeResumeNotice(
+            app: *App,
+            sink: anytype,
+            display: *const session_display_metadata.DisplayMetadata,
+            notice: ResumeNotice,
+        ) !void {
             switch (notice) {
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
@@ -3458,10 +3899,13 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = display.title,
                     });
-                    // A plain line, so the command copies as it is.
-                    const line = try app.alloc.print("original session fx --resume {s}\n", .{source_id});
-                    defer app.alloc.free(line);
-                    try sink.appendRaw(line);
+                    // Plain lines, and the command alone on its own, so
+                    // selecting that line copies only the command. The blank
+                    // line keeps a row between it and the input box while it
+                    // is the newest entry.
+                    const lines = try app.alloc.print("Resume the original session with:\nfx --resume {s}\n\n", .{source_id});
+                    defer app.alloc.free(lines);
+                    try sink.appendRaw(lines);
                 },
             }
         }
@@ -3505,37 +3949,42 @@ pub fn Runtime(comptime App: type) type {
                 switch (turn) {
                     .compacted_summary => {},
                     .assistant => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
+                        if (promptTime(entry.user, entry.execution.turn_summary)) |at| sink.setCreatedAtMs(at);
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
+                        const final_calls = full_transcript_metadata.stepModelCalls(entry.execution.model_calls, entry.execution.tool_steps.len);
+                        try writeModelCallNotices(sink, final_calls.before);
                         if (entry.assistant.len > 0) {
                             try writeAssistantHistoryMarkdownToSink(app, sink, entry.assistant);
                         }
+                        try writeModelCallNotices(sink, final_calls.after);
                         if (entry.execution.turn_summary) |summary| {
                             try sink.appendTurnSummary(summary);
                         }
                     },
                     .interrupted => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
+                        if (promptTime(entry.user, entry.execution.turn_summary)) |at| sink.setCreatedAtMs(at);
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
+                        const final_calls = full_transcript_metadata.stepModelCalls(entry.execution.model_calls, entry.execution.tool_steps.len);
+                        try writeModelCallNotices(sink, final_calls.before);
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
+                        try writeModelCallNotices(sink, final_calls.after);
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
+                        }
+                        if (entry.tool_call) |call| {
+                            try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
                         }
                         switch (entry.terminal_reason) {
                             .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
@@ -3637,16 +4086,21 @@ pub fn Runtime(comptime App: type) type {
                     &steering_index,
                     step_index,
                 );
+                const calls = full_transcript_metadata.stepModelCalls(execution.model_calls, step_index);
+                try writeModelCallNotices(sink, calls.before);
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
+                try writeModelCallNotices(sink, calls.after);
 
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
                         try writeCompletedToolResult(app, agent, sink, call, result, labels);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                         try writePermissionFeedback(sink, result.permission_feedback);
                     } else {
                         try writeUnreportedToolStatus(app, sink, call);
+                        try writeBridgeCallRows(app, sink, execution.bridge_calls, call.id);
                     }
                 }
 
@@ -3662,9 +4116,42 @@ pub fn Runtime(comptime App: type) type {
                 if (steering.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (steering.text.len == 0) continue;
+                if (steering.text.len == 0 or isRecoveryPrompt(steering.text)) continue;
                 try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
             }
+        }
+
+        /// When a saved turn's message was sent: its own line's time, else its
+        /// summary's start. A turn with neither keeps the clock it finds.
+        fn promptTime(user: types.UserTurn, summary: ?types.TurnSummary) ?i64 {
+            if (user.sent_at_ms > 0) return user.sent_at_ms;
+            const value = summary orelse return null;
+            return value.started_at_ms;
+        }
+
+        /// Writes each call record as the full-only notice Ctrl+O shows, at
+        /// the time the call settled.
+        fn writeModelCallNotices(sink: anytype, records: []const types.ModelCallRecord) !void {
+            for (records) |record| {
+                var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+                defer body.deinit();
+                try full_transcript_metadata.writeModelCallText(&body.writer, record);
+                sink.setCreatedAtMs(record.at_ms);
+                try sink.appendNotice(.{
+                    .topic = full_transcript_metadata.model_call_topic,
+                    .tone = if (record.outcome == .failed) .@"error" else .neutral,
+                    .body = body.written(),
+                    .visibility = .full_only,
+                });
+            }
+        }
+
+        /// Whether a saved steering entry is fx's own prompt to a stalled turn,
+        /// which was never on screen, so a replay leaves it out.
+        fn isRecoveryPrompt(text: []const u8) bool {
+            if (recovery_prompt.fromSaved(text) == null) return false;
+            debug_trace.logf("session", "replay skipped a recovery prompt bytes={d}", .{text.len});
+            return true;
         }
 
         /// A saved steering entry as the message it was: the user's update,
@@ -3687,7 +4174,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0) {
+                if (item.text.len > 0 and !isRecoveryPrompt(item.text)) {
                     try sink.appendUserTurn(savedSteeringTurn(item.text), true);
                 }
                 index.* += 1;
@@ -3773,7 +4260,10 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
-            const outcome_decision = command_decision orelse terminal_action_decision;
+            // A shell run that returned its command running, captured or tty,
+            // has no exit status and reads "Still running", as it did live.
+            const outcome_decision = command_decision orelse terminal_action_decision orelse
+                try tool_presentation.runningCommandDecision(action_arena.allocator(), call, result.output);
             const formatted_action_base = if (deferred)
                 try app.describeToolActionDeniedWithAdvertised(
                     agent,
@@ -3806,36 +4296,23 @@ pub fn Runtime(comptime App: type) type {
                 )
             else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line
-            else if (result.status == .success) success: {
-                var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
-                const registry = app.toolAdvertisementSet(agent).registry;
-                const display_target = target: {
-                    const spec = registry.lookup(call.name) orelse break :target null;
-                    if (spec.prepare_skill_call_fn == null) break :target null;
-                    const args = tool_args.parseToolArgsObject(action_arena.allocator(), call.arguments_json) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => break :target null,
-                    };
-                    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-                    if (presentation.label_arg_kind != .name or
-                        tool_dispatch.presentationLabelValue(presentation, args) != null) break :target null;
-                    break :target skill_invocation.displayNameFromOutput(result.preview orelse result.output, &skill_name_buffer);
-                };
-                break :success try app.describeToolActionCompletedWithAdvertised(
+            else if (result.status == .success)
+                try app.describeToolActionCompletedWithAdvertised(
                     agent,
                     action_arena.allocator(),
                     call,
-                    display_target orelse action_target,
+                    action_target,
+                    &.{},
+                )
+            else
+                try app.describeToolActionDeniedWithAdvertised(
+                    agent,
+                    action_arena.allocator(),
+                    call,
+                    action_target,
+                    try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                     &.{},
                 );
-            } else try app.describeToolActionDeniedWithAdvertised(
-                agent,
-                action_arena.allocator(),
-                call,
-                action_target,
-                try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
-                &.{},
-            );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
                     try action_arena.allocator().print(
@@ -4221,6 +4698,25 @@ pub fn Runtime(comptime App: type) type {
             return sink.appendToolStatus(kind, status);
         }
 
+        /// Writes the row of each call that the command of shell call
+        /// `call_id` made through `fx mcp call`, as its live row ended, right
+        /// after the shell call's row, so the two share a group again (D99).
+        fn writeBridgeCallRows(
+            app: *App,
+            sink: anytype,
+            records: []const types.BridgeCallRecord,
+            call_id: []const u8,
+        ) !void {
+            for (records) |record| {
+                if (!std.mem.eql(u8, record.call_id, call_id)) continue;
+                const status = try tooling_presentation.bridgeCallRowSummary(app.alloc, record.tool, record.outcome);
+                defer app.alloc.free(status);
+                const kind = record.outcome.toolOutcome();
+                const entry_id = try writeCompletedToolStatus(sink, kind, status);
+                try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
+            }
+        }
+
         fn writeSavedCommandOutput(sink: anytype, output: []const u8) !bool {
             var wrote = false;
             wrote = try writeCommandEnvelope(sink, output, "<stdout>\n", "\n</stdout>", .stdout) or wrote;
@@ -4407,14 +4903,19 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             agent.session_persistence.v2_children = children;
+            bindToolboxBehind(app, agent.session_persistence.subagent_host.?);
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;
                 host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
-                // A subagent's own host can message the subagent's parent.
+                // A subagent's own host can message the subagent's parent,
+                // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
-                // Only main starts children, and only as many as the profile
-                // allows (`subagent_max_children`).
+                // Nesting follows the configured depth: an agent at the last
+                // allowed level runs children that cannot start their own, so
+                // the tree stops there. Only main starts children, and only
+                // as many as the profile allows (`subagent_max_children`).
+                host.authority_resolver.children_nest = agent.subagent_depth < app.subagent_max_depth;
                 host.setMaxChildren(app.subagent_max_children);
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
@@ -4478,7 +4979,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const rules: types.PermissionRuleSet = if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{};
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(alloc, root_id, root_id, rules)
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -4593,12 +5094,7 @@ pub fn Runtime(comptime App: type) type {
                 alloc.free(integrations);
             }
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(
-                    alloc,
-                    root_id,
-                    root_id,
-                    app.permission_engine.rules,
-                )
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -4615,7 +5111,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsOf(app, instance) else &.{},
+                if (comptime @hasField(App, "permission_engine")) app_permission_runtime.Runtime(App).grantsLocked(app, instance) else &.{},
                 permission_state,
                 if (mcp_view) |*view| view else null,
             );
@@ -5047,7 +5543,7 @@ test "session transition retires queued and running compaction only after worker
             worker: worker_runtime.WorkerRuntime = .{},
         } = .{},
         pacer: struct {
-            fn clear(_: *@This(), _: Allocator) void {}
+            pub fn clear(_: *@This(), _: Allocator) void {}
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -5286,6 +5782,7 @@ const TestApp = struct {
     startup_resume_anchor_saw_writable: bool = false,
     startup_resume_anchor_history_len: usize = 0,
     startup_resume_anchor_notice_count: usize = 0,
+    startup_resume_anchor_saw_reset: bool = false,
     action_description_allocates_scratch: bool = false,
     live_resume_prepare_count: usize = 0,
     live_resume_finish_count: usize = 0,
@@ -5423,6 +5920,7 @@ const TestApp = struct {
         self.startup_resume_anchor_saw_writable = self.agent().session_persistence.v2 != null;
         self.startup_resume_anchor_history_len = self.agent().session.historyLen();
         self.startup_resume_anchor_notice_count = self.notices.items.len;
+        self.startup_resume_anchor_saw_reset = self.shell.terminal_reset_pending;
         if (self.fail_startup_resume_anchor) return error.TestStartupResumeAnchorFailure;
     }
 
@@ -5907,7 +6405,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         null,
     );
     app.agent().session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
 
     const first_turn = try session_runtime.makeAssistantTurn(alloc, "first prompt", "first reply");
     defer session_runtime.freeHistoryTurn(alloc, first_turn);
@@ -5939,7 +6437,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     const previous_id = try alloc.dupe(u8, app.agent().session_persistence.js_host_session.?.state.id);
     defer alloc.free(previous_id);
     app.agent().session.reset(alloc);
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
     try std.testing.expect(!std.mem.eql(
         u8,
         previous_id,
@@ -5947,6 +6445,54 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     ));
     try std.testing.expect(app.agent().session_persistence.js_host_session.?.revision == null);
     try std.testing.expectEqual(@as(usize, 0), app.agent().session_persistence.js_host_session.?.state.history.len);
+}
+
+test "js-host /new starts with what the closing session saved, not the workspace's preferences" {
+    const alloc = std.testing.allocator;
+    var fake = FakeJsHostSessionStore{};
+    defer fake.deinit(alloc);
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    try Runtime(TestApp).configureStartupPreferences(
+        &app,
+        (&app).agent(),
+        .gateway,
+        "fresh/model",
+        .user_global,
+        "fresh/model",
+        .auto,
+        false,
+        true,
+        false,
+        null,
+        null,
+        null,
+        null,
+    );
+    app.agent().session_persistence.js_host_store = fake.store();
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
+
+    // As a resumed session would, this one saved a model and effort of its own.
+    const owner = &app.agent().session_persistence.js_host_session.?;
+    alloc.free(owner.state.preferences.model);
+    owner.state.preferences.model = try alloc.dupe(u8, "resumed/model");
+    owner.state.preferences.effort = types.ReasoningEffort.literal("high");
+    const previous_id = try alloc.dupe(u8, owner.state.id);
+    defer alloc.free(previous_id);
+
+    // `beginFresh` takes these on a JS host; this native test app calls the
+    // JS-host steps directly, as the tests above do.
+    var carried = Runtime(TestApp).jsHostSavedPreferences(&app, (&app).agent());
+    defer if (carried) |*value| value.deinit(alloc);
+    try std.testing.expectEqualStrings("resumed/model", carried.?.model);
+    app.agent().session.reset(alloc);
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), carried);
+
+    const fresh = &app.agent().session_persistence.js_host_session.?.state;
+    try std.testing.expect(!std.mem.eql(u8, previous_id, fresh.id));
+    try std.testing.expectEqualStrings("resumed/model", fresh.preferences.model);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), fresh.preferences.effort);
+    try std.testing.expectEqualStrings("resumed/model", app.agent().session_persistence.session_preferences.?.model);
 }
 
 test "js-host preference changes snapshot the updated session preferences" {
@@ -5981,7 +6527,7 @@ test "js-host preference changes snapshot the updated session preferences" {
         null,
     );
     app.agent().session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
 
     var result = Runtime(TestApp).commitRuntimePreferences(&app, (&app).agent(), .{
         .model = "browser/model",
@@ -6572,6 +7118,150 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
+}
+
+/// A step whose command made three calls through `fx mcp call`, two that
+/// worked and one that failed, then read a file, as a resume reads it.
+const BridgeReplayFixture = struct {
+    calls: [2]types.ToolCall = .{
+        .{ .id = "call_pages", .name = "run_command", .arguments_json = "{\"command\":\"sh pages.sh\"}" },
+        .{ .id = "call_read", .name = "read_file", .arguments_json = "{\"path\":\"notes.txt\"}" },
+    },
+    results: [2]types.PersistedToolResult = .{
+        .{
+            .tool_call_id = @constCast("call_pages"),
+            .tool_name = @constCast("run_command"),
+            .status = .success,
+            .output = @constCast("exit_code=0\n<stdout>\ncalls=3\n</stdout>\n"),
+            .output_bytes = 39,
+            .stored_output_bytes = 39,
+        },
+        .{
+            .tool_call_id = @constCast("call_read"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("notes"),
+            .output_bytes = 5,
+            .stored_output_bytes = 5,
+        },
+    },
+    bridge_calls: [4]types.BridgeCallRecord = .{
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-2", .tool = "mcp_fixture_echo", .outcome = .completed },
+        .{ .call_id = "call_pages", .request_id = "fx-mcp-call-3", .tool = "mcp_fixture_echo", .outcome = .failed },
+        // Its shell call is not in the turn, as after a compaction cut it.
+        .{ .call_id = "call_gone", .request_id = "fx-mcp-call-4", .tool = "mcp_fixture_echo", .outcome = .completed },
+    },
+    steps: [1]types.ToolExecutionStep = undefined,
+
+    fn execution(self: *BridgeReplayFixture) types.ExecutionMemory {
+        self.steps[0] = .{ .tool_calls = self.calls[0..], .tool_results = self.results[0..] };
+        return .{ .tool_steps = self.steps[0..], .bridge_calls = self.bridge_calls[0..] };
+    }
+};
+
+test "a resume shows each saved fx mcp call row right after its shell call's row, as it ended (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), fixture.execution());
+
+    const statuses = app.completed_tool_statuses.items;
+    errdefer for (statuses) |status| std.debug.print("row: {s}", .{status});
+    try std.testing.expectEqual(@as(usize, 5), statuses.len);
+    // The test app names every command row the same way.
+    try std.testing.expectEqualStrings("● Ran pwd\n", statuses[0]);
+    for (statuses[1..4], [_][]const u8{ "Ran MCP", "Ran MCP", "Failed" }) |status, label| {
+        const want = try tooling_presentation.formatToolActionValue(alloc, label, "mcp_fixture_echo");
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, status, "\n"));
+    }
+    try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● Completed read_file"));
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .completed, .failed, .completed },
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    var fixture: BridgeReplayFixture = .{};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, (&app).agent(), &sink, fixture.execution(), &labels);
+
+    // Ctrl+O has the row alone: the tool and how it ended, nothing else.
+    var bridged: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        if (!std.mem.eql(u8, detail.tool_name, "mcp_fixture_echo")) continue;
+        bridged += 1;
+        try std.testing.expectEqual(@as(?types.ToolActivityKind, .mcp), detail.activity_kind);
+        try std.testing.expect(detail.arguments_json == null);
+        try std.testing.expect(detail.result == null);
+        try std.testing.expect(detail.origin == .recorded);
+        try std.testing.expect(detail.outcome == .completed or detail.outcome == .failed);
+    }
+    try std.testing.expectEqual(@as(usize, 3), bridged);
+
+    // The compact view counts the calls that worked on one row and gives
+    // the failed one its own, as the live session showed them.
+    var group = try tool_group_projection.buildStyled(
+        alloc,
+        projection.runtime.notebook.entries.items,
+        projection.runtime.notebook.tool_details.items,
+        120,
+        .{},
+        .{},
+    );
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
+}
+
+test "execution replay shows the user's steering and not fx's own recovery prompt" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const inside = try recovery_prompt.saved(alloc, "Summarize what you just did.");
+    defer alloc.free(inside);
+    const trailing = try recovery_prompt.saved(alloc, "Your last reply had no text and no tool call.");
+    defer alloc.free(trailing);
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("focus on rendering"), .after_tool_step_count = 0 },
+        .{ .text = inside, .after_tool_step_count = 0 },
+        .{ .text = trailing, .after_tool_step_count = 1 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
+    try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
+    try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
 }
 
 test "execution replay labels shell session interactions with their launch command" {
@@ -7348,6 +8038,9 @@ test "resume restores complete command output stored behind a result handle" {
     app.requested_resume = .{ .id = try commitSessionFixture(&app, history[0]) };
     try Runtime(TestApp).resumeRequestedSession(&app, (&app).agent());
 
+    // A plain startup resume draws below the shell's earlier output.
+    try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
+    try std.testing.expect(!app.startup_resume_anchor_saw_reset);
     try std.testing.expect(std.mem.find(u8, app.command_stdout.items, "SIDECAR_STDOUT_MARKER") != null);
     try std.testing.expect(std.mem.find(u8, app.command_stdout.items, "PREVIEW_STDOUT_MARKER") == null);
     try std.testing.expect(std.mem.find(u8, app.command_stderr.items, "SIDECAR_STDERR_MARKER") != null);
@@ -8029,6 +8722,8 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
     try std.testing.expect(app.startup_resume_anchor_saw_writable);
+    // The relaunch's first frame clears the terminal before it draws.
+    try std.testing.expect(app.startup_resume_anchor_saw_reset);
     try std.testing.expectEqual(@as(usize, 3), app.startup_resume_anchor_history_len);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_notice_count);
     try std.testing.expectEqualStrings(session_id, app.agent().session_persistence.v2.?.id());
@@ -9007,6 +9702,105 @@ test "zero-output cancelled command restores detail without an output block" {
     try std.testing.expectEqual(@as(usize, 1), app.cancelled_command_detail_count);
     try std.testing.expect(!app.cancelled_command_replayed_output);
     try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
+}
+
+test "a command cancelled before it printed anything keeps its row across a persisted session restart (D100)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var session_id: ?[]u8 = null;
+    defer if (session_id) |id| alloc.free(id);
+
+    {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app, (&app).agent());
+        try app.agent().session_persistence.v2.?.beginTurn();
+        // The command printed nothing, so core keeps no replay, and its
+        // terminal names no artifact.
+        Runtime(TestApp).recordToolTerminal(
+            &app,
+            (&app).agent(),
+            .{ .terminal = .{
+                .id = .{ .turn_id = 7, .call_id = "silent-command" },
+                .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
+            } },
+            true,
+        );
+        try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), .{ .interrupted = .{
+            .user = .{ .text = @constCast("run the slow command") },
+            .tool_call = .{
+                .id = "silent-command",
+                .name = "shell",
+                .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}",
+            },
+        } });
+        session_id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
+        Runtime(TestApp).finalizePersistence(&app, (&app).agent());
+    }
+
+    var resumed = try TestApp.init(alloc, paths.workspace);
+    defer resumed.deinit();
+    try configureTestPreferences(&resumed);
+    try Runtime(TestApp).initializePersistence(&resumed, (&resumed).agent(), true);
+    resumed.requested_resume = .{ .id = try alloc.dupe(u8, session_id.?) };
+    try Runtime(TestApp).resumeRequestedSession(&resumed, (&resumed).agent());
+
+    // The command's row comes back, with no output under it.
+    try std.testing.expectEqual(@as(usize, 1), resumed.cancelled_command_detail_count);
+    try std.testing.expect(!resumed.cancelled_command_replayed_output);
+    try std.testing.expect(resumed.cancelled_command_artifact_handle == null);
+    try std.testing.expectEqual(@as(usize, 0), resumed.command_output_flush_count);
+    try std.testing.expectEqualSlices(ReplayEvent, &.{.completed_tool_status}, resumed.replay_events.items);
+}
+
+test "a resumed cancelled command row has the live row's command metadata, for its short form" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+    const history = [_]types.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("cancel it") },
+        .tool_call = .{
+            .id = "cancelled-run",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch .ready && sleep 30\"}",
+        },
+        .cancelled_command = .{},
+    } }};
+
+    try Runtime(TestApp).replayHistoryToSink(&app, (&app).agent(), &sink, &history, &labels);
+
+    // The same display and label the live row stores when the call starts,
+    // which the compact view needs to show `Cancelled touch, sleep`.
+    var cancelled_rows: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |*detail| {
+        const outcome = detail.outcome orelse continue;
+        if (outcome != .cancelled) continue;
+        cancelled_rows += 1;
+        try std.testing.expectEqualStrings("touch .ready && sleep 30", detail.command_display.?);
+        try std.testing.expectEqualStrings("Ran", detail.command_action_label.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cancelled_rows);
 }
 
 test "cancelled command replay rejects unsafe handles without partial output" {
@@ -10249,9 +11043,58 @@ test "validateSessionTitle accepts printable text and rejects malformed input" {
     try std.testing.expectError(error.EmptyTitle, V("   "));
     try std.testing.expectError(error.InvalidTitle, V("bad\ttitle"));
     try std.testing.expectError(error.InvalidTitle, V("bad\x07title"));
+    try std.testing.expectError(error.MultilineTitle, V("line one\nline two"));
+    try std.testing.expectEqualStrings("quoted title", try V("\"quoted title\""));
+    try std.testing.expectEqualStrings("single", try V("'single'"));
+    try std.testing.expectEqualStrings("padded", try V("\" padded \""));
+    try std.testing.expectEqualStrings("\"unbalanced", try V("\"unbalanced"));
+    try std.testing.expectEqualStrings("\"a\" and \"b\"", try V("\"a\" and \"b\""));
+    try std.testing.expectError(error.EmptyTitle, V("\"\""));
 
     const long = text_utils.repeat("x", session_display_metadata.max_title_bytes + 1);
     try std.testing.expectError(error.TitleTooLong, V(long));
+}
+
+test "session titles keep their rules on fuzzed input" {
+    try std.testing.fuzz({}, fuzzSessionTitle, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "  hello world \n",
+            "\"quoted title\"",
+            "'single quoted'",
+            "\"\"",
+            "\"unbalanced",
+            "\"a\" and \"b\"",
+            "\" padded \"",
+            "line one\nline two",
+            "bad\ttitle",
+            "héllo ✓",
+            "\xff\xfe",
+        }) ++ @import("fuzz_corpus").session_title.*),
+    });
+}
+
+fn fuzzSessionTitle(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [512]u8 = undefined;
+    const raw = bytes[0..@intCast(smith.slice(&bytes))];
+    const title = Runtime(TestApp).validateSessionTitle(raw) catch |err| switch (err) {
+        error.EmptyTitle, error.TitleTooLong, error.InvalidTitle, error.MultilineTitle => return,
+        error.NoActiveSession => return error.TestUnexpectedResult,
+    };
+    // The title borrows from the input.
+    try std.testing.expect(@intFromPtr(title.ptr) >= @intFromPtr(raw.ptr));
+    try std.testing.expect(@intFromPtr(title.ptr) - @intFromPtr(raw.ptr) + title.len <= raw.len);
+    try std.testing.expect(title.len > 0 and title.len <= session_display_metadata.max_title_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(title));
+    try std.testing.expectEqual(title.len, std.mem.trim(u8, title, " \t\r\n").len);
+    for (title) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+    // Either the trimmed input, or the trimmed text inside one pair of quotes.
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (!std.mem.eql(u8, trimmed, title)) {
+        try std.testing.expect(trimmed.len >= 2);
+        try std.testing.expect(trimmed[0] == '"' or trimmed[0] == '\'');
+        try std.testing.expectEqual(trimmed[0], trimmed[trimmed.len - 1]);
+        try std.testing.expectEqualStrings(std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t"), title);
+    }
 }
 
 test "renameActiveSession requires an active session" {
@@ -10560,6 +11403,34 @@ test "session title generation gates on setting, history, and prompt text" {
     try std.testing.expect(app.agent().session_persistence.title_generation.task == null);
 }
 
+test "session title generation starts once per session, even before a stopped turn reaches the history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TitleGenerationFakeApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try initTitleTestSession(&app, alloc, paths.workspace);
+    app.stream_content = "";
+
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "refactor the renderer loop");
+    try std.testing.expect(app.agent().session_persistence.title_generation.task != null);
+    try awaitTitleTask(&app);
+    try std.testing.expectEqual(.failed, app.agent().session_persistence.title_generation.last.status);
+
+    // The history is still empty, as when the next prompt interrupts the
+    // first turn before that turn is committed.
+    try std.testing.expectEqual(@as(usize, 0), app.agent().session.agent.history.items.len);
+    Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, (&app).agent(), "now write the regression test");
+    try std.testing.expect(app.agent().session_persistence.title_generation.task == null);
+}
+
 test "session title generation keeps the derived title when the provider fails" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -10766,4 +11637,62 @@ test "a failed history delivery is kept for shutdown, and later turns still save
     var restored = try reopenSaved(&app);
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+}
+
+test "a live session switch drops the finishes it holds, so a later report is not held" {
+    const App = struct {
+        alloc: Allocator = std.heap.c_allocator,
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+        } = .{},
+        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var app: App = .{};
+    defer app.pacer.deinit(app.alloc);
+    defer app.agent().worker.deinit(alloc);
+    const worker = &app.agent().worker;
+    worker.enableCommitGate();
+
+    // Turn A's finish is in the pacer, and turn B's finish is still queued.
+    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    var taken = worker.takeEvents();
+    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
+    taken.deinit(alloc);
+    try app.pacer.enqueue(app.alloc, "still showing");
+    try std.testing.expect(try app.pacer.deferFinish(app.alloc, .{ .turn = turn }));
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try std.testing.expectEqual(@as(u32, 2), worker.unacknowledged_finishes);
+
+    // The switch cancels (and clears the pacer), then drops the queued events.
+    Runtime(App).beginLiveSessionCancellation(&app, (&app).agent());
+    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
+    worker.discardEvents(alloc);
+    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+
+    // The new session's first turn finishes and is committed, and a report missed it.
+    worker.worker_processing = true;
+    worker.active_turn_id = 9;
+    worker.direct_steering_closed = true;
+    try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
+    try worker.postMail(alloc, .{
+        .prompt = try alloc.dupe(u8, "a report"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    worker.finishProcessing();
+    worker.acknowledgeFinishCommitted();
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }

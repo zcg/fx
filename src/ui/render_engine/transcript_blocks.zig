@@ -108,6 +108,10 @@ pub const FullPresentationSink = struct {
     append_override: *const fn (context: *anyopaque, entry: TranscriptEntry, out: *std.Io.Writer.Allocating) anyerror!bool,
     before_entry: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!void,
     append_detail: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!FullDetailAppend,
+    /// Whether an overridden entry starts on the row under the block before
+    /// it, with no blank row between: a model call's line under the text
+    /// the call wrote.
+    attaches_below: *const fn (context: *anyopaque, entry: TranscriptEntry, previous: TranscriptBlockKind) bool,
 };
 
 pub const AssistantTurnSegments = struct {
@@ -339,6 +343,7 @@ pub const TranscriptEntry = union(enum) {
         tone: types.NoticeTone,
         body: []const u8,
         visibility: types.NoticeVisibility,
+        detail: []const u8 = "",
         // The producer will replace this entry in place; its bytes are not
         // final and must not be released into terminal history.
         pending_replacement: bool = false,
@@ -417,6 +422,7 @@ pub const TranscriptEntry = union(enum) {
             .semantic_notice => |e| {
                 alloc.free(e.topic);
                 alloc.free(e.body);
+                alloc.free(e.detail);
             },
             .user_turn => |*e| {
                 types.freeUserTurn(alloc, e.turn);
@@ -1879,6 +1885,14 @@ pub fn renderSemanticNotice(
         if (notice.topic.len > 0) try logical.append(alloc, ' ');
         try logical.appendSlice(alloc, body);
     }
+    // The detail starts on its own row; rows from here on render dim.
+    const detail = std.mem.trim(u8, notice.detail, "\r\n");
+    const detail_start = if (detail.len > 0) blk: {
+        try logical.append(alloc, '\n');
+        const start = logical.items.len;
+        try logical.appendSlice(alloc, detail);
+        break :blk start;
+    } else logical.items.len;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -1890,6 +1904,8 @@ pub fn renderSemanticNotice(
         const indent: usize = if (row > 0) noticeContinuationIndent(logical.items, cursor, cols) else 0;
         const available: usize = @max(@as(usize, cols) -| indent, 1);
         const line = scanNoticeLine(logical.items, cursor, available);
+        var row_styles = styles;
+        if (cursor >= detail_start) row_styles.system_notice_text_style = styles.dim_style;
         try appendNoticeRow(
             &out,
             alloc,
@@ -1898,7 +1914,7 @@ pub fn renderSemanticNotice(
             cursor,
             line.end,
             indent,
-            styles,
+            row_styles,
             notice.tone,
             &active_hyperlink,
         );
@@ -1977,6 +1993,7 @@ fn renderEntryToBlockForPresentationInterruptible(
                     .tone = e.tone,
                     .body = e.body,
                     .visibility = e.visibility,
+                    .detail = e.detail,
                 },
                 styles,
                 cols,
@@ -2090,7 +2107,8 @@ pub fn renderEntriesForFullPresentationInterruptible(
         }
 
         if (sink.override_kind(sink.context, entry)) |kind| {
-            try out.writer.splatByteAll('\n', sequence.separatorNewlineCountBefore(kind));
+            const attached = if (sequence.previous_kind) |previous| sink.attaches_below(sink.context, entry, previous) else false;
+            try out.writer.splatByteAll('\n', if (attached) sequence.attachedNewlineCountBefore() else sequence.separatorNewlineCountBefore(kind));
             try sink.before_entry(sink.context, entry_id, out);
             const override_ends_with_newline = try sink.append_override(sink.context, entry, out);
             const detail = try sink.append_detail(sink.context, entry_id, out);
@@ -2195,6 +2213,10 @@ test "full presentation composition keeps normal block gaps around detail" {
             try out.writer.writeAll("\n  input\n  FULL_DETAIL\n");
             return .{ .attached = true, .ends_with_newline = true };
         }
+
+        fn attaches_below(_: *anyopaque, _: TranscriptEntry, _: TranscriptBlockKind) bool {
+            return false;
+        }
     };
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2207,6 +2229,7 @@ test "full presentation composition keeps normal block gaps around detail" {
         .append_override = Context.append_override,
         .before_entry = Context.before,
         .append_detail = Context.append_detail,
+        .attaches_below = Context.attaches_below,
     };
     try renderEntriesForFullPresentationInterruptible(
         alloc,
@@ -2304,6 +2327,12 @@ const BlockSequenceState = struct {
     fn separatorNewlineCountBefore(self: BlockSequenceState, next_kind: TranscriptBlockKind) u16 {
         if (!self.emitted_any) return 0;
         return blockSeparatorNewlineCount(self.previous_kind.?, next_kind) -| @intFromBool(self.previous_ends_with_newline);
+    }
+
+    /// The newlines that start a block on the row under the last one.
+    fn attachedNewlineCountBefore(self: BlockSequenceState) u16 {
+        if (!self.emitted_any) return 0;
+        return 1 -| @intFromBool(self.previous_ends_with_newline);
     }
 
     fn observe(
@@ -3253,6 +3282,7 @@ fn appendSemanticNoticeTestEntry(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .detail = owned.detail,
     } });
 }
 
@@ -3367,6 +3397,35 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
         try std.testing.expectEqual(case.label_fg, fg_index(grid.cellAt(1, colon_col).?));
         try std.testing.expectEqual(@as(u8, 7), fg_index(grid.cellAt(1, colon_col + 2).?));
     }
+}
+
+test "semantic notice detail renders dim on its own indented rows" {
+    const alloc = std.testing.allocator;
+    const styles: Styles = .{
+        .system_notice_text_style = "<T>",
+        .dim_style = "<D>",
+        .reset_style = "<R>",
+    };
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Using Vercel team Acme (acme).",
+        .detail = "Get more tokens with a pass",
+    }, styles, 20);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "<T>* <R><T>Using Vercel team<R>\n  <T>Acme (acme).<R>\n  <D>Get more tokens<R>\n  <D>with a pass<R>",
+        rendered,
+    );
+
+    const plain = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Using Vercel team Acme (acme).",
+    }, styles, 80);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "<D>") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "\n") == null);
 }
 
 test "semantic notice topics never render the tool-activity bullet or forced capitalization" {

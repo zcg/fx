@@ -99,7 +99,8 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 /// resumes it without counting a crash (`RequestRecovery.closeActive`,
 /// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
 /// the terminal and re-raises as the handler did before. Without that
-/// thread, the handler restores and re-raises itself.
+/// thread, the handler restores and re-raises itself. A terminal that hangs
+/// up closes fx the same way (`closeOnHangup`).
 var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var close_signal: std.atomic.Value(i32) = .init(0);
 var closer_tmux = false;
@@ -122,12 +123,38 @@ fn closerMain() void {
     }
     const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
     const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing signal={d} record_saved={}", .{ close_signal.load(.seq_cst), saved });
+    debug_trace.logf("app", "event=closing signal={d} records_saved={d}", .{ close_signal.load(.seq_cst), saved });
     if (closer_tmux) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
     } else {
         abnormalExitHandlerWithRestore(abnormal_exit_restore, sig);
     }
+}
+
+/// A terminal that hangs up is a closed window too, and fx often sees the
+/// hang-up before SIGHUP. With a turn running, fx closes here as `closerMain`
+/// does: it saves the request in flight marked clean and ends by SIGHUP, so
+/// the turn stays open and the next launch resumes it
+/// (`tests/tla/recovery/Resume.tla` Close). A graceful shutdown would cancel
+/// the turn as Esc does, and nothing would send it again. Returns only when
+/// no turn is running.
+pub fn closeOnHangup(turn_running: bool) void {
+    if (!turn_running) return;
+    const saved = request_recovery.RequestRecovery.closeActive();
+    debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turn=left_open", .{saved});
+    // Windows has no SIGHUP and no signal handler to restore: the close is
+    // the saved record above, and the process ends with a hangup status.
+    if (comptime builtin.target.os.tag == .windows) {
+        std.c._exit(129);
+    }
+    if (io_mod.getenv("TMUX") != null) {
+        abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);
+    } else {
+        abnormalExitHandlerWithRestore(abnormal_exit_restore, std.posix.SIG.HUP);
+    }
+    // SIGHUP is blocked in this thread: end at once, with the status it
+    // gives, as a death by SIGHUP would.
+    std.c._exit(128 + @as(c_int, @intCast(@backingInt(std.posix.SIG.HUP))));
 }
 
 /// Starts the closer once per process. False when it cannot run.
@@ -266,12 +293,18 @@ pub const StartupState = struct {
     /// The bound a subagent turn gets. A configured `max_agent_steps` wins;
     /// otherwise children stay finite even though main does not.
     subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
-    /// How many subagents main may run at once, 1 to 16; a subagent never
-    /// starts one of its own (`subagent.max_subagent_depth`).
+    /// How many subagents main may run at once, 0 to 16; how deep the tree
+    /// may go is `subagent_max_depth`, and a host beyond it starts none.
     subagent_max_children: usize = agent_steps.default_subagent_max_children,
+    /// How many levels of subagents a session may run below main, 0 to 2.
+    /// Depth 1 (the default) means a child cannot start one of its own.
+    subagent_max_depth: usize = agent_steps.default_subagent_max_depth,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// Where built-in tools are offered, from the settings files; a host
+    /// applies `--tool-placement` over it.
+    tool_placement: config_runtime.tool_placement.Overrides = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
@@ -334,6 +367,7 @@ pub const StartupState = struct {
             .agent_step_limit = self.agent_step_limit,
             .subagent_agent_step_limit = self.subagent_agent_step_limit,
             .subagent_max_children = self.subagent_max_children,
+            .subagent_max_depth = self.subagent_max_depth,
         };
     }
 
@@ -465,7 +499,7 @@ pub const ModelOrigin = enum {
         };
     }
 
-    fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
+    pub fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
         if (env_model != null) return .env;
         return if (settings.models.get(provider) != null) .settings else .default;
     }
@@ -487,9 +521,10 @@ pub const StartupStatus = struct {
     /// The bound a subagent turn gets. A configured `max_agent_steps` wins;
     /// otherwise children stay finite even though main does not.
     subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
-    /// How many subagents a session may run at once; a subagent never starts
-    /// one of its own.
+    /// How many subagents a session may run at once, and how deep its tree
+    /// may go (`subagent_max_depth`; a host beyond it starts none).
     subagent_max_children: usize = agent_steps.default_subagent_max_children,
+    subagent_max_depth: usize = agent_steps.default_subagent_max_depth,
     update_channel: update_target.Channel = .stable,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
 
@@ -519,6 +554,11 @@ pub const BootstrapConfig = struct {
     terminal_title: host.TerminalTitle,
     footer_rows: u16,
     startup_min_body_rows: u16 = 0,
+    /// The terminal still shows the screen of the fx build this launch
+    /// replaces after an update, and the first frame clears it and draws the
+    /// conversation from the top. Startup leaves that screen where it is
+    /// instead of scrolling it to keep rows free for the welcome.
+    takes_over_screen: bool = false,
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
@@ -767,6 +807,7 @@ pub fn loadStartupStatusWithAuthMode(
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .subagent_agent_step_limit = loadSubagentAgentStepLimit(settings.subagent_max_agent_steps),
         .subagent_max_children = agent_steps.resolveSubagentMaxChildren(settings.subagent_max_children),
+        .subagent_max_depth = agent_steps.resolveSubagentMaxDepthWithOverride(settings.subagent_max_depth),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
     };
@@ -985,9 +1026,11 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.agent_step_limit = loadAgentStepLimit(state.agent_step_limit, settings.max_agent_steps);
     state.subagent_agent_step_limit = loadSubagentAgentStepLimit(settings.subagent_max_agent_steps);
     state.subagent_max_children = agent_steps.resolveSubagentMaxChildrenWithOverride(settings.subagent_max_children);
+    state.subagent_max_depth = agent_steps.resolveSubagentMaxDepthWithOverride(settings.subagent_max_depth);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
+    state.tool_placement = settings.tool_placement;
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(
         state.model_source,
@@ -1131,7 +1174,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.fx_version,
     ) catch |err| {
         debug_trace.logf("record", "startup recording failed err={s}", .{@errorName(err)});
-        return error.RecordingStartFailed;
+        return record_tape.startFailure(err);
     };
 
     // The shadow VT is load-bearing: frame commit diffs the target
@@ -1192,7 +1235,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         break :blk row;
     };
     var launch_start_row = start_row;
-    const effective_startup_min_body_rows = try prepareStartupViewport(
+    const effective_startup_min_body_rows = if (cfg.takes_over_screen) kept: {
+        // Scrolling here would move the old screen up until the first frame
+        // clears it.
+        debug_trace.logf("render", "launch_scrollback_push skipped start_row={d} reason=first_frame_clears_terminal", .{start_row});
+        break :kept cfg.startup_min_body_rows;
+    } else try prepareStartupViewport(
         cfg.shell,
         cfg.metrics,
         &launch_start_row,
@@ -1453,6 +1501,7 @@ fn resumeTerminalAfterJobControl(
     try terminal.captureOriginalTermios();
     try terminal.enableRawMode();
     try enableInteractiveTerminalModes(shell, metrics);
+    debug_trace.logf("app", "event=job_control_resume_redraw dropped=terminal_screen_and_scrollback reason=resumed_after_suspend", .{});
     try shell.requestTerminalReset(metrics);
     shell.render_requests.request(.first_frame);
 }

@@ -49,7 +49,10 @@ pub const Agent = struct {
     /// session. A subagent records none; its go to the instance at the
     /// top of its tree (`root_instance`). Each entry owns its strings,
     /// allocated with the app's allocator. Guarded by the app's permission
-    /// authority lock.
+    /// authority lock: every agent's worker adds to it, so every write and every
+    /// read holds the lock, and a reader that keeps what it reads takes a copy
+    /// (`copyGrants`). Only freeing it, after the instance's tree has stopped,
+    /// takes no lock.
     session_grants: std.ArrayList(types.PermissionGrant) = .empty,
     submission: submission_state.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -68,6 +71,11 @@ pub const Agent = struct {
     total_web_search_requests: u64 = 0,
     /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
+    /// How many levels of subagents sit above this agent: 0 for an instance,
+    /// 1 for a child main started, 2 for a child of one. Set once when the
+    /// agent is created, and read by its host to decide whether its children
+    /// may start subagents of their own (`subagent_max_depth`).
+    subagent_depth: usize = 0,
     /// Whether one of its turns was going when the host last looked, so the
     /// host can tell when one ends. Main loop only.
     was_working: bool = false,

@@ -1,0 +1,109 @@
+diff --git a/src/core/subagent/managed_owner.zig b/src/core/subagent/managed_owner.zig
+index 7bce7e4a4..25c12f5dd 100644
+--- a/src/core/subagent/managed_owner.zig
++++ b/src/core/subagent/managed_owner.zig
+@@ -21,7 +21,10 @@ const types = @import("../shared/types.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const StartResult = enum { started, already_running };
+-pub const StartError = error{ OutOfMemory, OwnerClosed, ChildUnavailable, ThreadSpawnFailed };
++/// Errors `start` reports to main. `TooManyChildren` is the whole-session
++/// permit: main may run `max_running` children at once, and a call past that
++/// gets this instead of another thread.
++pub const StartError = error{ OutOfMemory, OwnerClosed, ChildUnavailable, ThreadSpawnFailed, TooManyChildren };
+ pub const WaitError = error{ OutOfMemory, ChildUnavailable, StateUnavailable };
+ pub const CancelError = error{ChildUnavailable};
+ 
+@@ -131,6 +134,11 @@ pub const Owner = struct {
+     authority_resolver: *authority.Resolver,
+     approvals: *approval_registry.Registry,
+     max_history_turns: usize = 8,
++    /// The most children this owner runs at once. A start past it fails with
++    /// `TooManyChildren` instead of spawning another slot thread, so the
++    /// thread count follows this bound and not the number of calls. Resolved
++    /// from `subagent_max_children` by the host.
++    max_running: usize = 4,
+     mutex: std.Io.Mutex = .init,
+     waiters_changed: std.Io.Condition = .init,
+     slots: std.ArrayList(*Slot) = .empty,
+@@ -229,6 +237,22 @@ pub const Owner = struct {
+         return false;
+     }
+ 
++    /// Whether one more child would still be within `max_running`. Admission
++    /// asks before it records a new child, so a refused call leaves no child
++    /// behind that never ran. Only slots still working count: a finished
++    /// slot that waits to be reaped holds no permit, so a session that
++    /// stopped its children can start new ones.
++    pub fn hasCapacity(self: *Owner) bool {
++        self.mutex.lockUncancelable(io_mod.getIo());
++        defer self.mutex.unlock(io_mod.getIo());
++        if (self.closed) return false;
++        var running: usize = 0;
++        for (self.slots.items) |slot| {
++            if (slot.completion == .running) running += 1;
++        }
++        return running < self.max_running;
++    }
++
+     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
+         // A single-threaded build, such as the WebAssembly terminal, has no
+         // slot threads, and its subagent tool is off, so no child is started.
+@@ -261,6 +285,16 @@ pub const Owner = struct {
+                         item.deinit(self.alloc);
+                     } else feedback_index += 1;
+                 }
++                // New child: this slot is the permit. A session that already
++                // runs `max_running` children starts none more, so the thread
++                // count follows the setting and not the calls. Only slots
++                // still working hold a permit; a finished slot waits for its
++                // own reap and never blocks a new child.
++                var running: usize = 0;
++                for (self.slots.items) |slot| {
++                    if (slot.completion == .running) running += 1;
++                }
++                if (running >= self.max_running) return error.TooManyChildren;
+                 const slot = try self.alloc.create(Slot);
+                 errdefer self.alloc.destroy(slot);
+                 slot.* = .{
+@@ -405,6 +439,27 @@ pub const Owner = struct {
+         return false;
+     }
+ 
++    /// Removes a child whose slot already finished, so its next work starts a
++    /// fresh slot instead of reusing the retired one, and its thread is
++    /// joined now rather than at shutdown. Returns whether a slot was
++    /// removed; one still running, or one a caller is waiting on, is left
++    /// for its own reap.
++    pub fn reapSlot(self: *Owner, child_id: []const u8) bool {
++        const slot = blk: {
++            self.mutex.lockUncancelable(io_mod.getIo());
++            defer self.mutex.unlock(io_mod.getIo());
++            for (self.slots.items, 0..) |candidate, index| {
++                if (!std.mem.eql(u8, candidate.child_id, child_id)) continue;
++                if (candidate.completion == .running) return false;
++                if (candidate.waiters != 0) return false;
++                break :blk self.slots.swapRemove(index);
++            }
++            return false;
++        };
++        destroySlot(self, slot);
++        return true;
++    }
++
+     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
+         self.mutex.lockUncancelable(io_mod.getIo());
+         defer self.mutex.unlock(io_mod.getIo());
+@@ -815,7 +870,11 @@ fn runOne(slot: *Slot) OneOutcome {
+         .work_id = work_id,
+         .outcome = switch (result) {
+             .completed => .completed,
+-            .awaiting_approval, .paused => .interrupted,
++            // A turn that paused keeps its work; a failure inside it must not
++            // read as "the turn is still running". The child's parent decides
++            // whether to continue it, so it is reported as paused.
++            .paused => .paused,
++            .awaiting_approval => .interrupted,
+         },
+     };
+ }

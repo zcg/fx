@@ -1,0 +1,350 @@
+diff --git a/src/core/cli/cli_surface.zig b/src/core/cli/cli_surface.zig
+index 94744666c..b306fb55e 100644
+--- a/src/core/cli/cli_surface.zig
++++ b/src/core/cli/cli_surface.zig
+@@ -1,6 +1,7 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const io_mod = @import("../shared/io.zig");
++const term_mode = @import("../shared/term_mode.zig");
+ const app_lifecycle = @import("../app/app_lifecycle.zig");
+ const auth_runtime = @import("../auth/auth_runtime.zig");
+ const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+@@ -29,6 +30,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
+ const doctor_runtime = @import("doctor_runtime.zig");
+ const gateway_provider = @import("../gateway/gateway_provider.zig");
+ const model_catalog = @import("../gateway/model_catalog.zig");
++const chat_completions = @import("../../gateway/chat_completions.zig");
+ const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
+ const model_capabilities = @import("../config/model_capabilities.zig");
+ const provider_set = @import("../gateway/provider_set.zig");
+@@ -39,6 +41,7 @@ const host = @import("../hosts/host.zig");
+ const login_flow = @import("../auth/login_flow.zig");
+ const oauth_transport = @import("../auth/oauth_transport.zig");
+ const provider_catalog = @import("../auth/provider_catalog.zig");
++const secret_mod = @import("../auth/secret.zig");
+ const secret = @import("../auth/secret.zig");
+ const output_contracts = @import("../output/output_contracts.zig");
+ const prompt_policy = @import("../config/prompt_policy.zig");
+@@ -455,6 +458,8 @@ const RunDeps = struct {
+     write_stdout: WriteFn = writeRealStdout,
+     write_stderr: WriteFn = writeRealStderr,
+     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
++    /// Startup state for a command that lists models, which needs no model chosen.
++    load_catalog_startup_state: LoadStartupStateFn = app_lifecycle.loadCatalogStartupState,
+     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
+     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
+     load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
+@@ -1032,7 +1037,9 @@ fn launchWordSuggestion(command_catalog: CommandCatalog, word: []const u8) ?[]co
+ 
+ /// Detects `fx <subcommand> --help` / `-h` and returns the subcommand kind so the
+ /// caller can render command-specific help. Top-level `fx --help`/`fx help` are
+-/// handled separately and intentionally excluded here.
++/// handled separately and intentionally excluded here. A `--help` after `--`
++/// is part of the prompt, not a request for help, so the scan stops there
++/// (docs/audit/2026-11-06-full-review.md section 2.2).
+ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const u8) ?TopLevelKind {
+     if (args.len < 2) return null;
+     const kind = command_specs.topLevelKindFromToken(command_catalog, args[0]) orelse return null;
+@@ -1040,6 +1047,7 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const
+     // `fx resume` was removed, so its help request gets the removal hint.
+     if (kind == .@"resume" and std.mem.eql(u8, args[0], "resume")) return null;
+     for (args[1..]) |arg| {
++        if (std.mem.eql(u8, arg, "--")) break;
+         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return kind;
+     }
+     return null;
+@@ -1165,6 +1173,91 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
+     });
+ }
+ 
++/// Deletes a configured connection, its saved model, and its stored key. The
++/// built-in providers are refused: `gateway`, `codex`, and `grok` are not
++/// connections the profile defines, so there is nothing to delete.
++fn removeConfiguredProviderCommand(
++    alloc: Allocator,
++    cfg: Config,
++    deps: RunDeps,
++    name: []const u8,
++) !RunResult {
++    _ = cfg;
++    if (name.len == 0 or name.len > 64) {
++        try writeStderr(deps, "fx provider remove: expected a configured provider name\n");
++        return usage_failure;
++    }
++    if (provider_catalog.parse(name) != null) {
++        try writeStderr(deps, "fx provider remove: the built-in providers cannot be removed\n");
++        return usage_failure;
++    }
++    var attempt = config_runtime.attemptUserPreferences(alloc, .{ .remove_provider = name });
++    defer attempt.deinit(alloc);
++    switch (attempt) {
++        .failure => {
++            try writeStderr(deps, "fx provider remove: the settings could not be saved\n");
++            return .handled_failure;
++        },
++        .outcome => |outcome| {
++            if (outcome == .unchanged) {
++                const message = try alloc.print("fx provider remove: no configured provider named {s}\n", .{name});
++                defer alloc.free(message);
++                try writeStderr(deps, message);
++                return .handled_failure;
++            }
++        },
++    }
++    const message = try alloc.print("Removed provider {s}.\n", .{name});
++    defer alloc.free(message);
++    try writeStdout(deps, message);
++    return .handled_success;
++}
++
++/// The first model a configured provider offers, or null when its catalog
++/// cannot be read. Used when a provider is selected before any model of its own
++/// was saved, so switching to a freshly added provider works instead of asking
++/// the user to run a second command.
++fn resolveFirstCatalogModel(
++    alloc: Allocator,
++    cfg: Config,
++    settings: config_runtime.Settings,
++    bound: model_provider.ProviderId,
++) !?[]u8 {
++    const definition = settings.providers orelse return null;
++    const entry = definition.get(bound.label()) orelse return null;
++    const provider = chat_completions.model_catalog_provider(entry);
++    const access: credentials.CatalogAccess = blk: {
++        if (cfg.auth_mode == .host_managed) break :blk .host_managed;
++        const token: ?[]const u8 = switch (entry.auth) {
++            .none => null,
++            .bearer => |key| key,
++        };
++        const value = token orelse break :blk .{ .public_only = .no_credential };
++        break :blk .{ .authenticated = .{
++            .source = .stored_key,
++            .credential = value,
++            .team_context = null,
++        } };
++    };
++    const fetched = model_catalog.fetchWithPublicFallback(provider, alloc, .{
++        .access = access,
++        .endpoint = cfg.models_path,
++        .view = .picker,
++    });
++    switch (fetched) {
++        .failed => |failure| {
++            debug_trace.logf("catalog", "provider switch catalog failed provider={s} category={s}", .{ bound.label(), @tagName(failure.failure.category) });
++            return null;
++        },
++        .loaded => |loaded| {
++            var catalog = loaded.catalog;
++            defer model_catalog.freeModelCatalog(alloc, &catalog);
++            if (catalog.items.len == 0) return null;
++            return try alloc.dupe(u8, catalog.items[0].id);
++        },
++    }
++}
++
+ fn activateProviderSelectionFallible(
+     alloc: Allocator,
+     cfg: Config,
+@@ -1194,7 +1287,18 @@ fn activateProviderSelectionFallible(
+             },
+             error.ConfiguredProviderChanged => return err,
+         };
+-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
++        // A configured provider that has never been used has no saved model.
++        // Switching to it is still a reasonable thing to ask for, so its own
++        // catalog is read and the first model it offers is saved: that is the
++        // same model the picker would offer first, and the user can change it
++        // afterwards. A provider whose catalog cannot be read keeps the error,
++        // because switching to a provider with no usable model would only fail
++        // on the next request.
++        const selected_model = settings.models.get(bound) orelse blk: {
++            const resolved = try resolveFirstCatalogModel(alloc, cfg, settings, bound);
++            break :blk resolved orelse return error.ConfiguredModelNotSelected;
++        };
++        defer if (settings.models.get(bound) == null) alloc.free(@constCast(selected_model));
+         var attempt = config_runtime.attemptUserPreferences(alloc, .{
+             .provider = bound,
+             .model_preference = .{ .provider = bound, .model = selected_model },
+@@ -1270,7 +1374,7 @@ fn activateProviderSelectionFallible(
+                 .codex => "Codex credential is unavailable",
+                 .grok => "Grok credential is unavailable",
+                 .gateway => "configure a Gateway credential first",
+-                .configured => "configure the provider auth environment variable first",
++                .configured => "set the provider API key in settings.json first",
+             },
+         );
+         return false;
+@@ -1704,8 +1808,14 @@ fn runNonInteractiveWithDeps(
+             return .handled_success;
+         },
+         .provider => |rest| {
++            // `fx provider remove <name>` deletes a configured connection and the
++            // key stored with it. The built-in providers are not removable, so
++            // the subcommand applies only to a configured name.
++            if (rest.len == 2 and std.mem.eql(u8, rest[0], "remove")) {
++                return removeConfiguredProviderCommand(alloc, cfg, deps, rest[1]);
++            }
+             if (rest.len != 1) {
+-                try writeStderr(deps, "usage: fx provider <name>\n");
++                try writeStderr(deps, "usage: fx provider <name>\n       fx provider remove <name>\n");
+                 return usage_failure;
+             }
+             const target = model_provider.parse(rest[0]) orelse {
+@@ -1769,7 +1879,7 @@ fn runNonInteractiveWithDeps(
+             snapshot.mcp = localMcpView(&mcp_inspection);
+             snapshot.provider_endpoint = startup.provider_endpoint;
+             snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
+-            const fx_home = try profile_paths.activeRoot(alloc, io_mod.getenv("HOME"));
++            const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
+             defer if (fx_home) |path| alloc.free(path);
+             snapshot.fx_home = fx_home;
+             if (opts.format == .json) {
+@@ -1846,7 +1956,7 @@ fn runNonInteractiveWithDeps(
+                     null,
+                 )
+             else
+-                try deps.load_startup_state(
++                try deps.load_catalog_startup_state(
+                     alloc,
+                     cfg.gateway_provider.oauth_transport,
+                     cfg.secret_store,
+@@ -2112,9 +2222,10 @@ fn runNonInteractiveWithDeps(
+                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
+                 return usage_failure;
+             };
+-            // A relative $HOME counts as unset, as everywhere else in fx, and
+-            // with HOME unset FX_HOME's parent serves.
+-            const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse "";
++            // The home directory is `HOME` where it is set, and on Windows
++            // `USERPROFILE` where it is not. With neither, FX_HOME's parent
++            // serves.
++            const home = profile_paths.homeFromEnvironment(deps.getenv, deps.env_ctx) orelse "";
+             if (!std.Io.Dir.path.isAbsolute(home)) {
+                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
+                 return .handled_failure;
+@@ -2232,7 +2343,7 @@ fn runNonInteractiveWithDeps(
+             const shell = if (rest.len == 1) completion.parseShell(rest[0]) else null;
+             if (shell == null) {
+                 if (rest.len == 1) {
+-                    try writeStderrLine(alloc, deps, "fx completion: unknown shell {s}; choose bash, zsh, or fish\n", rest[0]);
++                    try writeStderrLine(alloc, deps, "fx completion: unknown shell {s}; choose bash, zsh, fish, or pwsh\n", rest[0]);
+                 }
+                 try writeTopLevelUsage(cfg.command_catalog, deps, .completion);
+                 return usage_failure;
+@@ -2458,8 +2569,7 @@ fn writePasteFailure(alloc: Allocator, deps: RunDeps, command: []const u8, probl
+ }
+ 
+ fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
+-    return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
+-        std.c.isatty(std.posix.STDERR_FILENO) != 0;
++    return io_mod.stdinIsTty() and io_mod.stderrIsTty();
+ }
+ 
+ fn readMaskedKeyDefault(
+@@ -2478,7 +2588,7 @@ fn readMaskedKeyDefault(
+ 
+     while (input.items.len < 8 * 1024) {
+         var byte: [1]u8 = undefined;
+-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
++        if (try io_mod.readFd(io_mod.stdinHandle(), &byte) == 0) return error.SetupCancelled;
+         switch (byte[0]) {
+             '\r', '\n' => {
+                 if (input.items.len == 0) continue;
+@@ -2506,50 +2616,23 @@ fn readMaskedKeyDefault(
+ }
+ 
+ const MaskedKeyRawMode = struct {
+-    original: std.posix.termios = undefined,
++    saved: term_mode.Saved = undefined,
+     active: bool = false,
+ 
+     fn enable() !MaskedKeyRawMode {
+-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
+-            std.c.isatty(std.posix.STDERR_FILENO) == 0)
+-        {
++        if (!io_mod.stdinIsTty() or !io_mod.stderrIsTty()) {
+             return error.NotATerminal;
+         }
+-
+         var self: MaskedKeyRawMode = .{};
+-        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
+-        var raw = self.original;
+-        raw.iflag.BRKINT = false;
+-        raw.iflag.ICRNL = false;
+-        raw.iflag.INPCK = false;
+-        raw.iflag.ISTRIP = false;
+-        raw.iflag.IXON = false;
+-        raw.iflag.IXOFF = false;
+-        raw.cflag.CSIZE = .CS8;
+-        raw.lflag.ECHO = false;
+-        raw.lflag.ICANON = false;
+-        raw.lflag.IEXTEN = false;
+-        raw.lflag.ISIG = false;
+-        const vmin_idx = switch (builtin.target.os.tag) {
+-            .linux => 6,
+-            else => 16,
+-        };
+-        const vtime_idx = switch (builtin.target.os.tag) {
+-            .linux => 5,
+-            else => 17,
+-        };
+-        if (vmin_idx < raw.cc.len and vtime_idx < raw.cc.len) {
+-            raw.cc[vmin_idx] = 1;
+-            raw.cc[vtime_idx] = 0;
+-        }
+-        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
++        self.saved = try term_mode.capture(io_mod.stdinHandle(), io_mod.stderrHandle());
++        try term_mode.enableRaw(self.saved, io_mod.stdinHandle(), io_mod.stderrHandle());
+         self.active = true;
+         return self;
+     }
+ 
+     fn disable(self: *MaskedKeyRawMode) void {
+         if (!self.active) return;
+-        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
++        term_mode.restore(self.saved, io_mod.stdinHandle(), io_mod.stderrHandle());
+         self.active = false;
+     }
+ };
+@@ -2689,16 +2772,16 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
+ 
+ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
+     if (comptime builtin.target.os.tag != .windows) {
+-        return writeFdAll(std.posix.STDOUT_FILENO, text);
++        return writeFdAll(io_mod.stdoutHandle(), text);
+     }
+-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
++    try io_mod.writeFd(io_mod.stdoutHandle(), text);
+ }
+ 
+ fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
+     if (comptime builtin.target.os.tag != .windows) {
+-        return writeFdAll(std.posix.STDERR_FILENO, text);
++        return writeFdAll(io_mod.stderrHandle(), text);
+     }
+-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
++    try io_mod.writeFd(io_mod.stderrHandle(), text);
+ }
+ 
+ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
+@@ -2746,8 +2829,9 @@ fn runTopLevelMcp(
+ 
+ /// `fx mcp`: the verbs `/mcp` shares.
+ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+-    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
+-    const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse {
++    // `HOME` where it is set, `USERPROFILE` on Windows where it is not, and
++    // FX_HOME's parent when neither names a home.
++    const home = profile_paths.homeFromEnvironment(deps.getenv, deps.env_ctx) orelse {
+         try writeStderr(deps, "fx mcp: HOME isn't set\n");
+         return .handled_failure;
+     };
+@@ -3142,6 +3226,7 @@ fn modelDetails(
+         );
+         detail.* = .{
+             .name = if (entry) |found| found.name else null,
++            .owned_by = if (entry) |found| found.owned_by else null,
+             .efforts = capabilities.reasoning_efforts,
+             .fast = capabilities.supports_fast_mode,
+             .ultrafast = provider == .gateway and capabilities.supports_ultrafast_mode,

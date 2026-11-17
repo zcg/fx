@@ -1,0 +1,127 @@
+diff --git a/src/core/cli/doctor_runtime.zig b/src/core/cli/doctor_runtime.zig
+index 043e26eac..2a1758caa 100644
+--- a/src/core/cli/doctor_runtime.zig
++++ b/src/core/cli/doctor_runtime.zig
+@@ -1,4 +1,5 @@
+ const std = @import("std");
++const builtin = @import("builtin");
+ const profile_paths = @import("../shared/profile_paths.zig");
+ const auth_runtime = @import("../auth/auth_runtime.zig");
+ const debug_trace = @import("../shared/debug_trace.zig");
+@@ -134,11 +135,81 @@ pub fn collect(
+     try appendStateChecks(&checks, alloc);
+     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
+     try appendGhCheck(&checks, alloc);
++    if (comptime builtin.target.os.tag == .windows) {
++        try appendWindowsChecks(&checks, alloc);
++    }
+ 
+     snapshot.checks = try checks.toOwnedSlice(alloc);
+     return snapshot;
+ }
+ 
++/// The checks that only mean something on Windows, where the shell, the console
++/// code page, and credential protection all differ from the POSIX assumptions
++/// the rest of doctor makes.
++fn appendWindowsChecks(
++    checks: *std.ArrayList(Check),
++    alloc: Allocator,
++) !void {
++    // Which shell commands will actually run in. An undetected shell means
++    // every shell tool call fails, so it is a failure rather than a warning.
++    const shell_resolver = @import("../terminal/shell_resolver.zig");
++    var shell_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
++    if (shell_resolver.windowsLoginShellInto(&shell_buffer)) |shell_path| {
++        const detail = try alloc.print("shell commands run in {s}", .{shell_path});
++        try appendCheckOwned(checks, alloc, "shell", .ok, detail);
++    } else {
++        try appendCheckOwned(
++            checks,
++            alloc,
++            "shell",
++            .fail,
++            try alloc.dupe(u8, "no PowerShell, Git Bash, or cmd.exe was found; shell commands cannot run"),
++        );
++    }
++
++    // Whether the console can carry fx's UTF-8 output. A console that refuses
++    // the code page shows mojibake for anything outside ASCII.
++    if (consoleCodePageStatus()) |status| {
++        try appendCheckOwned(checks, alloc, "console", status.kind, try alloc.dupe(u8, status.detail));
++    }
++
++    // Where credentials live. On Windows the profile file relies on an
++    // inherited ACL and is not encrypted, so doctor says so instead of implying
++    // the protection macOS gets from the Keychain.
++    try appendCheckOwned(
++        checks,
++        alloc,
++        "credentials",
++        .warn,
++        try alloc.dupe(u8, "stored in the profile file, protected by its folder's ACL and not encrypted; " ++
++            "use a dedicated Windows account if other accounts can read your profile"),
++    );
++}
++
++const ConsoleCodePageStatus = struct {
++    kind: CheckStatus,
++    detail: []const u8,
++};
++
++/// What the console's output code page currently is.
++fn consoleCodePageStatus() ?ConsoleCodePageStatus {
++    if (comptime builtin.target.os.tag != .windows) return null;
++    const code_page = kernel32.GetConsoleOutputCP();
++    if (code_page == 0) {
++        // No console attached: a redirected run, where the code page does not
++        // apply.
++        return .{ .kind = .ok, .detail = "no console attached" };
++    }
++    if (code_page == 65001) {
++        return .{ .kind = .ok, .detail = "output code page is UTF-8 (65001)" };
++    }
++    return .{ .kind = .warn, .detail = "output code page is not UTF-8; fx sets it while it runs, and non-ASCII text in other programs may look wrong" };
++}
++
++const kernel32 = if (builtin.target.os.tag != .windows) struct {} else struct {
++    extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) u32;
++};
++
+ fn appendConfigDiagnosticChecks(
+     checks: *std.ArrayList(Check),
+     alloc: Allocator,
+@@ -551,14 +622,32 @@ fn commandInPathValue(alloc: Allocator, command_name: []const u8, path_env: []co
+             continue;
+         };
+ 
+-        if (pathExists(candidate)) {
+-            return true;
++        if (pathExists(candidate)) return true;
++
++        // Windows stores a program under an extension from `PATHEXT`, so `gh` on
++        // the path is the file `gh.exe`, `gh.cmd`, `gh.bat`, or `gh.com`. Asking
++        // for the bare name would report a program that is installed as missing.
++        if (comptime builtin.target.os.tag == .windows) {
++            for (windows_program_extensions) |extension| {
++                var with_extension_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
++                const with_extension = std.mem.print(
++                    &with_extension_buf,
++                    "{s}" ++ std.Io.Dir.path.sep_str ++ "{s}{s}",
++                    .{ entry, command_name, extension },
++                ) catch continue;
++                if (pathExists(with_extension)) return true;
++            }
+         }
+     }
+ 
+     return false;
+ }
+ 
++/// The extensions Windows gives an executable, in the order `cmd` looks for
++/// them. A user's `PATHEXT` may add more; these cover the ones a program is
++/// installed under.
++const windows_program_extensions = [_][]const u8{ ".exe", ".cmd", ".bat", ".com" };
++
+ fn pathExists(path: []const u8) bool {
+     if (comptime @import("builtin").target.os.tag != .windows) {
+         return accessPath(path) catch false;

@@ -13,8 +13,13 @@ const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const kept_sign_outs = @import("kept_sign_outs.zig");
 const secret = @import("../auth/secret.zig");
+const auth_oauth = @import("../auth/oauth.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const slack = @import("slack.zig");
+const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
@@ -37,6 +42,14 @@ pub const Surface = enum {
         return switch (s) {
             .cli => "fx mcp",
             .shell => "/mcp",
+        };
+    }
+
+    /// `prog` after its article, as said aloud: "an fx mcp", "a /mcp".
+    fn progWithArticle(s: Surface) []const u8 {
+        return switch (s) {
+            .cli => "an fx mcp",
+            .shell => "a /mcp",
         };
     }
 };
@@ -86,9 +99,10 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         if (std.mem.eql(u8, old, "reload")) return moved(arena, "{s} reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", .{p});
         if (std.mem.eql(u8, old, "resource") or std.mem.eql(u8, old, "prompt"))
             return moved(arena, "{s} {s} is gone: fx doesn't support MCP resources and prompts yet.", .{ p, old });
+        const command = surface.progWithArticle();
         if (settings_messages.closest(old, &verb_names)) |near|
-            return usage(arena, null, "'{f}' isn't a {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), p, near });
-        return usage(arena, null, "'{f}' isn't a {s} command.", .{ text_utils.terminalSafe(old), p });
+            return usage(arena, null, "'{f}' isn't {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), command, near });
+        return usage(arena, null, "'{f}' isn't {s} command.", .{ text_utils.terminalSafe(old), command });
     };
 
     // Flags come before `--`; everything after it is a stdio server's command.
@@ -373,6 +387,27 @@ pub const Context = struct {
     hosts: Hosts,
     /// Ends a `show` still connecting, such as when fx quits.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// How a `login` that signs in and every `logout` send the sign-outs that
+    /// earlier logouts kept (`kept_sign_outs.zig`). Null: they wait for the
+    /// next TUI start, or for an `fx mcp` command that has this.
+    kept_sign_outs: ?KeptSignOutRetry = null,
+};
+
+const KeptSignOutRetry = struct {
+    transport: oauth_transport.Provider,
+    /// Runs before the first revocation goes out.
+    notice: ?auth_oauth.BeforeRevocation = null,
+
+    /// Sends those of the logins saved under `home`; one that fails stays
+    /// kept for the next retry, and nothing is said, since the logout that
+    /// kept it already did.
+    fn run(retry: ?KeptSignOutRetry, alloc: Allocator, home: []const u8) void {
+        const r = retry orelse return;
+        const outcome = kept_sign_outs.retry(alloc, home, r.transport, r.notice);
+        if (outcome.revoked != 0 or outcome.failed) {
+            debug_trace.logf("mcp", "MCP kept sign-outs retried revoked={d} failed={}", .{ outcome.revoked, outcome.failed });
+        }
+    }
 };
 
 /// Runs `fx mcp ARGS` or `/mcp ARGS` and returns the exit code: 0 for
@@ -442,6 +477,14 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
             return 2;
         },
     };
+    // Every verb but help and call reads or writes under `~/.fx`; call talks
+    // to the running fx over its socket. The shell passes an empty home when
+    // `io_mod.homeDir` has none, and a path built from it would land under
+    // the current folder.
+    switch (command) {
+        .help, .call => {},
+        else => if (!std.Io.Dir.path.isAbsolute(c.home)) return error.HomeNotSet,
+    }
     const old_profile = switch (command) {
         .add => |a| a.old_profile,
         .remove => |r| r.old_profile,
@@ -465,12 +508,29 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+// How fx says an MCP file is unusable, after a subject such as "it" or
+// "~/.fx/mcp.json".
+const not_plain_words = "isn't a plain file; replace it with one";
+const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
+const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+    switch (err) {
+        error.SymLinkLoop => return "it " ++ link_loop_words,
+        error.StreamTooLong => return "it " ++ too_large_words,
+        else => {},
+    }
     // The profile's replace refuses a link itself (DurablePathUnsafe).
     if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch {
+        // Not a link: a regular file with another hard link, or a special
+        // file such as a fifo.
+        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return describe(err);
+        if (stat.kind != .file) return "it " ++ not_plain_words;
+        return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    };
     const target = try safe(arena, buffer[0..n]);
     return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
 }
@@ -483,13 +543,29 @@ pub fn describe(err: anyerror) []const u8 {
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
-        error.HomeNotSet => "HOME isn't set",
+        error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
+        error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
+        error.SymLinkLoop => "an MCP config file " ++ link_loop_words,
+        error.StreamTooLong => "an MCP config file " ++ too_large_words,
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
+        error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json " ++ not_plain_words),
+        error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json " ++ link_loop_words),
+        error.McpConfigTooLarge => profile_paths.displayText("~/.fx/mcp.json " ++ too_large_words),
         error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => profile_paths.displayText("a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login"),
-        else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
+        else => if (isProfileConfigError(err)) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
     };
+}
+
+/// fx's words for an error in ~/.fx/mcp.json itself, for a caller that would
+/// otherwise print the error's name; null for any other error.
+pub fn profileConfigNotice(err: anyerror) ?[]const u8 {
+    return if (isProfileConfigError(err)) describe(err) else null;
+}
+
+fn isProfileConfigError(err: anyerror) bool {
+    return std.mem.startsWith(u8, @errorName(err), "McpConfig");
 }
 
 const Paths = struct { profile: []const u8, project: []const u8 };
@@ -634,6 +710,11 @@ fn writeNotes(c: Context, host: *Host) !void {
 
 fn safe(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
     return (try text_utils.encodeTerminalSafeInline(arena, raw, 240)).bytes;
+}
+
+/// A refusal's reason carries the server's own error, which runs past `safe`'s bound.
+fn safeLong(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    return (try text_utils.encodeTerminalSafeInline(arena, raw, login_words.max_failure_bytes)).bytes;
 }
 
 /// A sign-in address is only useful whole, so it isn't shortened.
@@ -824,9 +905,31 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     defer if (url) |u| c.gpa.free(u);
     var forgot = false;
-    // A `.mcp.json` server's login is its workspace's own.
-    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch false;
+    var kept: ?struct { store: credentials.Store, err: anyerror } = null;
+    // A `.mcp.json` server's login is its workspace's own. A server with no
+    // URL has none, so the store isn't looked for.
+    if (url) |u| {
+        const store = credentials.Store.detect(arena, c.home);
+        forgot = store.remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => no: {
+                debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ name, @errorName(err) });
+                kept = .{ .store = store, .err = err };
+                break :no false;
+            },
+        };
+    }
     c.hosts.changed(c.hosts.context);
+    // The server is gone from the config, but every fx that adds it back
+    // would sign in with the login still saved.
+    if (kept) |k| {
+        var buffer: [320]u8 = undefined;
+        const shown = try safe(arena, name);
+        try c.err.print("Removed {s} from {s}, but couldn't delete its saved login: {s}. Once that's fixed, add it back and run {s} logout {s} to delete it.\n", .{
+            shown, fileLabel(file), k.store.writeFailure(&buffer, k.err), c.surface.prog(), shown,
+        });
+        return 1;
+    }
     try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
     return 0;
 }
@@ -889,6 +992,13 @@ fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []con
     return 1;
 }
 
+/// A sign-out that changed nothing, since the saved sign-ins couldn't be changed.
+fn notSignedOut(c: Context, arena: Allocator, name: []const u8, store: credentials.Store, err: anyerror) !u8 {
+    var buffer: [320]u8 = undefined;
+    try c.err.print("Couldn't sign out of {s}: {s}. Try again once that's fixed.\n", .{ try safe(arena, name), store.writeFailure(&buffer, err) });
+    return 1;
+}
+
 fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
     defer c.hosts.release(c.hosts.context, host);
@@ -898,24 +1008,55 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         return 1;
     }
     const was = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
+    const store = credentials.Store.detect(arena, c.home);
     // There's a login to sign out of when one is saved, by this fx or
     // another, or this session holds one. A running server needn't have one.
-    const saved = try credentials.Store.detect(arena, c.home).get(arena, server.credentialKey());
+    const saved = store.get(arena, server.credentialKey()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return notSignedOut(c, arena, name, store, err),
+    };
     defer if (saved) |v| secret.zeroAndFree(arena, v);
-    host.runtime.logout(name) catch |err| switch (err) {
-        // A held server isn't in the engine; its saved login still goes.
-        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, server.credentialKey()) catch |e| switch (e) {
-            error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
-            else => false,
+    const done: runtime_mod.Logout = host.runtime.logout(name) catch |err| switch (err) {
+        // A held server isn't in the engine; its saved login still goes, and
+        // when it can't, nothing changed.
+        error.UnknownServer => held: {
+            _ = store.remove(arena, server.credentialKey()) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
+                else => return notSignedOut(c, arena, name, store, e),
+            };
+            break :held .{};
         },
         error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
+    if (done.kept) |err| {
+        if (saved == null and !was.signed_in) return notSignedOut(c, arena, name, store, err);
+        var buffer: [320]u8 = undefined;
+        try c.err.print("Signed out of {s} here, but couldn't remove its saved login: {s}. Sign out again once that's fixed.\n", .{
+            try safe(arena, name), store.writeFailure(&buffer, err),
+        });
+        return 1;
+    }
     if (saved != null or was.signed_in) {
-        try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
+        const shown = try safe(arena, name);
+        switch (done.revocation) {
+            .confirmed => try c.out.print("Signed out of {s}.\n", .{shown}),
+            // The server never hears of a logout it wasn't sent: a copy of
+            // the tokens keeps working there.
+            .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
+            .unconfirmed => if (done.retry_later)
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid for now. " ++ pending_revocation.retry_later ++ ".\n", .{shown})
+            else
+                try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
+        }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
     }
+    // The sign-out just kept is leased to this fx, so this retry leaves it
+    // and sends only older ones.
+    try c.out.flush();
+    KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
     return 0;
 }
 
@@ -925,6 +1066,8 @@ const Waiter = struct {
     authorize: ?[]u8 = null,
     shown: bool = false,
     done: ?bool = null,
+    /// The login is kept, but the server gave no answer to the request that checks it.
+    unchecked: bool = false,
     reason: ?[]u8 = null,
     /// Why the new login wasn't saved, if it wasn't.
     not_saved: ?[]u8 = null,
@@ -945,6 +1088,10 @@ const Waiter = struct {
                 w.authorize = w.gpa.dupe(u8, a.url) catch null;
             },
             .signed_in => |server| if (std.mem.eql(u8, server, w.name)) {
+                w.done = true;
+            },
+            .signed_in_unchecked => |server| if (std.mem.eql(u8, server, w.name)) {
+                w.unchecked = true;
                 w.done = true;
             },
             .sign_in_failed => |f| if (std.mem.eql(u8, f.server, w.name)) {
@@ -1016,12 +1163,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
     var line: std.ArrayList(u8) = .empty;
     while (true) {
         var done: ?bool = null;
+        var unchecked = false;
         var url: ?[]const u8 = null;
         var not_saved: ?[]const u8 = null;
         {
             waiter.mutex.lockUncancelable(io);
             defer waiter.mutex.unlock(io);
             done = waiter.done;
+            unchecked = waiter.unchecked;
             if (waiter.not_saved) |why| not_saved = try arena.dupe(u8, why);
             if (!waiter.shown and waiter.authorize != null) {
                 waiter.shown = true;
@@ -1044,10 +1193,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
                 return 1;
             };
             if (ok) {
-                try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                if (unchecked) {
+                    try c.out.print("Signed in to {s}, but fx couldn't check the login with it.\n", .{try safe(arena, name)});
+                } else try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                try c.out.flush();
+                KeptSignOutRetry.run(c.kept_sign_outs, c.gpa, c.home);
                 return 0;
             }
-            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safe(arena, waiter.reason orelse "the server refused") });
+            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safeLong(arena, waiter.reason orelse "the server refused") });
             return 1;
         }
         if (!open and waiter.shown) {
@@ -1196,8 +1349,8 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     const a = arena_state.allocator();
 
     const cases = [_]struct { args: []const []const u8, message: []const u8 }{
-        .{ .args = &.{"nope"}, .message = "'nope' isn't a fx mcp command." },
-        .{ .args = &.{"lsit"}, .message = "'lsit' isn't a fx mcp command; did you mean list?" },
+        .{ .args = &.{"nope"}, .message = "'nope' isn't an fx mcp command." },
+        .{ .args = &.{"lsit"}, .message = "'lsit' isn't an fx mcp command; did you mean list?" },
         .{ .args = &.{"show"}, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "show", "a", "b" }, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "add", "bad name", "https://w" }, .message = "'bad name' can't be a server name: use letters, digits, '-' and '_'." },
@@ -1220,6 +1373,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     try testing.expectEqualStrings("fx mcp auth is now fx mcp login NAME.", (try parseCli(a, &.{ "auth", "x" })).moved);
     try testing.expectEqualStrings("/mcp reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", (try parse(a, .shell, &.{"reload"})).moved);
     try testing.expectEqualStrings("/mcp list: unknown flag --json", (try parse(a, .shell, &.{ "list", "--json" })).usage.message);
+    try testing.expectEqualStrings("'nope' isn't a /mcp command.", (try parse(a, .shell, &.{"nope"})).usage.message);
 }
 
 test "status words follow commands.md, held states first" {
@@ -1247,6 +1401,36 @@ test "status words follow commands.md, held states first" {
     try testing.expectEqualStrings("waiting for approval", try statusText(a, s));
 }
 
+test "every verb that uses ~/.fx needs an absolute home" {
+    const NoHosts = struct {
+        fn get(_: *anyopaque, _: ?runtime_mod.Notify) anyerror!?*Host {
+            return null;
+        }
+        fn release(_: *anyopaque, _: *Host) void {}
+        fn changed(_: *anyopaque) void {}
+    };
+    var unused: u8 = 0;
+    for ([_][]const u8{ "", "relative/home" }) |home| {
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err: Writer.Allocating = .init(testing.allocator);
+        defer err.deinit();
+        const c: Context = .{
+            .gpa = testing.allocator,
+            .out = &out.writer,
+            .err = &err.writer,
+            .surface = .shell,
+            .home = home,
+            .workspace_root = "/Users/example/project",
+            .hosts = .{ .context = &unused, .get = NoHosts.get, .release = NoHosts.release, .changed = NoHosts.changed },
+        };
+        try testing.expectEqual(@as(u8, 1), run(c, &.{ "add", "probe", "http://127.0.0.1:9/mcp" }));
+        try testing.expectEqualStrings("/mcp: HOME is not set to an absolute path\n", err.written());
+        try testing.expectEqual(@as(u8, 0), run(c, &.{"help"}));
+        try testing.expect(out.written().len > 0);
+    }
+}
+
 test "list lines up its columns and keeps hostile names inert" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -1270,4 +1454,31 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors name it" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file"),
+        profileConfigNotice(error.McpConfigLinkLoop).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller"),
+        profileConfigNotice(error.McpConfigTooLarge).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json isn't a plain file; replace it with one"),
+        profileConfigNotice(error.McpConfigNotPlainFile).?,
+    );
+    try testing.expectEqualStrings(profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"), profileConfigNotice(error.McpConfigInvalidJson).?);
+    // The same failures from a file this can't name, such as the project's
+    // .mcp.json, keep their own words.
+    try testing.expect(profileConfigNotice(error.SymLinkLoop) == null);
+    try testing.expect(profileConfigNotice(error.AccessDenied) == null);
+    try testing.expectEqualStrings("an MCP config file is a link that loops or passes through too many links; replace it with a plain file", describe(error.SymLinkLoop));
+    try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
+    try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
 }

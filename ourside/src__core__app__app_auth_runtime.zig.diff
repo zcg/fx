@@ -1,0 +1,439 @@
+diff --git a/src/core/app/app_auth_runtime.zig b/src/core/app/app_auth_runtime.zig
+index 8b61a93e5..85f3b0de8 100644
+--- a/src/core/app/app_auth_runtime.zig
++++ b/src/core/app/app_auth_runtime.zig
+@@ -13,12 +13,14 @@ const login_flow = @import("../auth/login_flow.zig");
+ const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+ const grok_oauth = @import("../auth/grok_oauth.zig");
+ const provider_catalog = @import("../auth/provider_catalog.zig");
++const secret_mod = @import("../auth/secret.zig");
+ const auth_transition = @import("../auth/auth_transition.zig");
+ const model_provider = @import("../config/model_provider.zig");
+ const model_catalog = @import("../gateway/model_catalog.zig");
+ const provider_runtime = @import("provider_runtime.zig");
+ const picker_state = @import("../input/picker_state.zig");
+ const provider_picker_runtime = @import("provider_picker_runtime.zig");
++const app_agents_runtime = @import("app_agents_runtime.zig");
+ const types = @import("../shared/types.zig");
+ 
+ fn oauthAuthEnabled(comptime App: type) bool {
+@@ -182,7 +184,7 @@ pub fn Runtime(comptime App: type) type {
+                         .gateway => credentials.missing_interactive_credential_message,
+                         .codex => credentials.missing_chatgpt_interactive_credential_message,
+                         .grok => credentials.missing_grok_interactive_credential_message,
+-                        .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
++                        .configured => "Configured provider authentication is unavailable. Set its API key in /provider or settings.json.",
+                     },
+                 }, true),
+                 .failed => |failure| {
+@@ -207,7 +209,7 @@ pub fn Runtime(comptime App: type) type {
+                     .topic = "auth",
+                     .tone = .warning,
+                     .body = if (provider == .configured)
+-                        "Configured provider authentication is unavailable. Check settings.json and its environment variable."
++                        "Configured provider authentication is unavailable. Set its API key in /provider or settings.json."
+                     else if (provider == .grok)
+                         credentials.missing_grok_interactive_credential_message
+                     else
+@@ -715,6 +717,23 @@ pub fn Runtime(comptime App: type) type {
+             }
+             switch (choice) {
+                 .provider => |provider| try switchProvider(app, agent, provider, true, .manual),
++                .provider_action => |action| {
++                    debug_trace.logf("auth", "provider action chosen action={s} target={s}", .{ @tagName(action), app.auth.pickerTargetProvider().label() });
++                    try applyProviderAction(app, agent, app.auth.pickerTargetProvider(), action);
++                },
++                .add_provider => {
++                    // The add-provider flow starts from the picker's last row.
++                    if (!app.auth.beginAddProvider(app.alloc)) {
++                        try app.writeDomainNotice(.{
++                            .topic = "auth",
++                            .tone = .warning,
++                            .body = "A provider is already being added.",
++                        }, true);
++                    } else {
++                        _ = app.auth.advanceAddProvider(app.alloc);
++                    }
++                    app.shell.render_requests.request(.footer);
++                },
+                 .source => |source| _ = try applySourceChoice(app, agent, source),
+                 .action => |action| switch (action) {
+                     .connections => unreachable,
+@@ -773,6 +792,22 @@ pub fn Runtime(comptime App: type) type {
+                     return true;
+                 }
+             }
++            if (app.auth.addProviderFlowActive()) {
++                switch (byte) {
++                    // Escape is the documented way out. These two leave the walk
++                    // too, but only the walk: a key is easy to mistype, and a
++                    // stray ctrl+c should not end the whole run.
++                    3, 4 => app.auth.cancelAddProvider(app.alloc),
++                    '\r', '\n' => try submitAddProviderField(app, agent),
++                    8, 127 => _ = app.auth.deleteAddProviderByte(),
++                    // A pasted key is long, so clearing the field has to be one
++                    // keystroke rather than a hundred backspaces.
++                    21 => _ = app.auth.clearAddProviderField(),
++                    else => _ = try app.auth.appendAddProviderByte(app.alloc, byte),
++                }
++                app.shell.render_requests.request(.footer);
++                return true;
++            }
+             if (!app.auth.apiKeyEntryActive()) return false;
+             switch (byte) {
+                 3, 4 => cancelAndPopPickerStage(app, agent),
+@@ -785,6 +820,19 @@ pub fn Runtime(comptime App: type) type {
+         }
+ 
+         pub fn routeAuthPickerEscapeAction(app: *App, action: anytype) bool {
++            // Escape leaves the add-provider walk at any step, dropping what
++            // was typed. Without this a half-finished provider stayed in the
++            // runtime and every later attempt was refused.
++            if (app.auth.addProviderFlowActive()) {
++                switch (action) {
++                    .escape, .remapped_byte => {
++                        app.auth.cancelAddProvider(app.alloc);
++                        app.shell.render_requests.request(.footer);
++                        return true;
++                    },
++                    else => return false,
++                }
++            }
+             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
+             return switch (action) {
+                 .escape, .remapped_byte => false,
+@@ -911,6 +959,152 @@ pub fn Runtime(comptime App: type) type {
+             }
+         }
+ 
++        fn rejectProviderDefinitionMutation(app: *App, agent: *AppAgent) !bool {
++            const work_busy = if (comptime @hasField(App, "child_agents")) blk: {
++                if (app_agents_runtime.Runtime(App).anyWorkGoing(app)) break :blk true;
++                if (app.main_agent.session_persistence.title_generation.task != null) break :blk true;
++                for (app.child_agents.items) |child| if (child.agent.session_persistence.title_generation.task != null) break :blk true;
++                break :blk false;
++            } else agent.stream.active or agent.worker.queuedPromptCount() > 0;
++            const preparation_busy = if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) app.auth.providerPreparationPending() else false;
++            const busy = work_busy or preparation_busy;
++            if (!busy) return false;
++            try app.writeDomainNotice(.{
++                .topic = "provider",
++                .tone = .warning,
++                .body = "Wait for active and queued agent work to finish before changing provider settings.",
++            }, true);
++            return true;
++        }
++
++        /// Re-reads the profile's provider definitions and the names the picker
++        /// offers. A failed read leaves the previous registry in place, because
++        /// a settings file fx cannot parse is not a reason to lose the
++        /// connections that already work.
++        fn reloadConfiguredProviders(app: *App) void {
++            var registry = config_runtime.loadConfiguredProviders(app.alloc) catch |err| {
++                debug_trace.logf("provider", "provider definitions reload failed err={s}", .{@errorName(err)});
++                return;
++            };
++            var names: std.ArrayList([]const u8) = .empty;
++            defer names.deinit(app.alloc);
++            names.ensureTotalCapacity(app.alloc, registry.definitions.len) catch {
++                registry.deinit(app.alloc);
++                return;
++            };
++            for (registry.definitions) |definition| names.appendAssumeCapacity(definition.id);
++            app.auth.setConfiguredProviders(app.alloc, names.items) catch {
++                registry.deinit(app.alloc);
++                return;
++            };
++            if (comptime @hasDecl(@TypeOf(app.model_cache), "resetForProviderChange")) app.model_cache.resetForProviderChange();
++            app.provider_selection.definitions.deinit(app.alloc);
++            app.provider_selection.definitions = registry;
++        }
++
++        /// Carries out the row chosen in a provider's action menu. `use` is the
++        /// ordinary switch; the other three are what a configured connection
++        /// needs after it exists, and each used to require editing settings by
++        /// hand. `target` is the provider the menu was opened for, not whatever
++        /// provider happens to be active now.
++        fn applyProviderAction(app: *App, agent: *AppAgent, target: model_provider.ProviderId, action: auth_runtime.ProviderAction) !void {
++            switch (action) {
++                .use => try switchProvider(app, agent, target, true, .after_setup),
++                .refresh_models => {
++                    // Re-reading the list is what makes a newly shipped model
++                    // appear. The models the cache already holds stay on screen
++                    // while the fetch runs, and the header says a refresh is
++                    // running so a refresh that changes nothing is still
++                    // visible as an answer.
++                    try switchProvider(app, agent, target, false, .after_setup);
++                },
++                .set_key => {
++                    // A configured provider's key is kept under the profile, and
++                    // its validity is whatever its own endpoint says the next
++                    // time fx uses it. Only the built-in providers have a login
++                    // service that can answer for a key up front, so only they
++                    // go through the key-entry screen that checks one.
++                    if (target == .configured) {
++                        app.auth.beginAddProviderKey(app.alloc, target) catch |err| {
++                            debug_trace.logf("auth", "provider key entry failed provider={s} err={s}", .{ target.label(), @errorName(err) });
++                            try app.writeDomainNotice(.{
++                                .topic = "auth",
++                                .tone = .warning,
++                                .body = try app.alloc.print(
++                                    "The key for {s} could not be entered ({s}). Its definition is missing from the profile; add the provider again.",
++                                    .{ target.label(), @errorName(err) },
++                                ),
++                            }, true);
++                            app.shell.render_requests.request(.footer);
++                            return;
++                        };
++                        app.shell.render_requests.request(.footer);
++                        return;
++                    }
++                    // The key entry screen already exists; it is the same one
++                    // `/provider` uses when a connection has no key yet.
++                    if (comptime !runtime_profile.allows(App, .native_auth)) {
++                        try app.writeDomainNotice(.{
++                            .topic = "auth",
++                            .tone = .warning,
++                            .body = "API key setup is supplied by the embedding SDK.",
++                        }, true);
++                        return;
++                    }
++                    app.auth.openApiKeyPicker(app.alloc);
++                    app.shell.render_requests.request(.footer);
++                },
++                .edit => {
++                    try app.auth.beginEditProvider(app.alloc, target);
++                    app.shell.render_requests.request(.footer);
++                },
++                .clear_key => {
++                    if (try rejectProviderDefinitionMutation(app, agent)) return;
++                    const definition = app.provider_selection.definitions.get(target.label()) orelse return;
++                    _ = try config_runtime.setUserPreferences(app.alloc, .{ .provider_definition = .{
++                        .name = definition.id,
++                        .protocol = @tagName(definition.protocol),
++                        .base_url = definition.base_url,
++                        .key = "",
++                    } });
++                    if (provider_runtime.providerOf(app, agent).eql(target)) {
++                        var cleared = credentials.Credential{ .token = try app.alloc.dupe(u8, ""), .source = .configured };
++                        defer cleared.deinit(app.alloc);
++                        _ = app.auth.adoptCredential(app.alloc, &cleared);
++                        app.model_cache.resetForProviderChange();
++                    }
++                    reloadConfiguredProviders(app);
++                    try app.writeDomainNotice(.{
++                        .topic = "auth",
++                        .tone = .neutral,
++                        .body = "API key cleared. Set a new key to use this provider again.",
++                    }, true);
++                    app.shell.render_requests.request(.footer);
++                },
++                .remove => {
++                    if (try rejectProviderDefinitionMutation(app, agent)) return;
++                    const name = try app.alloc.dupe(u8, target.label());
++                    defer app.alloc.free(name);
++                    _ = config_runtime.setUserPreferences(app.alloc, .{ .remove_provider = name }) catch |err| {
++                        debug_trace.logf("provider", "provider remove failed err={s}", .{@errorName(err)});
++                        try app.writeDomainNotice(.{
++                            .topic = "provider",
++                            .tone = .warning,
++                            .body = "The provider could not be removed. Check ~/.fx/settings.json is writable.",
++                        }, true);
++                        return;
++                    };
++                    reloadConfiguredProviders(app);
++                    try app.writeDomainNotice(.{
++                        .topic = "provider",
++                        .tone = .neutral,
++                        .body = try app.alloc.print("Removed provider {s}.", .{name}),
++                    }, true);
++                    app.shell.render_requests.request(.footer);
++                },
++            }
++        }
++
+         fn submitApiKeyEntry(app: *App) !void {
+             if (app.auth.pickerView().api_key_mask_count == 0) return;
+             switch (app.auth.beginApiKeySave(app.alloc)) {
+@@ -924,6 +1118,75 @@ pub fn Runtime(comptime App: type) type {
+             }
+         }
+ 
++        /// Enter on the add-provider flow: advance to the next field, or, when
++        /// the key is entered, save the connection. The save goes through the
++        /// same settings commit every other preference uses; the pasted key,
++        /// when there is one, is read from the environment slot the definition
++        /// names, so it is never in settings.
++        fn submitAddProviderField(app: *App, agent: *AppAgent) !void {
++            const draft = if (app.auth.addProviderDraftView()) |view| view else return;
++            if (app.auth.advanceAddProvider(app.alloc)) |_| {
++                try saveAddProviderDraft(app, agent, draft);
++            }
++            app.shell.render_requests.request(.footer);
++        }
++
++        /// Saves the connection and key before fetching its catalog.
++        fn saveAddProviderDraft(app: *App, agent: *AppAgent, draft: auth_runtime.AddProviderProjection) !void {
++            if (try rejectProviderDefinitionMutation(app, agent)) return;
++            // A connection with a name and a URL but no key is not usable, and
++            // saving it as a definition turns its preset row into "switch to
++            // this" the next time the picker opens, which hides the key step
++            // the user was in the middle of. The draft is dropped instead, and
++            // nothing reaches settings.
++            if (draft.key.len == 0) {
++                try app.writeDomainNotice(.{
++                    .topic = "auth",
++                    .tone = .warning,
++                    .body = try app.alloc.print("{s} was not saved: it has no API key.", .{draft.name}),
++                }, true);
++                app.auth.cancelAddProvider(app.alloc);
++                return;
++            }
++            const name = try app.alloc.dupe(u8, draft.name);
++            defer app.alloc.free(name);
++            const base_url = try app.alloc.dupe(u8, draft.base_url);
++            defer app.alloc.free(base_url);
++            const protocol = try app.alloc.dupe(u8, draft.protocol);
++            defer app.alloc.free(protocol);
++            _ = config_runtime.setUserPreferences(app.alloc, .{
++                .provider_definition = .{
++                    .name = name,
++                    .previous_name = draft.original_name,
++                    .protocol = protocol,
++                    .base_url = base_url,
++                    .key = draft.key,
++                },
++            }) catch |err| {
++                try app.writeDomainNotice(.{
++                    .topic = "auth",
++                    .tone = .warning,
++                    .body = "The provider could not be saved. Check ~/.fx/settings.json is writable, then try again.",
++                }, true);
++                debug_trace.logf("auth", "add provider save failed err={s}", .{@errorName(err)});
++                app.auth.cancelAddProvider(app.alloc);
++                return;
++            };
++            app.auth.cancelAddProvider(app.alloc);
++            const body = try app.alloc.print("Saved provider {s}. Reading its model list now.", .{name});
++            defer app.alloc.free(body);
++            try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
++
++            // The definition was just written, and the registry the picker
++            // resolves against was loaded at startup, so it has to be re-read
++            // before the name below means anything.
++            reloadConfiguredProviders(app);
++
++            const candidate = model_provider.parse(name) orelse return error.InvalidProviderName;
++            const target = try candidate.bind(app.provider_selection.definitions);
++            try startProviderSwitch(app, agent, target, false, .after_setup, null);
++        }
++
+         /// Polled from the event loop so a save that blocks on a locked key store
+         /// or a slow gateway never stalls rendering.
+         pub fn collectApiKeySaveFacts(app: *App, agent: *AppAgent) !void {
+@@ -1180,7 +1443,7 @@ pub fn Runtime(comptime App: type) type {
+             }
+         }
+ 
+-        fn switchProvider(
++        pub fn switchProvider(
+             app: *App,
+             agent: *AppAgent,
+             target: model_provider.ProviderId,
+@@ -1190,6 +1453,10 @@ pub fn Runtime(comptime App: type) type {
+             try startProviderSwitch(app, agent, target, allow_login, intent, null);
+         }
+ 
++        pub fn switchProviderModel(app: *App, agent: *AppAgent, target: model_provider.ProviderId, model: []const u8) !void {
++            try startProviderSwitchToModel(app, agent, target, false, .manual, null, model);
++        }
++
+         fn startProviderSwitch(
+             app: *App,
+             agent: *AppAgent,
+@@ -1197,6 +1464,18 @@ pub fn Runtime(comptime App: type) type {
+             allow_login: bool,
+             intent: ProviderSwitchIntent,
+             fallback: ?model_provider.ProviderId,
++        ) !void {
++            try startProviderSwitchToModel(app, agent, target, allow_login, intent, fallback, null);
++        }
++
++        fn startProviderSwitchToModel(
++            app: *App,
++            agent: *AppAgent,
++            target: model_provider.ProviderId,
++            allow_login: bool,
++            intent: ProviderSwitchIntent,
++            fallback: ?model_provider.ProviderId,
++            selected_model: ?[]const u8,
+         ) !void {
+             if (comptime !provider_runtime.supported(App) or
+                 !@hasDecl(App, "providerCatalog") or
+@@ -1261,7 +1540,7 @@ pub fn Runtime(comptime App: type) type {
+                 .catalog_provider = catalog_provider,
+                 .models_path = app.model_cache.models_path,
+                 .preferred_source = if (target == .gateway) settings.credential_source else null,
+-                .primary_model = if (intent == .post_oauth and provider_runtime.providerOf(app, agent).eql(target)) provider_runtime.modelOf(app, agent) else null,
++                .primary_model = selected_model orelse if (intent == .post_oauth and provider_runtime.providerOf(app, agent).eql(target)) provider_runtime.modelOf(app, agent) else null,
+                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
+             });
+         }
+@@ -1404,12 +1683,29 @@ pub fn Runtime(comptime App: type) type {
+                     try app.writeDomainNotice(.{
+                         .topic = "provider",
+                         .tone = .@"error",
+-                        .body = if (failure.category == .cancellation) "Provider switching was cancelled. The current provider is unchanged." else providerFailureMessage(intent, "The target provider catalog could not be validated. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
++                        .body = switch (failure.category) {
++                            .cancellation => "Model loading was cancelled. The saved provider is available in /provider.",
++                            .authentication => "The provider rejected its API key. Open /provider and set a new key.",
++                            .malformed_response => "The provider returned an invalid model list. Check its Base URL in /provider.",
++                            else => providerFailureMessage(intent, "Could not load the provider's model list. Its configuration is saved; choose Refresh in /provider to retry.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
++                        },
+                     }, true);
+                     return false;
+                 },
+             };
+             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
++            if (task.input.primary_model) |selected| {
++                if (intent == .manual and selectCatalogModel(catalog.items, selected, null) != null and
++                    !std.mem.eql(u8, selected, selectCatalogModel(catalog.items, selected, null).?))
++                {
++                    try app.writeDomainNotice(.{
++                        .topic = "provider",
++                        .tone = .warning,
++                        .body = "The selected model is no longer available. Refresh /model and choose another model.",
++                    }, true);
++                    return false;
++                }
++            }
+             const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse {
+                 try app.writeDomainNotice(.{
+                     .topic = "provider",
+@@ -1439,7 +1735,7 @@ pub fn Runtime(comptime App: type) type {
+                 return false;
+             }
+ 
+-            app.model_cache.adoptOwnedCatalog(access, &catalog);
++            app.model_cache.adoptOwnedCatalog(access, target, &catalog);
+             app.provider_selection.adoptOwned(target, &owned_model);
+             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
+ 
+@@ -1496,6 +1792,17 @@ pub fn Runtime(comptime App: type) type {
+                     },
+                 }
+             }
++            // Adding a provider ends with its model list open: the next thing
++            // the user needs is a model to run, and reopening `/model` by hand
++            // is a step the flow already knows about.
++            if (intent == .after_setup) {
++                // The app owns the model menu; probing for the entry point keeps
++                // this file from importing the input runtime, which imports this
++                // one back.
++                if (comptime @hasDecl(App, "openModelMenuForSetup")) {
++                    try app.openModelMenuForSetup();
++                }
++            }
+             app.shell.render_requests.request(.footer);
+             return true;
+         }

@@ -1,0 +1,78 @@
+diff --git a/src/core/config/settings_keys.zig b/src/core/config/settings_keys.zig
+index 94b4d53fa..262cddbb0 100644
+--- a/src/core/config/settings_keys.zig
++++ b/src/core/config/settings_keys.zig
+@@ -123,7 +123,7 @@ pub const keys = [_]Key{
+     .{ .name = "first_call_tool_choice", .where = .profile, .kind = .string, .values = &.{ "auto", "none" }, .description = "Tool choice for the first request of a turn" },
+     .{ .name = "grok_model", .where = .profile, .kind = .string, .superseded_by = "models.grok", .description = "Older form of models.grok" },
+     .{ .name = "input_appearance", .where = .retired, .kind = .any, .description = retired_description },
+-    .{ .name = "max_agent_steps", .where = .project_safe, .kind = .integer, .minimum = 0, .description = "Most agent steps per turn; 0 means no limit" },
++    .{ .name = "max_agent_steps", .where = .project_safe, .kind = .integer, .minimum = 0, .description = "Most agent steps in one turn of the conversation; 0 means no limit" },
+     .{ .name = "max_tool_result_bytes", .where = .project_safe, .kind = .integer, .minimum = 1024, .description = "Tool output budget in model context, in bytes" },
+     .{ .name = "maxxing_mode", .where = .retired, .kind = .any, .description = retired_description },
+     .{ .name = "model", .where = .profile, .kind = .string, .superseded_by = "models.gateway", .description = "Older form of models.gateway" },
+@@ -137,6 +137,7 @@ pub const keys = [_]Key{
+     .{ .name = "provider_strict", .where = .project_safe, .kind = .boolean, .description = "Send AI Gateway requests only to the providers in provider_order" },
+     .{ .name = "providers", .where = .profile, .kind = .object, .map = true, .top_level_only = true, .description = "Named custom model connections" },
+     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
++    .{ .name = "review_effort", .where = .profile, .kind = .string, .description = "Reasoning effort for the review model: auto or a level it supports" },
+     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
+     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
+     // Retired, but still read so that fx can explain the migration.
+@@ -145,9 +146,12 @@ pub const keys = [_]Key{
+     .{ .name = "slash_menu_categories", .where = .profile, .kind = .boolean, .description = "Show command categories and skill sources in slash menu results" },
+     .{ .name = "sound", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .description = "Sounds" },
+     .{ .name = "startup_scrollback", .where = .profile, .kind = .boolean, .description = "Restore terminal output at startup" },
++    .{ .name = "subagent_max_children", .where = .profile, .kind = .integer, .minimum = 0, .maximum = 16, .description = "How many subagents may work at once; 0 turns subagents off, and a subagent cannot start its own" },
++    .{ .name = "subagent_max_agent_steps", .where = .profile, .kind = .integer, .minimum = 0, .description = "Most agent steps in one subagent run; 0 means no limit, and the parent can continue a run that stops" },
+     .{ .name = "statusLine", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .renamed_to = "status_line", .description = "Renamed to status_line" },
+     .{ .name = "status_line", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .description = "What the footer shows" },
+     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.fx/themes" },
++    .{ .name = "shell", .where = .profile, .kind = .string, .description = "On Windows, the shell fx runs commands in: pwsh, bash, or cmd. Defaults to the one detected at first use" },
+     .{ .name = "ultrafast_mode", .where = .profile, .kind = .boolean, .description = "Request the higher-priced Ultrafast tier for an eligible AI Gateway model" },
+     .{ .name = "update_channel", .where = .profile, .kind = .string, .values = &.{ "stable", "dev" }, .description = "Release channel for updates" },
+     .{ .name = "web_fetch_worker_model", .where = .retired, .kind = .any, .description = retired_description },
+@@ -168,6 +172,43 @@ pub fn find(name: []const u8) ?Key {
+     return null;
+ }
+ 
++/// Whether a settings path holds a credential that `fx config` must not print.
++///
++/// Provider connections store their bearer token at `providers.<name>.auth.key`
++/// and their extra request headers at `providers.<name>.headers`, so any path
++/// inside `providers` that ends in one of those leaves is a secret. The check
++/// is by path shape rather than by the named provider, because a connection is
++/// free-form: the same leaf under any name is the same credential.
++pub fn isSecretPath(path: []const u8) bool {
++    if (!std.mem.startsWith(u8, path, "providers.")) return false;
++    var rest = path["providers.".len..];
++    const dot = std.mem.findScalar(u8, rest, '.') orelse return false;
++    rest = rest[dot + 1 ..];
++    return secretLeaf(rest);
++}
++
++/// A leaf inside one provider connection that carries a credential. `auth.key`
++/// is the bearer token; `headers` is the map of extra request headers, which
++/// carries whatever the user put there.
++fn secretLeaf(leaf: []const u8) bool {
++    return std.mem.eql(u8, leaf, "auth.key") or
++        std.mem.eql(u8, leaf, "headers") or
++        std.mem.startsWith(u8, leaf, "headers.");
++}
++
++test "a provider credential path is a secret" {
++    try @import("std").testing.expect(isSecretPath("providers.example.auth.key"));
++    try @import("std").testing.expect(isSecretPath("providers.example.headers"));
++    try @import("std").testing.expect(isSecretPath("providers.example.headers.x-api-key"));
++    // The provider name and the rest of its connection are not secret.
++    try @import("std").testing.expect(!isSecretPath("providers.example.auth.type"));
++    try @import("std").testing.expect(!isSecretPath("providers.example.base_url"));
++    try @import("std").testing.expect(!isSecretPath("providers.example"));
++    // A lookalike outside `providers` is not a credential.
++    try @import("std").testing.expect(!isSecretPath("auth.key"));
++    try @import("std").testing.expect(!isSecretPath("model"));
++}
++
+ /// True when a project `.fx.json` that sets `name` is ignored and the user
+ /// should be told: a known setting that only the profile may set.
+ pub fn ignoredInProject(name: []const u8) bool {

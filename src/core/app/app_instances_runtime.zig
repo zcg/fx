@@ -116,6 +116,20 @@ pub const Seed = struct {
         self.captured = true;
     }
 
+    /// What `/launch` shows an instance would start with besides its
+    /// profile, as `launchWith` applies the seed: `--model`, `--provider`,
+    /// or `FX_MODEL` pins the model as `initializePersistence` does, and
+    /// `--effort` wins over the profile's. Borrows the seed's slices.
+    pub fn launchDefaults(self: *const Seed) app_profile_runtime.LaunchCompletion.Defaults {
+        return .{
+            .model = self.selected_model,
+            .effort = self.agent_effort,
+            .model_override = if (self.model_source == .process_override or self.provider_process_override != null) self.selected_model else null,
+            .effort_override = self.effort_process_override,
+            .profile_name = self.profile_name orelse profiles.main_name,
+        };
+    }
+
     pub fn captureProfile(self: *Seed, alloc: Allocator, name: ?[]const u8) !void {
         const owned = if (name) |value| try alloc.dupe(u8, value) else null;
         if (self.profile_name) |old| alloc.free(old);
@@ -137,6 +151,8 @@ pub const State = struct {
     startup_count: usize = 1,
     /// Backs the footer's agent indicator, which can hold a subagent's label.
     label_buf: [192]u8 = undefined,
+    /// Backs the "waiting on N subagents" activity row.
+    subagent_wait_buf: [96]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
     /// closes like any other and stays closed.
     first_open: bool = true,
@@ -253,7 +269,6 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Persistence.initInto(&agent.session_persistence);
             const name = profile_name orelse seed.profile_name;
             if (name) |value| try app.applyInstanceProfile(agent, value);
-            const profile_model = if (name != null) agent.profile.profile.model else null;
             try SessionRuntime.configureStartupPreferences(
                 app,
                 agent,
@@ -290,12 +305,10 @@ pub fn Runtime(comptime App: type) type {
                 try AgentsRuntime.visit(app, child, id, resumeInContext);
                 child.view_built = true;
             } else {
-                try SessionRuntime.beginFreshPersistedSession(app, agent);
+                try SessionRuntime.beginInstanceSession(app, agent);
                 SessionRuntime.enableSessionStores(app, agent);
-                // A fresh session starts from the configured model; the
-                // profile's replaces it unless `--model`, `--provider`, or
-                // `FX_MODEL` chose one for the process, which still wins.
-                if (profile_model) |model| try SessionRuntime.applyProfileModel(app, agent, model);
+                // A fresh session starts in its profile's model; `--model`,
+                // `--provider`, or `FX_MODEL` still wins for this run.
                 try SessionRuntime.applyProcessModelOverride(app, agent);
             }
             try AgentsRuntime.nameInstance(app, child, SessionRuntime.activeSessionId(agent));
@@ -533,9 +546,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// `/close`: closes the instance on screen and every subagent in its
-        /// tree. The next instance takes over and the host keeps running, the
-        /// first instance included. Closing the only open instance ends the
-        /// host, as `/exit` does.
+        /// tree. The agent on the row above it in the agent list takes over,
+        /// or the next instance when it is the first row, and the host keeps
+        /// running, the first instance included. Closing the only open
+        /// instance ends the host, as `/exit` does.
         pub fn closeOnScreen(app: *App) !void {
             if (app.agent_on_screen) |child| if (child.agent.role == .subagent) {
                 try app.writeDomainNotice(.{ .topic = "instances", .tone = .neutral, .body = "/close closes an fx instance. This screen is a subagent's." }, true);
