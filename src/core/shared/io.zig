@@ -928,8 +928,13 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
+///
+/// Windows has no `fsync` and no directory handle to give it: a directory
+/// opened with `FILE_FLAG_BACKUP_SEMANTICS` takes `FlushFileBuffers`, which
+/// asks the volume to write what it holds for that entry. That is the same
+/// promise the POSIX call makes for the rename and create that came before.
 pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.target.os.tag == .windows) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag == .windows) return windowsFlushDirectory(dir.handle);
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -942,6 +947,41 @@ pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
             else => return error.DirectorySyncFailed,
         }
     }
+}
+
+const windows_flush = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const NTSTATUS = i32;
+    extern "ntdll" fn NtFlushBuffersFile(
+        file_handle: std.posix.fd_t,
+        io_status_block: *IO_STATUS_BLOCK,
+    ) callconv(.winapi) NTSTATUS;
+    const IO_STATUS_BLOCK = extern struct {
+        status_or_pointer: usize,
+        information: usize,
+    };
+};
+
+/// Asks Windows to write what the volume holds for `handle`.
+///
+/// `NtFlushBuffersFile` is the call `FlushFileBuffers` wraps, and it takes the
+/// directory handle `openDir` already returned: unlike the Win32 function it
+/// needs no extra open with backup semantics, and it reports a status instead
+/// of setting a last error. A filesystem that has nothing to flush, such as a
+/// network share without write-through, answers success, which is what the
+/// POSIX call does there too.
+fn windowsFlushDirectory(handle: std.posix.fd_t) !void {
+    var status: windows_flush.IO_STATUS_BLOCK = undefined;
+    const rc = windows_flush.NtFlushBuffersFile(handle, &status);
+    if (rc >= 0) return;
+    return switch (rc) {
+        // STATUS_INVALID_DEVICE_REQUEST and STATUS_NOT_SUPPORTED: this volume
+        // cannot flush a directory, so there is nothing more fx can ask it.
+        @as(i32, @bitCast(@as(u32, 0xC0000010))), @as(i32, @bitCast(@as(u32, 0xC00000BB))) => {},
+        // STATUS_ACCESS_DENIED on a handle fx did not open for writing.
+        @as(i32, @bitCast(@as(u32, 0xC0000022))) => return error.AccessDenied,
+        @as(i32, @bitCast(@as(u32, 0xC000007F))) => return error.NoSpaceLeft,
+        else => return error.DirectorySyncFailed,
+    };
 }
 
 fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !VerifiedDir {
@@ -3349,6 +3389,34 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+test "a directory sync closes what a create and rename left behind" {
+    // Every durable session write pairs its create and rename with a
+    // directory sync. Windows has no `fsync` for a directory, so the handle
+    // goes to `NtFlushBuffersFile`; this checks that the call succeeds on a
+    // real directory and can be repeated.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = getIo();
+
+    var created = try tmp.dir.createFile(io, "first.json", .{});
+    try created.writeStreamingAll(io, "{}");
+    created.close(io);
+
+    var renamed = try tmp.dir.createFile(io, "second.tmp", .{});
+    try renamed.writeStreamingAll(io, "{}");
+    renamed.close(io);
+    try tmp.dir.rename(io, "second.tmp", "second.json");
+
+    try syncVerifiedDir(tmp.dir);
+    // A second flush has nothing left to write and still succeeds, rather
+    // than reporting the volume as unable to flush a directory.
+    try syncVerifiedDir(tmp.dir);
+
+    const bytes = try tmp.dir.readFileAlloc(io, "second.json", std.testing.allocator, 64);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("{}", bytes);
 }
 
 /// Holds each standard stream the parent left closed open on /dev/null,

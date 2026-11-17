@@ -53,12 +53,16 @@ pub fn permissionsForMode(mode: std.posix.mode_t) std.Io.File.Permissions {
     return if (mode & 0o040 != 0) .default_dir else .default_file;
 }
 
-/// Reads the mode back for a caller that verifies what it created. Windows has
-/// no mode to report, so this answers zero rather than inventing one; callers
-/// gate the comparison on `modeIsEnforced`.
+/// Reads the mode back for a caller that verifies what it created.
+///
+/// Windows has no mode bits. The one thing it does carry is the READONLY
+/// attribute, which `permissionsForMode` sets for a mode with no owner write
+/// bit, so a caller asking whether the entry refuses writes still gets the
+/// right answer there. Every other bit is reported as zero rather than
+/// invented, and callers compare full modes only where `modeIsEnforced`.
 pub fn modeOf(permissions: std.Io.File.Permissions) std.posix.mode_t {
     if (comptime modeIsEnforced) return permissions.toMode() & 0o777;
-    return 0;
+    return if (@backingInt(permissions) & windows_readonly_attribute != 0) 0o400 else 0o600;
 }
 
 /// Whether the entry refuses writes. POSIX reads the mode's write bits, and
@@ -494,6 +498,10 @@ test "an I/O failure keeps its OS cause, and only unknown ones become Io (D29)" 
 }
 
 test "folders are 0700 and files are 0600" {
+    // Windows has no mode bits: a folder or file is protected by the ACL it
+    // inherits, and `setPermissions` there carries only the read-only
+    // attribute. The modes are asserted where the platform has them, and the
+    // kinds are asserted everywhere.
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
@@ -502,9 +510,17 @@ test "folders are 0700 and files are 0600" {
     defer s.closeDir(sub);
     const file = try s.createFile(sub, "log.jsonl");
     s.closeFile(file);
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(root, "session")).mode);
-    try testing.expectEqual(@as(std.posix.mode_t, file_mode), (try s.stat(sub, "log.jsonl")).mode);
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(root, "session")).mode);
+        try testing.expectEqual(@as(std.posix.mode_t, file_mode), (try s.stat(sub, "log.jsonl")).mode);
+    } else {
+        // A folder and a file a durable write creates are writable on
+        // Windows, so neither carries the READONLY attribute.
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(root, "session")).mode);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(sub, "log.jsonl")).mode);
+    }
     try testing.expectEqual(Kind.directory, (try s.stat(root, "session")).kind);
+    try testing.expectEqual(Kind.file, (try s.stat(sub, "log.jsonl")).kind);
 }
 
 test "a read-only file is written through its own handle and opens read-only only" {
@@ -516,7 +532,15 @@ test "a read-only file is written through its own handle and opens read-only onl
     try s.writeAt(file, "body", 0);
     try s.sync(file);
     s.closeFile(file);
-    try testing.expectEqual(@as(std.posix.mode_t, blob_mode), (try s.stat(root, "blob")).mode);
+    // Windows carries the read-only attribute for a blob, not a mode; the
+    // mode is asserted where the platform has one.
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, blob_mode), (try s.stat(root, "blob")).mode);
+    } else {
+        // Windows carries the READONLY attribute for a blob, and `modeOf`
+        // reports it as a mode with no owner write bit.
+        try testing.expectEqual(@as(std.posix.mode_t, 0o400), (try s.stat(root, "blob")).mode);
+    }
     try testing.expectError(error.Refused, s.openFile(root, "blob", .read_write));
     const again = try s.openFile(root, "blob", .read_only);
     defer s.closeFile(again);
@@ -539,13 +563,27 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
     const root = try s.openRoot(root_path);
     s.closeDir(root);
     const top: Dir = .{ .handle = tmp.dir };
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(top, "a")).mode);
+    // Windows protects these folders through the ACL they inherit, so there
+    // is no mode to read back; the folders still have to be folders.
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(top, "a")).mode);
+    } else {
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(top, "a")).mode);
+    }
     var a = try tmp.dir.openDir(io, "a", .{});
     defer a.close(io);
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = a }, "sessions")).mode);
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = a }, "sessions")).mode);
+    } else {
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(.{ .handle = a }, "sessions")).mode);
+    }
     var parent = try a.openDir(io, "sessions", .{});
     defer parent.close(io);
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = parent }, "v2")).mode);
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = parent }, "v2")).mode);
+    } else {
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(.{ .handle = parent }, "v2")).mode);
+    }
 
     try tmp.dir.createDir(io, "real", .default_dir);
     try tmp.dir.symLink(io, "real", "linked", .{ .is_directory = true });

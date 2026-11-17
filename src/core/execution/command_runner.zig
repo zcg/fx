@@ -1822,16 +1822,12 @@ fn waitForForegroundSessionReady(
         }
 
         const remaining_ms = foreground_session_setup_timeout_ms - setup_elapsed_ms;
-        const poll_timeout_ms: i32 = @intCast(@min(@as(i64, 50), remaining_ms));
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = ready_read.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        if (try std.posix.poll(&poll_fds, poll_timeout_ms) == 0) continue;
+        const poll_timeout_ms: u32 = @intCast(@min(@as(i64, 50), remaining_ms));
+        var poll_watches = [_]readiness.Watch{.{ .fd = ready_read.handle }};
+        if ((try readiness.pollDescriptors(&poll_watches, .{ .milliseconds = poll_timeout_ms })) == 0) continue;
 
-        const revents = poll_fds[0].revents;
-        if ((revents & std.posix.POLL.IN) != 0) {
+        const events = poll_watches[0].events;
+        if (events.readable) {
             var marker: [1]u8 = undefined;
             const marker_len = try io_mod.readFd(ready_read.handle, &marker);
             if (marker_len == 0) return error.ForegroundSessionSetupFailed;
@@ -1840,7 +1836,7 @@ fn waitForForegroundSessionReady(
             }
             return;
         }
-        if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+        if (events.hung_up or events.errored) {
             return error.ForegroundSessionSetupFailed;
         }
     }

@@ -1285,6 +1285,7 @@ test "a stopped child, an exited child, and a gone pid count as stopped, and a r
 }
 
 test "a kill resumes the processes it stopped but did not kill" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         var session_reads: usize = 0;
         var group_reads: usize = 0;

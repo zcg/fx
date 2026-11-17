@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const testing_listener = @import("../core/shared/testing_listener.zig");
+const readiness = @import("../core/shared/readiness.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
@@ -11951,16 +11952,16 @@ const UnpooledOpenFixture = struct {
     /// `appear_ms` for a connection to arrive.
     fn lateConnection(self: *UnpooledOpenFixture, appear_ms: i32) !Late {
         const zio = io_mod.getIo();
-        var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
+        var listener = [_]readiness.Watch{.{ .fd = self.server.socket.handle }};
+        if ((try readiness.pollDescriptors(&listener, .{ .milliseconds = @intCast(appear_ms) })) == 0) return .none;
         // A connection that is gone before the accept still arrived, and is
         // no longer open.
         var stream = (try testing_listener.acceptIfWaiting(&self.server, zio)) orelse return .closed;
         defer stream.close(zio);
         // The close fx already made can reach this end a moment after the
         // accept; a connection fx left open never reads end of stream.
-        var peer = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        if (try std.posix.poll(&peer, 2_000) == 0) return error.TestConnectionLeftOpen;
+        var peer = [_]readiness.Watch{.{ .fd = stream.socket.handle }};
+        if ((try readiness.pollDescriptors(&peer, .{ .milliseconds = 2_000 })) == 0) return error.TestConnectionLeftOpen;
         var buffer: [64]u8 = undefined;
         var reader = stream.reader(zio, &buffer);
         var byte: [1]u8 = undefined;

@@ -49,6 +49,10 @@ pub fn build(b: *std.Build) void {
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
+    // Builds and runs the unit suites on Windows, where they are left out by
+    // default because most of them model POSIX behavior. A run there reports
+    // what passes on Windows and skips the rest.
+    const windows_tests = b.option(bool, "windows-tests", "Build and run the unit suites on Windows too") orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
@@ -119,9 +123,14 @@ pub fn build(b: *std.Build) void {
     // an inode, a kill is a signal, `fsync` works on a directory, and a process
     // group can be addressed. None of that exists on Windows, so the suites are
     // not built there rather than being made to pass on semantics they do not
-    // have. Windows coverage is added as its own tests, written against the
-    // Windows behavior.
-    const posix_suites = target.result.os.tag != .windows;
+    // have.
+    //
+    // `-Dwindows-tests` builds and runs them on Windows anyway. The Windows
+    // branches this branch adds are covered by the same tests that cover the
+    // POSIX ones, and a test that models a POSIX-only facility already returns
+    // `error.SkipZigTest` there, so the run reports what passes and skips the
+    // rest.
+    const posix_suites = target.result.os.tag != .windows or windows_tests;
 
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);

@@ -324,6 +324,10 @@ const Acceptor = struct {
 };
 
 test "connect reaches a local listener and returns a blocking socket" {
+    // This file exists for a POSIX connect that std calls twice after EINTR,
+    // which Windows has no equivalent of: it never installs its connect
+    // there, so there is nothing for the test to exercise.
+    if (comptime !supported) return error.SkipZigTest;
     const io = testing.io;
     const address = loopback(0);
     var server = try address.listen(io, .{});
@@ -340,6 +344,10 @@ test "connect reaches a local listener and returns a blocking socket" {
 }
 
 test "connect reports a port nobody listens on as refused" {
+    // This file exists for a POSIX connect that std calls twice after EINTR,
+    // which Windows has no equivalent of: it never installs its connect
+    // there, so there is nothing for the test to exercise.
+    if (comptime !supported) return error.SkipZigTest;
     const io = testing.io;
     const address = loopback(0);
     var server = try address.listen(io, .{});
@@ -350,6 +358,10 @@ test "connect reports a port nobody listens on as refused" {
 }
 
 test "a connect that SIGIO interrupts while it waits still connects" {
+    // This file exists for a POSIX connect that std calls twice after EINTR,
+    // which Windows has no equivalent of: it never installs its connect
+    // there, so there is nothing for the test to exercise.
+    if (comptime !supported) return error.SkipZigTest;
     const io = testing.io;
     const pair = try StalledPair.open();
     defer pair.close();
@@ -394,6 +406,10 @@ test "a connect that SIGIO interrupts while it waits still connects" {
 }
 
 test "connects on worker threads all succeed while another thread sends SIGIO" {
+    // This file exists for a POSIX connect that std calls twice after EINTR,
+    // which Windows has no equivalent of: it never installs its connect
+    // there, so there is nothing for the test to exercise.
+    if (comptime !supported) return error.SkipZigTest;
     const io = testing.io;
     const address = loopback(0);
     var server = try address.listen(io, .{ .kernel_backlog = 128 });
@@ -447,6 +463,10 @@ test "connects on worker threads all succeed while another thread sends SIGIO" {
 }
 
 test "waiting for a connect ends promptly when its task is canceled" {
+    // This file exists for a POSIX connect that std calls twice after EINTR,
+    // which Windows has no equivalent of: it never installs its connect
+    // there, so there is nothing for the test to exercise.
+    if (comptime !supported) return error.SkipZigTest;
     const io = testing.io;
     const pair = try StalledPair.open();
     defer pair.close();

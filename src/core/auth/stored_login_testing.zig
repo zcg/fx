@@ -35,7 +35,7 @@ pub const StoredLoginHome = struct {
         try self.tmp.dir.writeFile(io_mod.getIo(), .{
             .sub_path = ".fx/auth.json",
             .data = json,
-            .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+            .flags = .{ .permissions = io_mod.permissionsForMode(0o600) },
         });
     }
 

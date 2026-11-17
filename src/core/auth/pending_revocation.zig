@@ -829,7 +829,7 @@ fn writeRecord(tmp: *testing.TmpDir, name: []const u8, bytes: []const u8, mode: 
     if (mode != 0o600) {
         var file = try fx_dir.dir.openFile(io_mod.getIo(), name, .{ .mode = .read_only });
         defer file.close(io_mod.getIo());
-        try file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(@intCast(mode)));
+        try file.setPermissions(io_mod.getIo(), io_mod.permissionsForMode(@intCast(mode)));
     }
 }
 

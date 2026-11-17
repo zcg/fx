@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
+const readiness = @import("../../core/shared/readiness.zig");
 const record_tape = @import("../../core/workspace/record_tape.zig");
 const types = @import("../../core/shared/types.zig");
 const terminal_diff = @import("../render_engine/terminal_diff.zig");
@@ -82,13 +83,12 @@ pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) ter
 fn terminalHungUp(file: std.Io.File, err: anyerror) bool {
     if (comptime builtin.target.os.tag == .wasi) return false;
     if (err != error.InputOutput) return false;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = file.handle,
-        .events = std.posix.POLL.OUT,
-        .revents = 0,
-    }};
-    _ = std.posix.poll(&fds, 0) catch return false;
-    return (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0;
+    // Windows has no hang-up to see: a closed pipe reports end of file on the
+    // next read, and a console reports the console closing through its own
+    // event. `pollDescriptors` answers both the same way it answers POSIX.
+    var watches = [_]readiness.Watch{.{ .fd = file.handle }};
+    _ = readiness.pollDescriptors(&watches, .now) catch return false;
+    return watches[0].events.hung_up or watches[0].events.errored;
 }
 
 fn recordPartialFrame(metrics: *Metrics, accepted: []const u8, err: anyerror) terminal_diff.FrameSinkWriteResult {

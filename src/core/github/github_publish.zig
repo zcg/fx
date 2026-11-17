@@ -264,6 +264,10 @@ test "publish returns fallback for non-zero exit without stderr" {
 }
 
 test "publish reports a gh that a signal ended as a failure" {
+    // A terminated child reports a signal on POSIX. Windows has no signals to
+    // report: a process there ends with an exit status, so the signal arm of
+    // the result cannot be built.
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const stdout = try std.testing.allocator.dupe(u8, "https://github.com/o/r/pull/1\n");
     const stderr = try std.testing.allocator.dupe(u8, "");
 
