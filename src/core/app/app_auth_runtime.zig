@@ -2999,6 +2999,41 @@ const TestAuth = struct {
     inventory_refresh_fails: bool = false,
     prompt_refresh_start: auth_runtime.PromptCredentialRefreshStart = .not_needed,
     prompt_refresh_start_count: usize = 0,
+    /// The add-provider walk these tests drive, when they drive one.
+    add_provider_active: bool = false,
+
+    fn beginAddProvider(self: *TestAuth, _: std.mem.Allocator) bool {
+        self.add_provider_active = true;
+        return true;
+    }
+
+    fn beginAddProviderKey(self: *TestAuth, _: std.mem.Allocator, _: model_provider.ProviderId) !void {
+        self.add_provider_active = true;
+    }
+
+    fn addProviderFlowActive(self: *const TestAuth) bool {
+        return self.add_provider_active;
+    }
+
+    fn cancelAddProvider(self: *TestAuth, _: std.mem.Allocator) void {
+        self.add_provider_active = false;
+    }
+
+    fn deleteAddProviderByte(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn clearAddProviderField(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn addProviderDraftView(_: *const TestAuth) ?auth_runtime.AddProviderProjection {
+        return null;
+    }
+
+    fn appendAddProviderByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
+        return true;
+    }
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;

@@ -14,6 +14,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const agent_steps = @import("../config/agent_steps.zig");
 const model_provider = @import("../config/model_provider.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -876,6 +877,13 @@ const TestApp = struct {
     selected_model: std.ArrayList(u8) = .empty,
     permission_engine: permissions.PermissionEngine = .{},
     agent_step_limit: usize = 0,
+    /// The bound a subagent turn gets, from `subagent_max_agent_steps`.
+    subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
+    /// How deep a subagent tree may go, and how many may work at once.
+    subagent_max_depth: usize = agent_steps.default_subagent_max_depth,
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
+    /// The paragraph main's prompt adds about its subagent limits.
+    subagent_prompt_guidance: []const u8 = &.{},
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
     context_enabled: bool = true,

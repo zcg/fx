@@ -158,21 +158,47 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
     }
 }
 
-const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+/// The bit `F_SETFL` reads for non-blocking, on the platforms that have it.
+/// Windows turns non-blocking on with `FIONBIO` on a socket and has no such
+/// flag for a handle, so there it is zero and the code below never uses it.
+const nonblock_flag: usize = if (supported) @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK") else 0;
+
+/// `ioctlsocket` from winsock, which Zig 0.17 does not declare.
+const winsock = struct {
+    extern "ws2_32" fn ioctlsocket(socket: posix.fd_t, command: c_long, argument: *u32) c_int;
+};
+
+/// `FIONBIO`: the command that turns non-blocking on or off for a socket.
+const FIONBIO: c_long = 0x8004667e;
+
+/// Sets or clears non-blocking on a Windows socket.
+fn setNonblockingSocket(fd: posix.fd_t, enabled: bool) error{Unexpected}!void {
+    var value: u32 = @intFromBool(enabled);
+    if (winsock.ioctlsocket(fd, FIONBIO, &value) != 0) return error.Unexpected;
+}
 
 /// Closes `fd` when the process runs another program.
 pub fn setCloexec(fd: posix.fd_t) error{Unexpected}!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        // A Windows socket handle is created non-inheritable already. A pipe
+        // or file handle carries the same inherit flag, which this clears.
+        const windows = std.os.windows;
+        if (windows.kernel32.SetHandleInformation(fd, windows.HANDLE_FLAG_INHERIT, 0) == 0) return error.Unexpected;
+        return;
+    }
     _ = try fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
 }
 
 /// Makes calls on `fd` return instead of waiting.
 pub fn setNonblocking(fd: posix.fd_t) error{Unexpected}!void {
+    if (comptime builtin.target.os.tag == .windows) return setNonblockingSocket(fd, true);
     const flags = try fcntl(fd, posix.F.GETFL, 0);
     _ = try fcntl(fd, posix.F.SETFL, flags | nonblock_flag);
 }
 
 /// Makes calls on `fd` wait until they can finish.
 pub fn setBlocking(fd: posix.fd_t) error{Unexpected}!void {
+    if (comptime builtin.target.os.tag == .windows) return setNonblockingSocket(fd, false);
     const flags = try fcntl(fd, posix.F.GETFL, 0);
     _ = try fcntl(fd, posix.F.SETFL, flags & ~nonblock_flag);
 }

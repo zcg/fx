@@ -3914,8 +3914,19 @@ const RoutingFakeApp = struct {
         session_persistence: app_session_runtime.Persistence = .{},
         worker: RoutingWorker = .{},
         stream: types.StreamState = .{},
+        /// How many levels of subagents sit above this agent.
+        subagent_depth: usize = 0,
     } = .{},
     next_image_id_counter: usize = 1,
+    /// The provider runtime the auth flows read and rewrite.
+    provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
+    /// Counts pointer presses, so a click and a drag are told apart.
+    pointer_click_seq: u64 = 0,
+    /// A left-button press, in 1-based cells, counted so a frame can tell which
+    /// presses it has already answered.
+    pointer_click: ?struct { row: u16, column: u16, seq: u64 } = null,
+    /// Where the pointer last moved with no button down, in 1-based cells.
+    hover_position: ?struct { row: u16, column: u16 } = null,
     selected_model: std.ArrayList(u8) = .empty,
     workspace_root: []const u8 = "",
     skills: skill_runtime.Runtime = .{},
@@ -4230,6 +4241,10 @@ const RoutingFakeApp = struct {
             .source => |source| _ = try self.selectCredentialSource(source),
             .action => |action| self.selected_auth_action = action,
             .team => |index| self.selected_auth_team = index,
+            // The add-provider row starts a walk this stub does not drive; the
+            // tests that check it use the real runtime.
+            .add_provider => {},
+            .provider_action => {},
         }
     }
 

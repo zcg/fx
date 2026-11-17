@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const agent_steps = @import("../config/agent_steps.zig");
 const profiles = @import("../profiles/profiles.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
@@ -2107,11 +2108,19 @@ const FakeApp = struct {
     selected_provider: model_provider.ProviderId = .gateway,
     permission_engine: permissions.PermissionEngine = .{},
     agent_step_limit: usize = 8,
+    /// The bound a subagent turn gets, from `subagent_max_agent_steps`.
+    subagent_agent_step_limit: usize = agent_steps.default_subagent_max_agent_steps,
+    /// How deep a subagent tree may go, from `subagent_max_depth`.
+    subagent_max_depth: usize = agent_steps.default_subagent_max_depth,
+    /// How many subagents may work at once, from `subagent_max_children`.
+    subagent_max_children: usize = agent_steps.default_subagent_max_children,
     fast_mode: bool = true,
     main_agent: struct {
         /// What this agent is to the one that started it; the root agent has
         /// no parent, and a subagent names its role so its tool set can differ.
-        role: agents.Role = .root,
+        role: agents.Role = .instance,
+        /// How many levels of subagents sit above this agent.
+        subagent_depth: usize = 0,
         effort: types.ReasoningEffort = types.ReasoningEffort.literal("high"),
         context_snapshot: context_contract.GatheredContextSnapshot,
         change_tracker: change_tracker.ChangeTracker = .{},

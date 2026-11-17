@@ -969,7 +969,7 @@ pub const Runtime = struct {
         const fetch_cached = provider.fetch_cached_fn orelse return;
         var entries = (try fetch_cached(provider.context, self.alloc)) orelse return;
         defer model_catalog.freeModelCatalog(self.alloc, &entries);
-        try mergeMenuSnapshot(self.alloc, &self.menu, entries.items, provider.provider_id.label(), &.{});
+        try mergeMenuSnapshot(self.alloc, &self.menu, entries.items, provider.provider_id.label(), &.{}, self.token_pass.hasPass());
     }
 
     pub fn startMenuWarmup(self: *Self, provider: model_catalog.Provider) void {
@@ -995,7 +995,7 @@ pub const Runtime = struct {
         if (self.menu_loader) |loader| {
             if (try loader.pollLoadTransition()) {
                 if (self.menu.active) {
-                    if (loader.state == .ready) try mergeMenuSnapshot(self.alloc, &self.menu, loader.catalog.items, loader.providerLabel(), &.{});
+                    if (loader.state == .ready) try mergeMenuSnapshot(self.alloc, &self.menu, loader.catalog.items, loader.providerLabel(), &.{}, self.token_pass.hasPass());
                     if (self.menu.providerFilter()) |name| {
                         if (std.mem.eql(u8, name, loader.providerLabel())) self.menu.catalog_state = modelMenuCatalogState(loader.outcome, loader.from_profile_settings);
                     }
@@ -1350,6 +1350,7 @@ pub const Runtime = struct {
                 self.catalog.items,
                 self.providerLabel(),
                 self.previous_ids.items,
+                self.token_pass.hasPass(),
             ),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
@@ -1454,31 +1455,61 @@ fn modelProvider(model: []const u8) []const u8 {
 /// Builds one row per catalog entry, owned by the returned list. The rows'
 /// `provider` borrows `connection`, which the caller must keep alive for as
 /// long as the rows live; `rebuildTabs` later repoints it at the tab's copy.
-fn buildMenuItems(alloc: Allocator, catalog: []const model_catalog.ModelCatalogEntry, connection: []const u8) Allocator.Error!std.ArrayList(ModelMenuItem) {
+///
+/// `token_pass_first` is the team's Token Pass: the models the catalog marks
+/// as paid by it lead the list, in catalog order. A model whose Fast mode runs
+/// on another listed model gets no row of its own, because that model's row
+/// already selects it (`model_catalog.foldsIntoFastMode`).
+fn buildMenuItems(
+    alloc: Allocator,
+    catalog: []const model_catalog.ModelCatalogEntry,
+    connection: []const u8,
+    token_pass_first: bool,
+) Allocator.Error!std.ArrayList(ModelMenuItem) {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
         for (items.items) |*item| item.deinit(alloc);
         items.deinit(alloc);
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
+    if (token_pass_first) {
+        for (catalog) |entry| {
+            if (!entry.token_pass) continue;
+            if (model_catalog.foldsIntoFastMode(entry, catalog)) continue;
+            try appendMenuRow(alloc, &items, entry, connection);
+        }
+    }
     for (catalog) |entry| {
-        const id = try alloc.dupe(u8, entry.id);
-        errdefer alloc.free(id);
-        const owner = if (entry.owned_by) |vendor| try alloc.dupe(u8, vendor) else null;
-        errdefer if (owner) |vendor| alloc.free(vendor);
-        items.appendAssumeCapacity(.{
-            .id = id,
-            .added = entry.added,
-            .provider = connection,
-            .owned_by = owner,
-            .token_pass = entry.token_pass,
-            .capabilities = model_capabilities.resolveCapabilities(
-                id,
-                model_catalog_metadata.fromCatalogEntry(entry),
-            ),
-        });
+        // The Token Pass rows already went in above.
+        if (token_pass_first and entry.token_pass) continue;
+        if (model_catalog.foldsIntoFastMode(entry, catalog)) continue;
+        try appendMenuRow(alloc, &items, entry, connection);
     }
     return items;
+}
+
+/// Appends the row for `entry`, owning what it copies.
+fn appendMenuRow(
+    alloc: Allocator,
+    items: *std.ArrayList(ModelMenuItem),
+    entry: model_catalog.ModelCatalogEntry,
+    connection: []const u8,
+) Allocator.Error!void {
+    const id = try alloc.dupe(u8, entry.id);
+    errdefer alloc.free(id);
+    const owner = if (entry.owned_by) |vendor| try alloc.dupe(u8, vendor) else null;
+    errdefer if (owner) |vendor| alloc.free(vendor);
+    try items.append(alloc, .{
+        .id = id,
+        .added = entry.added,
+        .provider = connection,
+        .owned_by = owner,
+        .token_pass = entry.token_pass,
+        .capabilities = model_capabilities.resolveCapabilities(
+            id,
+            model_catalog_metadata.fromCatalogEntry(entry),
+        ),
+    });
 }
 
 /// Everything a rebuild has to preserve: the tab, the row under the cursor,
@@ -1564,11 +1595,12 @@ fn hydrateMenuSnapshot(
     catalog: []const model_catalog.ModelCatalogEntry,
     connection: []const u8,
     previous_ids: []const []const u8,
+    token_pass_first: bool,
 ) !void {
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
     const tab = try menu.ensureProviderTab(alloc, connection);
-    const items = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?);
+    const items = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?, token_pass_first);
     adoptMenuItems(alloc, menu, items, carry, previous_ids);
 }
 
@@ -1582,11 +1614,12 @@ fn mergeMenuSnapshot(
     catalog: []const model_catalog.ModelCatalogEntry,
     connection: []const u8,
     previous_ids: []const []const u8,
+    token_pass_first: bool,
 ) !void {
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
     const tab = try menu.ensureProviderTab(alloc, connection);
-    const incoming = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?);
+    const incoming = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?, token_pass_first);
     var items = incoming;
     errdefer {
         for (items.items) |*item| item.deinit(alloc);
@@ -2597,7 +2630,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "openai", &.{});
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "openai", &.{}, false);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -2652,7 +2685,7 @@ test "model menu leaves out a fast variant that Fast mode on a listed model runs
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "provider", &.{}, false);
     runtime.menu.active = true;
 
     // `provider/plain` has no Fast mode, so its variant is the only way to run fast.
@@ -2668,7 +2701,7 @@ test "model menu leaves out a fast variant that Fast mode on a listed model runs
     // stays out too, while its base keeps the Fast mode row.
     var marked = entries;
     marked[1].token_pass = true;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &marked, true);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &marked, "provider", &.{}, true);
     try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
     for (runtime.menu.items.items) |item| {
         try std.testing.expect(!std.mem.eql(u8, item.id, "anthropic/claude-opus-5-fast"));
@@ -2687,7 +2720,7 @@ test "model menu leads with the models the catalog marks as Token Pass, for a te
     defer menu.deinit(alloc);
 
     // The marks, not a list in fx, pick the models, in catalog order.
-    try hydrateMenuSnapshot(alloc, &menu, &entries, true);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "provider", &.{}, true);
     const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6-sol", "deepseek/deepseek-v4.1-flash" };
     for (led, menu.items.items) |id, item| {
         try std.testing.expectEqualStrings(id, item.id);
@@ -2695,7 +2728,7 @@ test "model menu leads with the models the catalog marks as Token Pass, for a te
     }
 
     // Without Token Pass the catalog order stands.
-    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "provider", &.{}, false);
     for (entries, menu.items.items) |entry, item| try std.testing.expectEqualStrings(entry.id, item.id);
 }
 
@@ -2709,7 +2742,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai", &.{});
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai", &.{}, false);
     menu.active = true;
 
     menu.setQuery("gpt5");
@@ -2727,7 +2760,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     const revalidated = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
     } ++ entries;
-    try hydrateMenuSnapshot(alloc, &menu, &revalidated, "openai", &.{});
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, "openai", &.{}, false);
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 }
@@ -2742,7 +2775,7 @@ test "a model's own name ranks it above longer ids that contain it" {
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai", &.{});
+    try hydrateMenuSnapshot(alloc, &menu, &entries, "openai", &.{}, false);
     menu.active = true;
 
     menu.setQuery("GPT-4o");
@@ -2804,8 +2837,8 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &openai_entries, "openai", &.{});
-    try mergeMenuSnapshot(alloc, &mixed, &xai_entries, "xai", &.{});
+    try hydrateMenuSnapshot(alloc, &mixed, &openai_entries, "openai", &.{}, false);
+    try mergeMenuSnapshot(alloc, &mixed, &xai_entries, "xai", &.{}, false);
     mixed.active = true;
 
     try std.testing.expectEqual(@as(usize, 3), mixed.provider_tabs.items.len);
@@ -2824,7 +2857,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     // A menu with a single connection has nowhere to go.
     var single: ModelMenu = .{};
     defer single.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &single, &openai_entries, "openai", &.{});
+    try hydrateMenuSnapshot(alloc, &single, &openai_entries, "openai", &.{}, false);
     single.active = true;
     try std.testing.expect(!single.moveProvider(1));
     try std.testing.expect(single.providerFilter() == null);
@@ -2839,14 +2872,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, "openai", &.{});
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, "openai", &.{}, false);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, "openai", &.{})) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, "openai", &.{}, false)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

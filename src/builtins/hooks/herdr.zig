@@ -343,6 +343,10 @@ fn writeClearAuthority(w: *std.Io.Writer, id: u64, pane_id: []const u8) !void {
 
 test "waiting for herdr's reply ends at its line, at a close, or at the deadline" {
     if (comptime host_target.is_wasm) return;
+    // The test builds a Unix-domain socket pair, which Windows does not have;
+    // `drainResponse` also returns at once there, so there is nothing to wait
+    // for and nothing to assert.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var handles: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &handles) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(handles[0]);
