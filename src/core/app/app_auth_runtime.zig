@@ -2,6 +2,7 @@ const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const settings_store = @import("../config/settings_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -1187,6 +1188,24 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(base_url);
             const protocol = try app.alloc.dupe(u8, draft.protocol);
             defer app.alloc.free(protocol);
+            // The key never goes into the settings file: that file records the
+            // environment variable the key is read from, and the key is put in
+            // the environment here so a saved connection works next start.
+            const key_env = try settings_store.providerKeyEnvName(app.alloc, name);
+            defer app.alloc.free(key_env);
+            io_mod.setPersistentEnv(key_env, draft.key) catch |err| {
+                debug_trace.logf("auth", "add provider key store failed env={s} err={s}", .{ key_env, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = try app.alloc.print(
+                        "The key for {s} could not be stored. Set {s} in your environment, then try again.",
+                        .{ name, key_env },
+                    ),
+                }, true);
+                app.auth.cancelAddProvider(app.alloc);
+                return;
+            };
             _ = config_runtime.setUserPreferences(app.alloc, .{
                 .provider_definition = .{
                     .name = name,

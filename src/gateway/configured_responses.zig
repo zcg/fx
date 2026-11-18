@@ -58,7 +58,6 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const provider_options = request.provider_options;
-    if (provider_options.reasoning != null and options.effort_fields == null) return error.UnsupportedProviderOption;
     if (provider_options.fast or provider_options.prompt_caching or provider_options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     if (request.response_format) |format| if (format.schema != .object) return error.UnsupportedResponseFormat;
@@ -131,6 +130,20 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
         try writer.writeAll(",\"strict\":true}}");
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
+    // The chosen level travels with the request: without it the endpoint
+    // reasons at its own default and the menu setting has no effect. A
+    // connection that declares effort levels writes its own fields; one that
+    // does not still gets the level's name in the standard `reasoning.effort`
+    // shape, which a compatible gateway reads the same way. Refusing here
+    // would make a connection that reports its thinking levels unusable until
+    // someone writes a metadata file by hand.
+    if (provider_options.reasoning) |effort| {
+        if (!effort.isDefault() and options.effort_fields == null) {
+            try writer.writeAll(",\"reasoning\":{\"effort\":");
+            try std.json.Stringify.value(effort.label(), .{}, writer);
+            try writer.writeByte('}');
+        }
+    }
     const effort_fields = if (provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
     try request_fragment.write(writer, options.request_fields, effort_fields);
     try writer.writeByte('}');

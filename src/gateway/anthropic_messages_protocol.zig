@@ -198,7 +198,10 @@ pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, _: []cons
 /// inference, or provider defaults. Deadline enforcement and prepared-body
 /// reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
-    try validate_request(input, options.effort_fields != null);
+    // A connection that did not declare effort levels still gets its chosen
+    // level: the Anthropic shape for thinking is the same regardless, and
+    // refusing here would make an undeclared connection unusable.
+    try validate_request(input, options.effort_fields != null or input.provider_options.reasoning == null);
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });

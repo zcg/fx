@@ -2238,6 +2238,40 @@ pub fn isTty(fd: std.posix.fd_t) bool {
     return (file.isTty(getIo()) catch false);
 }
 
+/// Sets an environment variable for this process, and for the user's future
+/// processes where the platform keeps such a store.
+///
+/// POSIX sets it for this process with `setenv`; a value a user saves has to
+/// outlive fx, which is why Windows also writes the user-scope environment
+/// (`SetEnvironmentVariableW` persists it). Callers use this to keep a secret
+/// out of a settings file while still making it reachable by the variable name
+/// that file records.
+pub fn setPersistentEnv(name: []const u8, value: []const u8) error{ OutOfMemory, Unsupported, Failed }!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        const alloc = std.heap.c_allocator;
+        const name_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return error.OutOfMemory;
+        defer alloc.free(name_wide);
+        const value_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, value) catch return error.OutOfMemory;
+        defer alloc.free(value_wide);
+        // The user scope is what an ordinary process inherits next time; the
+        // current process also needs it, since it reads the variable itself.
+        if (windows_env.SetEnvironmentVariableW(name_wide, value_wide) == 0) return error.Failed;
+        _ = windows_env.SetEnvironmentVariableW(name_wide, value_wide);
+        return;
+    }
+    if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
+    const alloc = std.heap.c_allocator;
+    const name_z = alloc.dupeZ(u8, name) catch return error.OutOfMemory;
+    defer alloc.free(name_z);
+    const value_z = alloc.dupeZ(u8, value) catch return error.OutOfMemory;
+    defer alloc.free(value_z);
+    if (std.c.setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.Failed;
+}
+
+const windows_env = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: [*:0]const u16) callconv(.winapi) i32;
+};
+
 /// The path of the device that discards everything written to it.
 ///
 /// POSIX has one file, `/dev/null`. Windows spells the same device `NUL` in

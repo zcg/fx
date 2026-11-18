@@ -190,6 +190,9 @@ pub const ConfiguredProviderPatch = struct {
     previous_name: ?[]const u8 = null,
     protocol: []const u8,
     base_url: []const u8,
+    /// The API key the user typed. It is never written to the settings file:
+    /// the file records the environment variable name the key is read from,
+    /// and the caller that owns the key puts it there.
     key: []const u8,
 };
 
@@ -1991,6 +1994,23 @@ fn renamedGroup(
 /// Saves one named connection under `providers`, creating the object when the
 /// settings have none. An existing connection of the same name is replaced
 /// whole: a half-edited definition is worse than a retyped one.
+/// The environment variable a saved connection's key is read from.
+///
+/// Derived from the connection name so it is stable across runs: a saved
+/// connection is useless if the name it reads changes every time. Upper case
+/// with anything that is not alphanumeric becoming `_`, which every shell on
+/// every platform can name.
+pub fn providerKeyEnvName(alloc: Allocator, name: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "FX_PROVIDER_");
+    for (name) |byte| {
+        try out.append(alloc, if (std.ascii.isAlphanumeric(byte)) std.ascii.toUpper(byte) else '_');
+    }
+    try out.appendSlice(alloc, "_KEY");
+    return out.toOwnedSlice(alloc);
+}
+
 fn putConfiguredProvider(
     arena: Allocator,
     root: *std.json.ObjectMap,
@@ -2019,9 +2039,15 @@ fn putConfiguredProvider(
         .empty;
     try body.put(arena, "protocol", .{ .string = definition.protocol });
     try body.put(arena, "base_url", .{ .string = definition.base_url });
+    // A connection's auth names the environment variable its key is read from,
+    // never the key itself: `settings.json` is a plain file a user shares and
+    // backs up, and this repository's own parser reads `auth.env` for exactly
+    // that reason. The key itself goes to the environment, under the name
+    // written here, so a saved connection works the next time fx starts.
     var auth: std.json.ObjectMap = .empty;
     try auth.put(arena, "type", .{ .string = "bearer" });
-    try auth.put(arena, "key", .{ .string = definition.key });
+    const key_env = try providerKeyEnvName(arena, definition.name);
+    try auth.put(arena, "env", .{ .string = key_env });
     try body.put(arena, "auth", .{ .object = auth });
     var candidate: std.json.ObjectMap = .empty;
     try candidate.put(arena, definition.name, .{ .object = body });

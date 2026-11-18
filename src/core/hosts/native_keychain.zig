@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const select_watch = @import("../shared/select_watch.zig");
 const secret = @import("../auth/secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const windows_credentials = @import("windows_credentials.zig");
 
 const err_sec_success: i32 = 0;
 const err_sec_item_not_found: i32 = -25300;
@@ -62,8 +63,14 @@ pub const Error = error{
     KeychainDeleteFailed,
 };
 
+/// Whether this platform has a secret store fx can use.
+///
+/// macOS keeps it in the login keychain; Windows in the Credential Manager,
+/// whose generic credentials the operating system encrypts with DPAPI before
+/// they reach disk. Every other target has no such store, and a caller that
+/// needs one reports it as unavailable rather than writing a secret to a file.
 pub fn isAvailable() bool {
-    return builtin.target.os.tag == .macos;
+    return builtin.target.os.tag == .macos or windows_credentials.supported;
 }
 
 pub fn isDisabled() bool {
@@ -176,9 +183,14 @@ pub fn oauthSessionPresence() Error!host.SecretStorePresence {
 }
 
 fn containsService(service: []const u8) Error!host.SecretStorePresence {
-    if (comptime builtin.target.os.tag != .macos) return .missing;
+    if (!isAvailable()) return .missing;
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
+    if (comptime windows_credentials.supported) {
+        const present = windows_credentials.contains(std.heap.c_allocator, service, account) catch
+            return error.KeychainReadFailed;
+        return if (present) .present else .missing;
+    }
     const service_len = std.math.cast(u32, service.len) orelse
         return error.KeychainReadFailed;
     const account_len = std.math.cast(u32, account.len) orelse
@@ -220,6 +232,13 @@ fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
 
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
+    if (comptime windows_credentials.supported) {
+        return windows_credentials.load(alloc, service, account) catch |err| switch (err) {
+            error.NotFound => null,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.KeychainReadFailed,
+        };
+    }
     const result = std.process.run(alloc, io_mod.getIo(), .{
         .argv = &.{ "/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w" },
     }) catch |err| {
@@ -371,6 +390,14 @@ pub fn storeValue(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0) return error.KeychainWriteFailed;
 
+    if (comptime windows_credentials.supported) {
+        var account_buf: AccountBuffer = undefined;
+        const account = try accountName(&account_buf);
+        return windows_credentials.store(std.heap.c_allocator, service_name, account, value) catch |err| switch (err) {
+            error.OutOfMemory => error.KeychainWriteFailed,
+            else => error.KeychainWriteFailed,
+        };
+    }
     if (comptime builtin.target.os.tag == .macos) return storeValueMac(service_name, value);
     return error.UnsupportedPlatform;
 }

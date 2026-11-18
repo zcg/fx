@@ -734,10 +734,14 @@ fn composeAddProviderPickerRow(
                     try row.appendSlice(alloc, ui_render.reset_style);
                     try row.appendSlice(alloc, addProviderInputText(draft, width).?);
                 },
+                // A terminal delivers a paste as bracketed text, which is what
+                // ctrl+shift+v (and a right-click paste) send. A bare ctrl+v is
+                // a control byte the field refuses, so naming it would promise
+                // something the keystroke does not do.
                 3 => try row_text.appendClipped(alloc, &row, if (draft.field == .api_key)
-                    "   ctrl+v pastes     ctrl+u clears     enter saves and fetches models"
+                    "   ctrl+shift+v pastes     ctrl+u clears     enter saves and fetches models"
                 else
-                    "   ctrl+v pastes     ctrl+u clears     enter continues", width),
+                    "   ctrl+shift+v pastes     ctrl+u clears     enter continues", width),
                 else => {},
             }
         },
