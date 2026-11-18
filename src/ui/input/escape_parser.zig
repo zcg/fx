@@ -146,6 +146,12 @@ fn keypadNavigationKey(keycode: u16) ?u8 {
 // The plain navigation mapping. Every encoding that reports navigation keys
 // resolves through this one table: CSI finals, application-keypad SS3 bytes,
 // and kitty keypad codes.
+//
+// A letter outside the table is ignored rather than treated as a bug. A
+// terminal sends a CSI sequence for every key fx does not know, including the
+// ones a keyboard reports that fx never bound, and one of those must not end
+// the program: the byte arrives from the terminal, not from this code, so it is
+// input to survive rather than an invariant to assert.
 fn plainNavigationAction(letter: u8) InputEscapeAction {
     return switch (letter) {
         'A' => .cursor_up,
@@ -154,7 +160,7 @@ fn plainNavigationAction(letter: u8) InputEscapeAction {
         'D' => .cursor_left,
         'H' => .home,
         'F' => .end,
-        else => unreachable,
+        else => .ignore,
     };
 }
 
