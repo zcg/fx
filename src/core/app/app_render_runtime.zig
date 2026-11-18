@@ -959,6 +959,11 @@ pub fn Runtime(comptime App: type) type {
             return picker_state.model_picker_speed_options[speed_index % picker_state.model_picker_speed_options.len];
         }
 
+        /// How many frames a resize may refuse before the block is dropped.
+        /// A resize being applied refuses one or two, so a higher count means
+        /// the pass that applies it is stuck.
+        const max_resize_refusals: u8 = 8;
+
         fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, speed_index: usize) bool {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
@@ -1002,18 +1007,25 @@ pub fn Runtime(comptime App: type) type {
                 if (shell_runtime.resizeBlocksFrameCommit(&app.shell)) {
                     // A resize blocks the next frame until it is applied, and
                     // the pass that applies it can be waiting on a probe the
-                    // terminal will not answer. Past its own deadline the
-                    // geometry is taken as it stands, so the block cannot
-                    // outlive the debounce window and freeze the screen.
-                    if (app.shell.render_requests.shouldApplyDeferredResize(app_permission_runtime.monotonicMillis())) {
-                        debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d}", .{
+                    // terminal will not answer. A block that has refused this
+                    // many frames in a row is not a resize in progress, it is a
+                    // resize nothing will ever apply, and the screen would stay
+                    // frozen for the rest of the session. Counting refusals
+                    // rather than reading a clock keeps the rule exact: a resize
+                    // that is being applied refuses at most a frame or two.
+                    if (app.shell.resize_refusals >= max_resize_refusals) {
+                        debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d} refusals={d}", .{
                             app.shell.render_requests.resize_apply_after_ms,
+                            app.shell.resize_refusals,
                         });
                         app.shell.render_requests.completeResizeGeometry(false);
                         app.shell.pending_resize_observation = null;
+                        app.shell.resize_refusals = 0;
                     } else {
-                        debug_trace.logf("frame_schedule", "flush_refused resize_lifecycle pending_after_ms={d}", .{
+                        app.shell.resize_refusals +|= 1;
+                        debug_trace.logf("frame_schedule", "flush_refused resize_lifecycle pending_after_ms={d} refusals={d}", .{
                             app.shell.render_requests.resize_apply_after_ms,
+                            app.shell.resize_refusals,
                         });
                         return;
                     }
@@ -3773,6 +3785,7 @@ const CoordinatorFaultTestApp = struct {
         terminal_reset_pending: bool = false,
         resize_history_row_delta: ?i32 = null,
         pending_resize_observation: ?transcript_runtime.ResizeObservation = null,
+        resize_refusals: u8 = 0,
         layout: struct {
             rows: u16 = 24,
             cols: u16 = 80,
