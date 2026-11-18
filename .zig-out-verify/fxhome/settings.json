@@ -1,1 +1,0 @@
-{"provider":"probe","providers":{"probe":{"protocol":"openai-chat-completions","base_url":"http://127.0.0.1:1/v1","auth":{"type":"bearer","key":"PLACEHOLDER-CREDENTIAL-VALUE"},"headers":{"x-api-key":"PLACEHOLDER-HEADER-VALUE"}}},"model":"probe/model"}

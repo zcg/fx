@@ -536,7 +536,7 @@ const Mutation = struct {
         var current = (try session_presence.openCurrent(self.fx_dir.dir, self.place.source.files().record)) orelse return null;
         defer current.file.close(io_mod.getIo());
         const stat = current.stat;
-        if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) return error.InsecureKeptSignOuts;
+        if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or io_mod.exposesGroupOrOther(stat.permissions)) return error.InsecureKeptSignOuts;
         return try io_mod.readFileToEnd(alloc, &current.file, max_record_bytes + 1);
     }
 

@@ -409,7 +409,7 @@ fn verifyOpenedRegularFileWithPolicy(stat: std.Io.File.Stat, policy: RegularFile
     if (policy.hardlinks == .reject and stat.nlink > 1) {
         return error.DurablePathUnsafe;
     }
-    if (policy.hardlinks == .reject and policy.mode != .read_only and stat.nlink != 1) {
+    if (policy.hardlinks == .reject and policy.mode != .read_only and !isSingleLinkRegularFile(stat.kind, stat.nlink)) {
         return error.DurablePathUnsafe;
     }
 }
@@ -907,7 +907,7 @@ fn validateRelativeLeaf(name: []const u8) !void {
 
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
     if (comptime modeIsEnforced) {
         if (stat.permissions.toMode() & 0o777 != 0o600) return error.PrivateStatePermissionsUnsupported;
     }
@@ -918,7 +918,7 @@ fn verifyPrivateRegularFile(file: std.Io.File) !void {
 /// this, because a mode they cannot set is not evidence of a restriction.
 fn verifyPrivateRegularFilePath(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
 }
 
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
@@ -1073,13 +1073,13 @@ fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
         error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
         else => return err,
     };
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
     if (deniesWrites(stat.permissions)) return error.AccessDenied;
 }
 
 fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
     const stat = dir.statFile(getIo(), name, .{ .follow_symlinks = false }) catch return;
-    if (stat.kind != .file or stat.nlink != 1) return;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return;
     dir.deleteFile(getIo(), name) catch {};
 }
 
@@ -1194,7 +1194,7 @@ pub fn durableReplaceVerifiedWithOps(
     // equivalent guarantee for a freshly renamed file, so the check is limited to
     // the platforms where it means what it says.
     if (comptime modeIsEnforced) {
-        if (final_stat.nlink != 1) return error.DurableReplacePostRenameFailed;
+        if (!isSingleLinkRegularFile(final_stat.kind, final_stat.nlink)) return error.DurableReplacePostRenameFailed;
     }
     if (comptime modeIsEnforced) {
         if (final_stat.permissions.toMode() & 0o777 != 0o600) return error.DurableReplacePostRenameFailed;
@@ -1230,7 +1230,7 @@ pub fn othersCanWrite(permissions: std.Io.File.Permissions) bool {
 /// A regular file only its owner can write, though others may read it.
 fn verifyOwnerWritableRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
     if (othersCanWrite(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
@@ -1762,6 +1762,21 @@ pub inline fn exposesGroupOrOther(permissions: std.Io.File.Permissions) bool {
     return false;
 }
 
+/// Whether the entry is a regular file only this account can reach, which every
+/// file fx keeps for one account alone must be.
+///
+/// POSIX proves it from the link count: a second name would let another account
+/// in through a folder fx does not control. Windows keeps that count in the
+/// filesystem too, but its `stat` leaves it zero for a handle it opened without
+/// backup intent, so a zero there is "not reported" rather than "unlinked" and
+/// must not be read as a leak. The ACL, not the mode, is what restricts the
+/// file there, which `privateStateIsRestricted` covers.
+pub inline fn isSingleLinkRegularFile(kind: std.Io.File.Kind, nlink: u64) bool {
+    if (kind != .file) return false;
+    if (comptime modeIsEnforced) return nlink == 1;
+    return nlink == 1 or nlink == 0;
+}
+
 /// Whether the entry's mode differs from the one fx requires. Windows has no
 /// mode, so a check that only a POSIX mode can satisfy passes there rather than
 /// failing a file fx could not have marked.
@@ -2236,6 +2251,13 @@ pub fn isTty(fd: std.posix.fd_t) bool {
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     return (file.isTty(getIo()) catch false);
 }
+
+/// The path of the device that discards everything written to it.
+///
+/// POSIX has one file, `/dev/null`. Windows spells the same device `NUL` in
+/// every folder, so a test that writes a frame somewhere harmless names this
+/// instead of a path.
+pub const null_device = if (builtin.target.os.tag == .windows) "\\\\.\\NUL" else "/dev/null";
 
 /// This process's standard input as a `std.Io.File`.
 pub fn stdinFile() std.Io.File {

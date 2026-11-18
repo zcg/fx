@@ -14,7 +14,33 @@ const io_mod = @import("core/shared/io.zig");
 /// a failing unit test still names the status it saw.
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = builtin.is_test,
+    .logFn = logMessage,
 };
+
+/// Writes a log line to stderr without marking the test binary as failed.
+///
+/// The default test log function counts every `.err` line in a counter the
+/// fuzz runner reads, so one error logged by any earlier test makes every
+/// later `std.testing.fuzz` call panic with "error logs detected". fx logs
+/// recoverable conditions at that level on purpose, and the tests that care
+/// about them assert on their own outcome, so the count is not a signal here.
+fn logMessage(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (comptime builtin.is_test) {
+        var buffer: [1024]u8 = undefined;
+        const line = std.mem.print(&buffer, "[{s}] ({s}) " ++ format ++ "\n", .{
+            @tagName(level),
+            @tagName(scope),
+        } ++ args) catch return;
+        _ = std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), line) catch {};
+        return;
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
 
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
@@ -4160,10 +4186,13 @@ fn windowsNamesNonFolder(path: []const u8) bool {
     if (wide_len + 1 > wide_buffer.len) return false;
     wide_buffer[wide_len] = 0;
     const attributes = windows_file.GetFileAttributesW(@ptrCast(&wide_buffer));
-    // `INVALID_FILE_ATTRIBUTES` means the path does not resolve at all, which is
-    // a path fx may create later rather than one a file blocks.
-    const invalid_attributes: u32 = 0xFFFFFFFF;
-    if (attributes == invalid_attributes) return false;
+    if (attributes == windows_file.invalid_file_attributes) {
+        // A path that runs through a file resolves to nothing, and Windows says
+        // so by naming the component that is not a folder rather than the path
+        // as missing. That is the case POSIX reports as `ENOTDIR`, and it is a
+        // path fx must refuse rather than create later.
+        return windows_file.GetLastError() == windows_file.error_path_not_found;
+    }
     const directory_attribute: u32 = 0x10;
     return attributes & directory_attribute == 0;
 }
@@ -4193,6 +4222,12 @@ fn windowsCreateFolderPath(path: []const u8) void {
 const windows_path_max_wide = 32767;
 
 const windows_file = if (builtin.target.os.tag != .windows) struct {} else struct {
+    /// `INVALID_FILE_ATTRIBUTES`: what `GetFileAttributesW` reports for a path
+    /// that does not resolve.
+    const invalid_file_attributes: u32 = 0xFFFFFFFF;
+    /// `ERROR_PATH_NOT_FOUND`: a component of the path is not a folder.
+    const error_path_not_found: u32 = 3;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     const file_append_data: u32 = 0x00000004;
     const file_share_write: u32 = 0x00000002;
     const open_always: u32 = 0x00000004;
@@ -4793,15 +4828,17 @@ test "process io connects through a reachable address while fx tasks hold every 
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
+    const focused = focused_ui_worker_poll_timeout_ms;
+    const idle = min_idle_poll_timeout_ms;
     try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
+    try std.testing.expectEqual(idle, nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
+    try std.testing.expectEqual(idle, nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
@@ -4994,7 +5031,7 @@ test "session reset traces and clears active paste state" {
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
 
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -5034,7 +5071,7 @@ test "session reset traces and clears active paste state" {
 
 test "fresh session resize preflight keeps a pending draft until geometry settles" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5068,7 +5105,7 @@ test "fresh session resize preflight keeps a pending draft until geometry settle
 
 test "partial session handoff resize cancels the pending transition without exiting" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5118,7 +5155,7 @@ test "partial session handoff resize cancels the pending transition without exit
 
 test "deferred session transition replays later input only after the fresh session installs" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5153,7 +5190,7 @@ test "deferred session transition replays later input only after the fresh sessi
 
 test "deferred session input stops replay after quit" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5187,7 +5224,7 @@ test "deferred session input stops replay after quit" {
 
 test "active native turn cancels before resize-deferred session handoff" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5223,7 +5260,7 @@ test "active native turn cancels before resize-deferred session handoff" {
 
 test "deferred paste settles before input from the next delivery epoch" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5257,7 +5294,7 @@ test "deferred paste settles before input from the next delivery epoch" {
 
 test "stalled fresh-session handoff replays Ctrl+C after timeout" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5308,7 +5345,7 @@ test "stalled fresh-session handoff replays Ctrl+C after timeout" {
 
 test "replayed new command retains the worker hold through a second deferred transition" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5351,7 +5388,7 @@ test "replayed new command retains the worker hold through a second deferred tra
 
 test "quit exits after a timed-out handoff without a completed input epoch" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -5403,7 +5440,7 @@ test "terminal help styling respects terminal capability and color opt-outs" {
 }
 
 test "follow up prompt card top margin is renderer-owned" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -5439,7 +5476,7 @@ test "follow up prompt card top margin is renderer-owned" {
 }
 
 test "follow up prompt card does not over-pad when assistant ends with blank row" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -5475,7 +5512,7 @@ test "diff block writes are classified" {
     const c_alloc = std.heap.c_allocator;
     const diff_mod = @import("core/output/diff.zig");
 
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -5519,7 +5556,7 @@ test "deferred resumed diff builds once and degrades to its preview" {
     const c_alloc = std.heap.c_allocator;
     const diff_mod = @import("core/output/diff.zig");
 
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -5573,7 +5610,7 @@ test "deferred resumed diff builds once and degrades to its preview" {
 }
 
 test "prompt card wraps image badges in OSC 8 hyperlinks" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -5608,7 +5645,7 @@ test "prompt card wraps image badges in OSC 8 hyperlinks" {
 }
 
 test "/version command writes version to transcript" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -6100,6 +6137,9 @@ fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent 
 // the mode of the agent that runs it: none in full access, so a tool a deny rule names stays, and the
 // host's rules in ask (tests/tla/mcp_host/McpRules.tla `FullAccessIgnoresRules`, `DenyHoldsOutside`).
 test "the per-step refresh of an MCP tool takes the rules of the mode of the agent that runs it" {
+    // The fixture is an MCP server written in sh, and a Windows host has no
+    // `sh` to run it with.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const Permission = app_permission_runtime.Runtime(App);
     const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
@@ -6181,7 +6221,7 @@ test "visiting a child agent puts its context, transcript, and pacer on the scre
 
 test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6250,7 +6290,7 @@ test "the tick visits only the child agents with work waiting" {
 test "the tick leaves hidden agents' work for a later pass while a scrollback handoff is pending" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6428,7 +6468,7 @@ test "hidden work held over a thousand passes is all handled once the handoff en
 
 test "main and every hidden subagent wait during a pending handoff and are each handled once after it" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6471,7 +6511,7 @@ test "main and every hidden subagent wait during a pending handoff and are each 
 
 test "hidden work held by a handoff runs once a resize cancels the handoff" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -6658,7 +6698,7 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
 
 test "a handoff that gives way before it pushed any row only redraws" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -6694,7 +6734,7 @@ test "a handoff that gives way before it pushed any row only redraws" {
 
 test "a subagent its parent closes during a pending handoff is dropped once the handoff ends" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6736,7 +6776,7 @@ test "a subagent its parent closes during a pending handoff is dropped once the 
 
 test "quitting while a scrollback handoff is pending closes every agent" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6760,7 +6800,7 @@ test "quitting while a scrollback handoff is pending closes every agent" {
 
 test "a turn that starts on screen during a pending handoff lets the hidden agents run" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{
         .alloc = alloc,
@@ -6812,7 +6852,7 @@ test "a turn that starts on screen during a pending handoff lets the hidden agen
 test "the agent list previews each agent by switching, keeps every draft where it was typed, Up on the first row closes it, and Esc goes back" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6895,7 +6935,7 @@ test "the agent list previews each agent by switching, keeps every draft where i
 
 test "a search edit that makes the agent list show another agent keeps the cursor and selection where they were in the search" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -6934,7 +6974,7 @@ test "a search edit that makes the agent list show another agent keeps the curso
 
 test "the agent list holds a subagent among the working ones until its finished turn is applied" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7017,7 +7057,7 @@ fn menuRowState(projection: anytype, name: []const u8) ![]const u8 {
 
 test "an idle agent's waiting row counts a subagent until its finished turn is applied" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7097,7 +7137,7 @@ fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []
 
 test "a run of Backspace presses that edited the agent list's search never arms a close, held or not, in any encoding, and another key ends the run" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(std.testing.io);
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7185,7 +7225,7 @@ test "a run of Backspace presses that edited the agent list's search never arms 
 
 test "a run of forward Delete presses that edited the agent list's search never arms a close either, and Delete after a Backspace run arms as on any list" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(std.testing.io);
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7270,7 +7310,7 @@ test "a run of forward Delete presses that edited the agent list's search never 
 
 test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7360,7 +7400,7 @@ fn fuzzAgentsMenu(_: void, smith: *std.testing.Smith) !void {
     const bytes = input[0..smith.slice(&input)];
     var at: usize = 0;
     const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7473,7 +7513,7 @@ fn indexOfAgent(order: []const ?*app_agents_runtime.ChildAgent, agent: ?*app_age
 test "the footer indicator names the agent on screen and the key that opens the list" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7501,7 +7541,7 @@ const EndsFixture = struct {
 
     fn init(self: *EndsFixture) !void {
         // A switch writes the tab title, so keep it off the test runner's stdout.
-        self.sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+        self.sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
         self.app = .{ .alloc = std.testing.allocator, .shell = .{ .stdout_file = self.sink } };
     }
 
@@ -7661,7 +7701,7 @@ test "an instance's row keeps its states whatever its turns did" {
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7702,7 +7742,7 @@ test "while a subagent is on screen, the tick visits main and the other hidden a
 test "the footer notes a hidden agent waiting on an approval, never the one on screen" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7737,7 +7777,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
 test "the footer notes a hidden agent whose request waits for the user" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7769,7 +7809,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7872,7 +7912,7 @@ test "an approval answered on main's screen goes back, so the next one of the tr
 test "main's screen shows its tree's oldest prompt first, approval or question" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
@@ -7921,7 +7961,7 @@ test "main's screen shows its tree's oldest prompt first, approval or question" 
 test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
     var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);

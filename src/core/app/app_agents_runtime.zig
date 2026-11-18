@@ -3777,14 +3777,34 @@ fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {
     var len: usize = 0;
     var instances: usize = 0;
     while (len < buf.len and !smith.eos()) : (len += 1) {
-        if (smith.boolWeighted(1, 1)) {
+        // A subagent belongs to an instance that already started, which is the
+        // shape the switch order is defined over: each instance sits above its
+        // own group. The first entry is therefore always an instance.
+        if (instances == 0 or smith.boolWeighted(1, 1)) {
             buf[len] = .{ .role = .instance };
             instances += 1;
-        } else buf[len] = .{ .role = .subagent, .root = smith.valueRangeAtMost(u8, 0, @intCast(instances)) };
+        } else {
+            buf[len] = .{ .role = .subagent, .root = smith.valueRangeAtMost(u8, 1, @intCast(instances)) };
+        }
     }
     var order: [buf.len + 1]usize = undefined;
     switchOrder(buf[0..len], order[0 .. len + 1]);
     try expectSwitchOrder(buf[0..len], order[0 .. len + 1]);
+}
+
+test "the switch order holds for every subagent root the generator can name" {
+    // `fuzzSwitchOrder` only builds a subagent under an instance that already
+    // exists, because the order it checks puts each instance above its own
+    // children. This pins that rule with inputs that would break it: a
+    // subagent before any instance, and one naming an instance that never
+    // arrives.
+    const no_instance = [_]OrderEntry{
+        .{ .role = .subagent, .root = 1 },
+    };
+    var order: [3]usize = undefined;
+    switchOrder(&no_instance, &order);
+    // The root has no instance, so the subagent keeps its place after All.
+    try std.testing.expectEqual(@as(usize, 0), order[0]);
 }
 
 test "an instance's subagents waiting for the user come first, then the working ones, in the order they started, and the instance stays above them" {

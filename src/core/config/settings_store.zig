@@ -798,7 +798,7 @@ pub const Store = struct {
 
         for (names.items) |name| {
             const stat = backups.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch continue;
-            if (stat.kind != .file or stat.nlink != 1 or stat.size > max_settings_bytes) continue;
+            if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or stat.size > max_settings_bytes) continue;
             var file = backups.openFile(io_mod.getIo(), name, .{
                 .allow_directory = false,
                 .follow_symlinks = false,
@@ -2586,7 +2586,7 @@ fn containsCopyWithFingerprint(
     while (try iterator.next(io_mod.getIo())) |entry| {
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
         const stat = dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false }) catch continue;
-        if (stat.kind != .file or stat.nlink != 1 or stat.size > max_settings_bytes) continue;
+        if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or stat.size > max_settings_bytes) continue;
         var file = dir.openFile(io_mod.getIo(), entry.name, .{
             .allow_directory = false,
             .follow_symlinks = false,
@@ -2628,7 +2628,7 @@ fn pruneSequencedCopies(
     var deleted = false;
     for (names.items[keep_count..]) |name| {
         const stat = dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch continue;
-        if (stat.kind != .file or stat.nlink != 1) continue;
+        if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) continue;
         dir.deleteFile(io_mod.getIo(), name) catch |err| {
             debug_trace.logf("config", "settings backup prune skipped err={s}", .{@errorName(err)});
             continue;

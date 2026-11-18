@@ -1534,7 +1534,7 @@ fn verifyPrivateOpenedStat(
 }
 
 fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
-    if (stat.kind != .file or stat.nlink != 1) {
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) {
         return error.SessionPathUnsafe;
     }
     if (io_mod.modeMismatch(stat.permissions, 0o600)) {

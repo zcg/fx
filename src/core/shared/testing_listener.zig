@@ -72,12 +72,17 @@ fn acceptUntilStop(
 /// Room for the longest report `goneMessage` writes.
 const gone_message_max = 160;
 
-/// Logs a connection that `poll` reported and `accept` did not find. An
-/// error logged during a test fails that test, with this text in its output.
+/// Logs a connection that `poll` reported and `accept` did not find.
+///
+/// The line is a warning, not an error, because a test binary counts every
+/// error-level line it ever wrote and fails any later fuzz target when the
+/// count is not zero. This report describes a race the test is driving on
+/// purpose, and the test that cares asserts on its own result, so it must not
+/// be what makes an unrelated target fail.
 fn reportGone(port: u16, revents: i16, errno: posix.E) void {
     var buffer: [gone_message_max]u8 = undefined;
     const text = goneMessage(&buffer, port, revents, errno) catch "poll reported a connection, but accept found none";
-    log.err("{s}", .{text});
+    log.warn("{s}", .{text});
 }
 
 fn goneMessage(buffer: []u8, port: u16, revents: i16, errno: posix.E) error{NoSpaceLeft}![]const u8 {

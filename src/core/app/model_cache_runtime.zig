@@ -1600,6 +1600,10 @@ fn hydrateMenuSnapshot(
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
     const tab = try menu.ensureProviderTab(alloc, connection);
+    // A menu that was empty has no tab of its own yet, so the one this catalog
+    // is for is what it should show. Without this the picker opens on All even
+    // though every row belongs to one connection.
+    if (carry.tab == null) carry.tab = try alloc.dupe(u8, menu.provider_tabs.items[tab].name.?);
     const items = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?, token_pass_first);
     adoptMenuItems(alloc, menu, items, carry, previous_ids);
 }
@@ -1619,6 +1623,7 @@ fn mergeMenuSnapshot(
     var carry = try MenuCarry.take(alloc, menu);
     defer carry.deinit(alloc);
     const tab = try menu.ensureProviderTab(alloc, connection);
+    if (carry.tab == null) carry.tab = try alloc.dupe(u8, menu.provider_tabs.items[tab].name.?);
     const incoming = try buildMenuItems(alloc, catalog, menu.provider_tabs.items[tab].name.?, token_pass_first);
     var items = incoming;
     errdefer {

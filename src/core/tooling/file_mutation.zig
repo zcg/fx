@@ -549,7 +549,7 @@ fn applyWithTestControls(
 
     const initial_stage_stat = stage.stat(io_mod.getIo()) catch
         return resources.reject(.io_failure);
-    if (initial_stage_stat.kind != .file or initial_stage_stat.nlink != 1) {
+    if (!io_mod.isSingleLinkRegularFile(initial_stage_stat.kind, initial_stage_stat.nlink)) {
         return resources.reject(.staged_source_changed);
     }
     resources.temp_identity = pathing.fileIdentity(
@@ -816,7 +816,7 @@ fn validateStagedSourceIdentity(
     const zio = io_mod.getIo();
     const stat = stage.stat(zio) catch return .io_failure;
     if (stat.kind != .file or
-        stat.nlink != 1 or
+        !io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or
         stat.size != expected_size)
     {
         return .changed;
@@ -1133,7 +1133,7 @@ fn observedFileIdentity(
     }) catch return null;
     defer file.close(io_mod.getIo());
     const stat = file.stat(io_mod.getIo()) catch return null;
-    if (stat.kind != .file or stat.nlink != 1) return null;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return null;
     return pathing.fileIdentity(
         pathing.descriptorDevice(file.handle) catch return null,
         stat,

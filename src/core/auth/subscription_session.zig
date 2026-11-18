@@ -150,7 +150,7 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
             var file = current.file;
 
             const stat = current.stat;
-            if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) {
+            if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or io_mod.exposesGroupOrOther(stat.permissions)) {
                 debug_trace.logf("auth", spec.trace_label ++ " session load failed step=permissions err=InsecureAuthFile", .{});
                 return error.InsecureAuthFile;
             }

@@ -2313,7 +2313,7 @@ fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
 
 fn verifyManagedFile(file: std.Io.File, mode: OpenMode) !void {
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.SessionPathUnsafe;
     if (mode == .writable and io_mod.modeMismatch(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }

@@ -332,7 +332,7 @@ fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
     var file = current.file;
 
     const stat = current.stat;
-    if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) {
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or io_mod.exposesGroupOrOther(stat.permissions)) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
     }
@@ -764,7 +764,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
     defer current.file.close(io_mod.getIo());
 
     const stat = current.stat;
-    if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) {
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or io_mod.exposesGroupOrOther(stat.permissions)) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
     }
@@ -1057,7 +1057,7 @@ fn readKeptTeam(alloc: Allocator) !?KeptTeam {
     var current = (try session_presence.openCurrent(fx_dir, kept_team_file_name)) orelse return null;
     defer current.file.close(io_mod.getIo());
     const stat = current.stat;
-    if (stat.kind != .file or stat.nlink != 1 or io_mod.exposesGroupOrOther(stat.permissions)) return error.InsecureKeptTeamFile;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or io_mod.exposesGroupOrOther(stat.permissions)) return error.InsecureKeptTeamFile;
     const bytes = try io_mod.readFileToEnd(alloc, &current.file, max_kept_team_file_bytes);
     defer alloc.free(bytes);
     return try parseKeptTeam(alloc, bytes);

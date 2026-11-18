@@ -150,7 +150,7 @@ fn classifyConversationCandidate(
         "events.jsonl",
         .{ .follow_symlinks = false },
     );
-    if (event_stat.kind != .file or event_stat.nlink != 1) {
+    if (!io_mod.isSingleLinkRegularFile(event_stat.kind, event_stat.nlink)) {
         return error.SessionPathUnsafe;
     }
     var history_len: usize = 0;
@@ -458,7 +458,7 @@ fn classifyLegacySnapshot(
     };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.SessionPathUnsafe;
     if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
     var buffer: [16 * 1024]u8 = undefined;
     var reader = file.readerStreaming(io_mod.getIo(), &buffer);

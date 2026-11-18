@@ -289,7 +289,7 @@ pub const Store = struct {
         errdefer file.close(zio);
 
         const initial = try file.stat(zio);
-        if (initial.kind != .file or initial.nlink != 1) return error.DurablePathUnsafe;
+        if (!io_mod.isSingleLinkRegularFile(initial.kind, initial.nlink)) return error.DurablePathUnsafe;
         if (writable) {
             io_mod.setPermissions(file, private_file_permissions) catch {
                 return error.PrivateStatePermissionsUnsupported;

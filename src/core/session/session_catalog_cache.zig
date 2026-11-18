@@ -270,7 +270,7 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "display.json" }) |name| {
         const path = try std.mem.print(&path_buffer, "{s}/{s}", .{ id, name });
         if (try statOptional(dir, path)) |stat| {
-            if (stat.kind != .file or stat.nlink != 1) return null;
+            if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return null;
             digest.update(&.{1});
             addStat(&digest, stat);
         } else digest.update(&.{0});
@@ -284,7 +284,7 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
         for ([_][]const u8{ "owner.json", "control.json" }) |name| {
             const path = try std.mem.print(&path_buffer, "{s}/subagent/{s}", .{ id, name });
             if (try statOptional(dir, path)) |marker| {
-                if (marker.kind != .file or marker.nlink != 1) return null;
+                if (!io_mod.isSingleLinkRegularFile(marker.kind, marker.nlink)) return null;
                 digest.update(&.{1});
                 addStat(&digest, marker);
             } else digest.update(&.{0});

@@ -275,7 +275,7 @@ pub fn eventLogSize(
         error.SymLinkLoop, error.NotDir => return error.SessionPathUnsafe,
         else => return err,
     };
-    if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.SessionPathUnsafe;
     return stat.size;
 }
 

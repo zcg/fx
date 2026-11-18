@@ -53,7 +53,7 @@ pub fn requireWritableInDir(dir: std.Io.Dir, file_name: []const u8) error{Creden
         if (err == error.FileNotFound) return false;
         return error.CredentialStorageUnavailable;
     };
-    if (stat.kind != .file or stat.nlink != 1 or io_mod.modeMismatch(stat.permissions, 0o600)) {
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or io_mod.modeMismatch(stat.permissions, 0o600)) {
         return error.CredentialStorageUnavailable;
     }
     return true;
@@ -121,7 +121,7 @@ fn profileFileFromHome(
 
     const stat = current.stat;
     if (stat.kind != .file or
-        stat.nlink != 1 or
+        !io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or
         io_mod.exposesGroupOrOther(stat.permissions) or
         stat.size == 0 or
         stat.size > max_bytes)
