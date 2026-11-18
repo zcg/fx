@@ -604,10 +604,18 @@ pub fn Runtime(comptime App: type) type {
             // Main's prompt says how many subagents it may run, and how deep
             // the tree may go, so it plans within the same limits the tool
             // enforces. The app owns this text for its lifetime.
-            app.subagent_prompt_guidance = subagent_agent_adapter.mainSubagentGuidance(
+            // Replacing text the app already owns: a bootstrap that runs
+            // twice would otherwise leak the first one.
+            const rebuilt_guidance = subagent_agent_adapter.mainSubagentGuidance(
                 app.alloc,
                 .{ .max_children = startup.subagent_max_children, .max_depth = startup.subagent_max_depth },
-            ) catch "";
+            ) catch null;
+            if (rebuilt_guidance) |guidance| {
+                if (comptime @hasField(App, "subagent_prompt_guidance")) {
+                    if (app.subagent_prompt_guidance.len > 0) app.alloc.free(app.subagent_prompt_guidance);
+                    app.subagent_prompt_guidance = guidance;
+                } else app.alloc.free(guidance);
+            }
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
@@ -911,6 +919,10 @@ const TestApp = struct {
 
     fn deinit(self: *TestApp) void {
         self.deinit_calls += 1;
+        if (self.subagent_prompt_guidance.len > 0) {
+            self.alloc.free(self.subagent_prompt_guidance);
+            self.subagent_prompt_guidance = &.{};
+        }
         if (self.workspace_root.len > 0) {
             self.alloc.free(self.workspace_root);
             self.workspace_root = &.{};
@@ -1087,11 +1099,16 @@ fn loadSkillsForTest(
 
     const diagnostics = try alloc.alloc(skill_runtime.SkillDiagnostic, 1);
     errdefer alloc.free(diagnostics);
+    // A root the catalog could not read. A malformed skill is deliberately
+    // quiet now: it is the skill author's file, every third-party collection
+    // has a few, and reporting them made every start warn about something the
+    // user could not act on. So the notice this fixture produces is the root
+    // one, which is the shape the summary writes.
     diagnostics[0] = .{
         .path = try alloc.dupe(u8, "/skills/hostile\npath/body-sentinel"),
         .source = .global_fx,
-        .scope = .candidate,
-        .cause = .{ .invalid_metadata = .missing_name },
+        .scope = .root,
+        .cause = .unreadable,
     };
     return .{ .dir = dir, .skills = &.{}, .diagnostics = diagnostics };
 }
@@ -1488,8 +1505,9 @@ test "app_bootstrap_runtime keeps skill discovery warnings in the full transcrip
     const start = std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") orelse return error.TestExpectedEqual;
     const end = std.mem.findScalarPos(u8, app.transcript.items, start, '\n') orelse return error.TestExpectedEqual;
     const notice = app.transcript.items[start..end];
+    // The root could not be read, and the summary names it.
     try std.testing.expect(std.mem.find(u8, notice, "hostile&#x0a;path/body-sentinel") != null);
-    try std.testing.expect(std.mem.find(u8, notice, "metadata is invalid (missing_name)") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "inventory incomplete because root") != null);
     try std.testing.expect(std.mem.endsWith(u8, notice, " [full-only]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.transcript.items, "* skills:"));
 }

@@ -634,6 +634,9 @@ const App = struct {
     /// no children of its own.
     subagent_max_children: usize = agent_steps.default_subagent_max_children,
     subagent_max_depth: usize = agent_steps.default_subagent_max_depth,
+    /// What main's prompt says about starting subagents. Owned by this app:
+    /// `mainSubagentGuidance` allocates it and this frees it, since the limit
+    /// it names can change while fx runs.
     subagent_prompt_guidance: []const u8 = &.{},
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -1151,6 +1154,7 @@ const App = struct {
     /// the cooperative host. Native interactive exit uses
     /// `shutdownForProcessExit`.
     pub fn deinit(self: *App) void {
+        defer if (self.subagent_prompt_guidance.len > 0) self.alloc.free(self.subagent_prompt_guidance);
         // Shutdown is main's own; its subagents stop in stopChildren and
         // shutdownChildren. Main is named here, not found as the agent on
         // screen, so quitting from a subagent's screen stops main.

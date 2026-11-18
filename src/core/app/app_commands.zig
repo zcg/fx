@@ -2114,10 +2114,17 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 // Main's prompt says how many it may run, so it is rebuilt
                 // from the same number the tool enforces.
                 if (comptime @hasField(ChangeApp, "subagent_prompt_guidance")) {
-                    app.subagent_prompt_guidance = subagent_agent_adapter.mainSubagentGuidance(
+                    // The app owns this text, so the rebuilt one replaces it and
+                    // what it replaced is freed. A failure keeps the old text,
+                    // which the app still owns.
+                    const rebuilt = subagent_agent_adapter.mainSubagentGuidance(
                         app.alloc,
-                        .{ .max_children = children },
-                    ) catch app.subagent_prompt_guidance;
+                        .{ .max_children = children, .max_depth = app.subagent_max_depth },
+                    ) catch null;
+                    if (rebuilt) |guidance| {
+                        if (app.subagent_prompt_guidance.len > 0) app.alloc.free(app.subagent_prompt_guidance);
+                        app.subagent_prompt_guidance = guidance;
+                    }
                 }
                 app.shell.render_requests.request(.footer);
             }
