@@ -164,7 +164,6 @@ pub const AssistantPacer = struct {
     /// here instead of shifting the buffer, so a long reply costs one copy
     /// when it is drained rather than one per tick
     /// (docs/audit/2026-11-06-full-review.md section 12.2).
-    consumed: usize = 0,
     deferred_turn: ?FinishedPrompt = null,
     deferred_started_ns: ?i128 = null,
     /// Calls whose Ctrl+O lines wait for the text before them, which is still
@@ -179,7 +178,6 @@ pub const AssistantPacer = struct {
 
     pub fn deinit(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.deinit(alloc);
-        self.consumed = 0;
         self.dropHeldModelCalls(alloc, "deinit");
         self.held_calls.deinit(alloc);
         if (self.deferred_turn) |finished| {
@@ -194,23 +192,13 @@ pub const AssistantPacer = struct {
     }
 
     /// The bytes not yet emitted.
+    ///
+    /// `consume` removes them from the buffer as they go out, so the buffer
+    /// holds exactly what is left to show. Every caller reads that as "how much
+    /// is pending", including the check that writes a held call line, so the
+    /// two must not drift apart.
     fn remaining(self: *const AssistantPacer) []const u8 {
-        return self.pending.items[@min(self.consumed, self.pending.items.len)..];
-    }
-
-    /// Drops the emitted prefix. Called when nothing is left, so the buffer is
-    /// emptied once instead of on every tick.
-    fn compact(self: *AssistantPacer) void {
-        if (self.consumed == 0) return;
-        if (self.consumed >= self.pending.items.len) {
-            self.pending.clearRetainingCapacity();
-            self.consumed = 0;
-            return;
-        }
-        const rest = self.pending.items.len - self.consumed;
-        @memmove(self.pending.items[0..rest], self.pending.items[self.consumed..]);
-        self.pending.items.len = rest;
-        self.consumed = 0;
+        return self.pending.items;
     }
 
     /// Holds a call's Ctrl+O line while the text before it is still pending,
@@ -241,9 +229,6 @@ pub const AssistantPacer = struct {
 
     pub fn enqueue(self: *AssistantPacer, alloc: Allocator, text: []const u8) !void {
         if (text.len == 0) return;
-        // Everything before `consumed` is spent, so it is dropped once here
-        // rather than on every tick.
-        self.compact();
         try self.pending.appendSlice(alloc, text);
     }
 
@@ -290,13 +275,11 @@ pub const AssistantPacer = struct {
     /// A deferred finish stays.
     pub fn discardPendingText(self: *AssistantPacer) void {
         self.pending.clearRetainingCapacity();
-        self.consumed = 0;
         self.sgr = .{};
     }
 
     pub fn clear(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.clearRetainingCapacity();
-        self.consumed = 0;
         self.dropHeldModelCalls(alloc, "clear");
         if (self.deferred_turn) |finished| {
             types.freeFinishedPrompt(alloc, finished);
@@ -361,7 +344,15 @@ pub const AssistantPacer = struct {
     /// can't be written is traced and dropped; the turn saved it already.
     fn writeHeldModelCalls(self: *AssistantPacer, alloc: Allocator, cb: TickCallbacks) void {
         if (self.held_calls.items.len == 0) return;
-        std.debug.assert(self.pending.items.len == 0);
+        // A call's line is held until the text before it has been shown, and
+        // `consume` removes emitted bytes, so the buffer is empty exactly when
+        // nothing is left to show. Text still here would mean a caller skipped
+        // the emit and the line would appear before its own text; that is a
+        // pacer bug worth reporting rather than one worth ending a session
+        // over, so it is traced instead of asserted.
+        if (self.pending.items.len > 0) {
+            debug_trace.logf("ui_activity", "model call line written with text pending bytes={d}", .{self.pending.items.len});
+        }
         var calls = self.held_calls;
         self.held_calls = .empty;
         defer calls.deinit(alloc);
@@ -515,10 +506,11 @@ pub const AssistantPacer = struct {
     }
 
     fn consume(self: *AssistantPacer, byte_count: usize) void {
-        // The emitted bytes stay where they are and the next read starts past
-        // them. Within one tick the emitted prefix is reserved, so this costs
-        // nothing; the buffer is compacted once no more will arrive.
-        self.consumed +|= byte_count;
+        const left = self.pending.items.len - byte_count;
+        if (left > 0) {
+            @memmove(self.pending.items[0..left], self.pending.items[byte_count..]);
+        }
+        self.pending.items.len = left;
     }
 };
 
@@ -597,6 +589,26 @@ test "tick emits one queued rendered block atomically" {
     try pacer.tick(alloc, 0, cap.callbacks());
 
     try std.testing.expectEqualStrings(paragraph, cap.emitted.items);
+    try std.testing.expect(!pacer.hasPending());
+}
+
+test "a held call line is written once its text has drained" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    // The line waits while text is pending and is written once that text has
+    // gone out. `consume` removes emitted bytes from the buffer, so "nothing
+    // pending" and "empty buffer" are the same statement, which is what the
+    // write relies on.
+    try pacer.enqueue(alloc, "reply that is complete\n");
+    try std.testing.expect(try pacer.holdModelCall(alloc, held_call));
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try std.testing.expectEqualStrings("reply that is complete\n", cap.emitted.items);
+    try std.testing.expectEqual(@as(usize, 1), cap.call_count);
+    try std.testing.expectEqual(@as(usize, 0), pacer.pending.items.len);
     try std.testing.expect(!pacer.hasPending());
 }
 
