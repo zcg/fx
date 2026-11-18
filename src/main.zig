@@ -3442,11 +3442,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        debug_trace.logf("resize", "loop_pass_begin", .{});
-        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) {
-            debug_trace.logf("resize", "loop_pass_refused admission", .{});
-            return;
-        }
+        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
 
         // Targets with no SIGWINCH report a resize only when asked, so every
         // pass compares the terminal's size against the one on record. This is

@@ -986,7 +986,9 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) {
-                // Why a frame never came: the gate that refuses one.
+                // A frame is refused here while the terminal has no usable
+                // size, and only a later resize clears the flag. Recorded so a
+                // frozen screen names the gate that held it.
                 debug_trace.logf("frame_schedule", "flush_refused dimensions_invalid={} rows={d} cols={d}", .{
                     app.shell.terminal_dimensions_invalid,
                     app.shell.layout.rows,
