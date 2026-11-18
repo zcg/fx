@@ -53,6 +53,10 @@ pub fn build(b: *std.Build) void {
     // default because most of them model POSIX behavior. A run there reports
     // what passes on Windows and skips the rest.
     const windows_tests = b.option(bool, "windows-tests", "Build and run the unit suites on Windows too") orelse false;
+    // A substring a test's name must contain, so one suite can be run on its
+    // own. Zig applies it while building the test binary, which keeps a run to
+    // the tests a change touched.
+    const test_filter = b.option([]const u8, "test-filter", "Run only the tests whose name contains this text");
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
@@ -160,6 +164,7 @@ pub fn build(b: *std.Build) void {
     if (posix_suites) {
         const exe_tests = b.addTest(.{
             .root_module = exe.root_module,
+            .filters = if (test_filter) |filter| &.{filter} else &.{},
         });
         // Some of fx's modules declare the JavaScript host's `extern "fx"`
         // functions, which name a library `fx`. An executable leaves them

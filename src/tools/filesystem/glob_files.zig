@@ -419,9 +419,11 @@ fn writeTempFileWithMtime(
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
-    defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-    try file.setTimestamps(io_mod.getIo(), .{
+    // The handle is closed before the time is set, because Windows opens the
+    // entry again for its attributes rather than reusing this handle.
+    file.close(io_mod.getIo());
+    try io_mod.setTimestamps(tmp.dir, sub_path, .{
         .access_timestamp = .{ .new = .{ .nanoseconds = mtime_ns } },
         .modify_timestamp = .{ .new = .{ .nanoseconds = mtime_ns } },
     });

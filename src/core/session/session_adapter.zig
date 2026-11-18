@@ -6267,6 +6267,18 @@ fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u
 
 const testing = std.testing;
 
+/// Widens an entry's mode the way an older fx or another program would, which
+/// is how these tests describe a filesystem another account can reach.
+///
+/// A Windows file carries an inherited ACL rather than a mode, so there is
+/// nothing to widen, and Zig's Windows `dirSetFilePermissions` panics with TODO
+/// implement. The test that asked for a wider entry then skips: it describes a
+/// POSIX filesystem, and the refusal it checks is POSIX policy.
+fn widenModeForTest(dir: std.Io.Dir, sub_path: []const u8, mode: u32) !void {
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
+    try dir.setFilePermissions(io_mod.getIo(), sub_path, io_mod.permissionsForMode(mode), .{});
+}
+
 test "every piece kind but checkpoints maps to one item type and back" {
     inline for (@typeInfo(PieceKind).@"enum".field_values) |field_value| {
         const kind: PieceKind = @fromBackingInt(@intCast(field_value));
@@ -8897,7 +8909,8 @@ test "a resume makes a hand-made ~/.fx private instead of refusing the session" 
     defer testing.allocator.free(id);
     try OldSideFolder.commitTurn(&t, s);
     s.close();
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), ".fx", io_mod.permissionsForMode(0o755), .{});
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
+    try widenModeForTest(t.tmp.dir, ".fx", 0o755);
 
     const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
     r.close();
@@ -9813,7 +9826,7 @@ const V1Home = struct {
                 error.FileNotFound => continue,
                 else => return err,
             };
-            try fx.dir.setTimestamps(io, log, .{ .modify_timestamp = .{ .new = at } });
+            try io_mod.setTimestamps(fx.dir, log, .{ .modify_timestamp = .{ .new = at } });
         }
         return ids;
     }
@@ -9844,8 +9857,8 @@ const V1Home = struct {
             var walker = try dir.walk(a);
             defer walker.deinit();
             while (try walker.next(io)) |entry| switch (entry.kind) {
-                .directory => try dir.setFilePermissions(io, entry.path, io_mod.permissionsForMode(0o755), .{}),
-                .file => try dir.setFilePermissions(io, entry.path, io_mod.permissionsForMode(0o644), .{}),
+                .directory => try widenModeForTest(dir, entry.path, 0o755),
+                .file => try widenModeForTest(dir, entry.path, 0o644),
                 else => {},
             };
         }
@@ -10431,7 +10444,8 @@ test "recover on a v1 session whose lock file others can write says its storage 
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const id = (try v1.fixture("plain", 1))[0];
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "session.lock"), io_mod.permissionsForMode(0o666), .{});
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(id, "session.lock"), 0o666);
     const err = if (recover(&t.store, alloc, id)) |recovered| {
         var value = recovered;
         value.deinit(alloc);
@@ -10448,7 +10462,7 @@ test "a v1 family whose subagent folder others can write: recover refuses it as 
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), io_mod.permissionsForMode(0o777), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(family[0], "subagent"), 0o777);
     const err = if (recover(&t.store, alloc, family[0])) |recovered| {
         var value = recovered;
         value.deinit(alloc);
@@ -11154,8 +11168,8 @@ test "fx sessions convert says a v1 subagent's own subagent stays with a parent 
     try nestThirdChild(&v1, family);
     var parent = try t.tmp.dir.openDir(io, try v1.sessionPath(family[1], "."), .{});
     defer parent.close(io);
-    parent.setFilePermissions(io, "session.json", io_mod.permissionsForMode(0o000), .{}) catch return error.SkipZigTest;
-    defer parent.setFilePermissions(io, "session.json", io_mod.permissionsForMode(0o600), .{}) catch {};
+    widenModeForTest(parent, "session.json", 0o000) catch return error.SkipZigTest;
+    defer widenModeForTest(parent, "session.json", 0o600) catch {};
     // Not when the file still opens, as it does for root.
     if (parent.readFileAlloc(io, "session.json", alloc, .limited(1 << 20))) |bytes| {
         alloc.free(bytes);
@@ -11375,7 +11389,7 @@ test "a v1 session whose folder others can write is refused as unsafe by show, r
     const ids = try v1.fixture("side", 1);
     const id = ids[0];
     for ([_]std.posix.mode_t{ 0o757, 0o775 }) |mode| {
-        try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), io_mod.permissionsForMode(mode), .{});
+        try widenModeForTest(t.tmp.dir, try v1.sessionPath(id, ""), mode);
         if (readSession(&t.store, alloc, id)) |shown| {
             var value = shown;
             value.deinit(alloc);
@@ -11392,7 +11406,7 @@ test "a v1 session whose folder others can write is refused as unsafe by show, r
         try testing.expectError(error.NotFound, t.store.manager.peek(alloc, id));
     }
     // Readable by others only, it shows and converts (D61).
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), io_mod.permissionsForMode(0o755), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(id, ""), 0o755);
     var shown = try readSession(&t.store, alloc, id);
     shown.deinit(alloc);
     const s = try openConverted(&t, id);
@@ -11424,7 +11438,7 @@ test "a v1 family whose subagent folder others can write is refused with the sub
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[1], ""), io_mod.permissionsForMode(0o757), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(family[1], ""), 0o757);
     if (recover(&t.store, alloc, family[0])) |recovered| {
         var value = recovered;
         value.deinit(alloc);
@@ -11451,7 +11465,7 @@ test "a v1 family whose root's subagent folder others can write is refused, nami
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent"), io_mod.permissionsForMode(0o777), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(family[0], "subagent"), 0o777);
     if (readSession(&t.store, alloc, family[0])) |shown| {
         var value = shown;
         value.deinit(alloc);
@@ -11476,7 +11490,7 @@ test "a v1 family whose children.json others can write is refused before it chan
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(family[0], "subagent/children.json"), io_mod.permissionsForMode(0o646), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(family[0], "subagent/children.json"), 0o646);
     if (readSession(&t.store, alloc, family[0])) |shown| {
         var value = shown;
         value.deinit(alloc);
@@ -11506,7 +11520,7 @@ test "a writable v1 entry's name reaches the reason terminal-safe, and a name to
     defer folder.close(io);
     const hostile = "x\x1b]0;PWNED\x07\x1b[31mred";
     folder.writeFile(io, .{ .sub_path = hostile, .data = "", .flags = .{ .permissions = io_mod.permissionsForMode(0o666) } }) catch return error.SkipZigTest;
-    try folder.setFilePermissions(io, hostile, io_mod.permissionsForMode(0o666), .{});
+    try widenModeForTest(folder, hostile, 0o666);
     try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
     const text = t.store.problem.text();
     try testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
@@ -11520,7 +11534,7 @@ test "a writable v1 entry's name reaches the reason terminal-safe, and a name to
     // reason would not fit whole.
     const long: [255]u8 = @splat(0x01);
     folder.writeFile(io, .{ .sub_path = &long, .data = "" }) catch return error.SkipZigTest;
-    try folder.setFilePermissions(io, &long, io_mod.permissionsForMode(0o666), .{});
+    try widenModeForTest(folder, &long, 0o666);
     try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
     try testing.expectEqualStrings(try std.mem.print(&buffer, "others can write something in its folder, so its files may not be the ones fx saved; make it private with `chmod -R go-w ~/.fx/sessions/{s}`", .{id}), t.store.problem.text());
 }
@@ -11533,7 +11547,7 @@ test "a v1 session whose events file others can write is refused like a writable
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const id = (try v1.fixture("side", 1))[0];
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, "events.jsonl"), io_mod.permissionsForMode(0o646), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(id, "events.jsonl"), 0o646);
     if (readSession(&t.store, alloc, id)) |shown| {
         var value = shown;
         value.deinit(alloc);
@@ -11562,7 +11576,7 @@ test "a converted session whose v1 folder comes back writable by others is kept,
     try testing.expect(!V1Home.exists(&t, id));
     // The v1 copy is back, and others can write it.
     _ = try v1.fixture("side", 1);
-    try t.tmp.dir.setFilePermissions(io_mod.getIo(), try v1.sessionPath(id, ""), io_mod.permissionsForMode(0o757), .{});
+    try widenModeForTest(t.tmp.dir, try v1.sessionPath(id, ""), 0o757);
     for (0..2) |_| {
         var report = try convertAll(&t.store, alloc);
         defer report.deinit(alloc);
@@ -12104,6 +12118,14 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
 }
 
+/// The same path with `/` as its separator, so a comparison does not depend on
+/// what the platform's walker reports.
+fn normalizeSlashes(path: []const u8, buffer: []u8) []const u8 {
+    if (path.len > buffer.len) return path;
+    for (path, 0..) |byte, i| buffer[i] = if (byte == '\\') '/' else byte;
+    return buffer[0..path.len];
+}
+
 test "only the adapter imports the session manager" {
     // Set by `zig build test`.
     const root = @import("test_paths").source_root;
@@ -12115,8 +12137,13 @@ test "only the adapter imports the session manager" {
     var checked: usize = 0;
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        if (std.mem.startsWith(u8, entry.path, "core/session_manager/")) continue;
-        if (std.mem.eql(u8, entry.path, "core/session/session_adapter.zig")) continue;
+        // A walker reports the separator the platform uses, so a Windows path
+        // reads `core\session\...` and a comparison against the POSIX form
+        // would let the adapter itself through as a violation.
+        var normalized_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const normalized = normalizeSlashes(entry.path, &normalized_buf);
+        if (std.mem.startsWith(u8, normalized, "core/session_manager/")) continue;
+        if (std.mem.eql(u8, normalized, "core/session/session_adapter.zig")) continue;
         const source = try dir.readFileAlloc(io, entry.path, testing.allocator, .limited(16 << 20));
         defer testing.allocator.free(source);
         if (std.mem.find(u8, source, "@import(\"session_manager\")") != null) {

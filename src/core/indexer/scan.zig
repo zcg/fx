@@ -911,7 +911,7 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
         try tree.file(try arena.print("{s}/docs/b.md", .{name}), "b");
     }
     const future: std.Io.Timestamp = .{ .nanoseconds = @as(i96, tree_mod.nowNs()) + 3600 * std.time.ns_per_s };
-    try tree.tmp.dir.setTimestamps(std.testing.io, "future/docs", .{ .modify_timestamp = .{ .new = future } });
+    try io_mod.setTimestamps(tree.tmp.dir, "future/docs", .{ .modify_timestamp = .{ .new = future } });
     // Folders above a searched one that have no `.gitignore` yet.
     const first_rules = [_][]const u8{ "root_rules", "parent_rules" };
     for (first_rules) |name| {

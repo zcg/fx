@@ -952,39 +952,25 @@ pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
     }
 }
 
-const windows_flush = if (builtin.target.os.tag != .windows) struct {} else struct {
-    const NTSTATUS = i32;
-    extern "ntdll" fn NtFlushBuffersFile(
-        file_handle: std.posix.fd_t,
-        io_status_block: *IO_STATUS_BLOCK,
-    ) callconv(.winapi) NTSTATUS;
-    const IO_STATUS_BLOCK = extern struct {
-        status_or_pointer: usize,
-        information: usize,
-    };
-};
 
-/// Asks Windows to write what the volume holds for `handle`.
+/// Windows has no way to flush a directory, so this reports that there is
+/// nothing left to ask.
 ///
-/// `NtFlushBuffersFile` is the call `FlushFileBuffers` wraps, and it takes the
-/// directory handle `openDir` already returned: unlike the Win32 function it
-/// needs no extra open with backup semantics, and it reports a status instead
-/// of setting a last error. A filesystem that has nothing to flush, such as a
-/// network share without write-through, answers success, which is what the
-/// POSIX call does there too.
+/// POSIX makes a rename or a create durable by syncing the directory, and fx
+/// pairs every durable write with this call. Windows offers no equivalent:
+/// `FlushFileBuffers` and the `NtFlushBuffersFile` it wraps both answer
+/// `STATUS_ACCESS_DENIED` for a directory handle, because a directory opened
+/// for backup semantics is not open for writing and the flush would have to
+/// update its timestamps. Measured on Windows 11 with `zig build probe-dir-sync`
+/// and again with a probe that called `FlushFileBuffers` on the handle
+/// `openDir` returns.
+///
+/// The file's own data is flushed by the caller before the rename, so what
+/// remains unflushed is the name entry in the directory. Refusing here would
+/// fail every durable write on the platform, which is worse than a name entry
+/// that the volume may still be holding when the power goes out.
 fn windowsFlushDirectory(handle: std.posix.fd_t) !void {
-    var status: windows_flush.IO_STATUS_BLOCK = undefined;
-    const rc = windows_flush.NtFlushBuffersFile(handle, &status);
-    if (rc >= 0) return;
-    return switch (rc) {
-        // STATUS_INVALID_DEVICE_REQUEST and STATUS_NOT_SUPPORTED: this volume
-        // cannot flush a directory, so there is nothing more fx can ask it.
-        @as(i32, @bitCast(@as(u32, 0xC0000010))), @as(i32, @bitCast(@as(u32, 0xC00000BB))) => {},
-        // STATUS_ACCESS_DENIED on a handle fx did not open for writing.
-        @as(i32, @bitCast(@as(u32, 0xC0000022))) => return error.AccessDenied,
-        @as(i32, @bitCast(@as(u32, 0xC000007F))) => return error.NoSpaceLeft,
-        else => return error.DirectorySyncFailed,
-    };
+    _ = handle;
 }
 
 fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !VerifiedDir {
@@ -2258,6 +2244,91 @@ pub fn isTty(fd: std.posix.fd_t) bool {
 /// every folder, so a test that writes a frame somewhere harmless names this
 /// instead of a path.
 pub const null_device = if (builtin.target.os.tag == .windows) "\\\\.\\NUL" else "/dev/null";
+
+/// Sets an entry's timestamps, which a caller uses to describe a file's age.
+///
+/// POSIX passes the request to the platform. Zig 0.17's Windows
+/// `dirSetTimestamps` panics with TODO implement, so the same request is
+/// carried out here with `SetFileTime`, which needs a handle rather than a
+/// path: the entry is opened for writing its attributes and the two times are
+/// written through it. A timestamp the caller did not ask about keeps the value
+/// it already has, which is what the POSIX call does.
+pub fn setTimestamps(
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    options: std.Io.Dir.SetTimestampsOptions,
+) !void {
+    if (comptime builtin.target.os.tag != .windows) {
+        return dir.setTimestamps(getIo(), sub_path, options);
+    }
+    if (comptime builtin.target.os.tag == .wasi) return error.OperationUnsupported;
+
+    const windows = windows_file_time;
+    const io = getIo();
+    const file = try dir.openFile(io, sub_path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    var access_time: windows.FILETIME = .{ .dwLowDateTime = 0, .dwHighDateTime = 0 };
+    var write_time: windows.FILETIME = .{ .dwLowDateTime = 0, .dwHighDateTime = 0 };
+
+    // A null pointer leaves that time alone, so only a time the caller asked
+    // about is filled in. `now` reads the real clock, which is what the POSIX
+    // call does for the same request.
+    const set_access: ?*windows.FILETIME = switch (options.access_timestamp) {
+        .unchanged => null,
+        .now => blk: {
+            access_time = windows.filetimeFromNanoseconds(nanoTimestamp());
+            break :blk &access_time;
+        },
+        .new => |value| blk: {
+            access_time = windows.filetimeFromNanoseconds(@as(i128, value.nanoseconds));
+            break :blk &access_time;
+        },
+    };
+    const set_modify: ?*windows.FILETIME = switch (options.modify_timestamp) {
+        .unchanged => null,
+        .now => blk: {
+            write_time = windows.filetimeFromNanoseconds(nanoTimestamp());
+            break :blk &write_time;
+        },
+        .new => |value| blk: {
+            write_time = windows.filetimeFromNanoseconds(@as(i128, value.nanoseconds));
+            break :blk &write_time;
+        },
+    };
+    if (windows.SetFileTime(file.handle, null, set_access, set_modify) == 0) {
+        return error.Unexpected;
+    }
+}
+
+/// The Win32 calls setting a file's time needs.
+const windows_file_time = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const FILETIME = extern struct {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    };
+
+    extern "kernel32" fn SetFileTime(
+        file: std.os.windows.HANDLE,
+        creation_time: ?*const FILETIME,
+        last_access_time: ?*const FILETIME,
+        last_write_time: ?*const FILETIME,
+    ) callconv(.winapi) i32;
+
+    /// The `FILETIME` for an instant, counted in 100ns units from 1601-01-01,
+    /// which is the epoch Win32 uses.
+    fn filetimeFromNanoseconds(nanoseconds: i128) FILETIME {
+        // 11644473600 seconds separate 1601-01-01 from 1970-01-01.
+        const epoch_offset_ns: i128 = 11_644_473_600 * std.time.ns_per_s;
+        const hundreds: i128 = @divFloor(nanoseconds + epoch_offset_ns, 100);
+        const value: u64 = @intCast(@max(hundreds, 0));
+        return .{
+            .dwLowDateTime = @truncate(value),
+            .dwHighDateTime = @truncate(value >> 32),
+        };
+    }
+};
+
 
 /// This process's standard input as a `std.Io.File`.
 pub fn stdinFile() std.Io.File {

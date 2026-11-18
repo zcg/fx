@@ -2638,6 +2638,41 @@ fn pruneSequencedCopies(
     if (deleted) try io_mod.syncVerifiedDir(dir);
 }
 
+/// The same path with the characters JSON requires escaped, so a fixture that
+/// names a workspace reads back as that workspace on every platform.
+///
+/// A Windows path carries backslashes, and a backslash opens an escape in JSON,
+/// so a fixture built by writing the path straight into a string literal would
+/// be invalid there (`\w` is not an escape). The caller owns the result.
+fn jsonEscapedPath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (path) |byte| switch (byte) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\r' => try out.appendSlice(alloc, "\\r"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => try out.append(alloc, byte),
+    };
+    return out.toOwnedSlice(alloc);
+}
+
+/// Removes a name that is a folder link, which is how these tests retarget an
+/// additional directory.
+///
+/// POSIX removes a symlink with `unlink`, and so does Windows for a file link.
+/// A folder link there is a junction, which the kernel reports as a directory,
+/// so the removal goes through the tree call that knows the difference.
+fn removeDirectoryLink(dir: std.Io.Dir, sub_path: []const u8) !void {
+    if (comptime !io_mod.modeIsEnforced) {
+        // A junction is removed as a directory, and the tree call does not
+        // follow it, so the target it names is left alone.
+        return dir.deleteTree(io_mod.getIo(), sub_path);
+    }
+    try dir.deleteFile(io_mod.getIo(), sub_path);
+}
+
 fn writeStoreFixture(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
@@ -3320,9 +3355,11 @@ test "user permission mutation preserves local rules" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
     const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"global *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
-        .{workspace},
+        .{escaped_workspace},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3360,9 +3397,11 @@ test "permission mutation validates scope paths and isolates remove and reset" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
     const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\",\"deny *\":\"deny\"}},\"read\":{{\"*\":\"allow\"}}}}}}}}}}\n",
-        .{workspace},
+        .{escaped_workspace},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3710,7 +3749,9 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
+    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{escaped_workspace});
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -3733,9 +3774,11 @@ test "unrelated user patch preserves inert output level values" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
     const fixture = try alloc.print(
         "{{\"output_level\":{{\"legacy\":true}},\"workspaces\":{{\"{s}\":{{\"output_level\":[\"quiet\",7],\"future\":true}}}}}}\n",
-        .{workspace},
+        .{escaped_workspace},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3840,6 +3883,10 @@ test "symlinked durable home is rejected before reading settings" {
 }
 
 test "read only settings rejects group or world writable policy files" {
+    // The test widens a folder's mode and expects the store to refuse it.
+    // Windows files carry an inherited ACL instead of a mode, so there is
+    // nothing to widen and the refusal it checks is POSIX policy.
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3878,6 +3925,10 @@ test "read only settings rejects group or world writable policy files" {
 }
 
 test "tightening read-only open removes group and other write access and records it" {
+    // The test widens a folder's mode and expects the store to refuse it.
+    // Windows files carry an inherited ACL instead of a mode, so there is
+    // nothing to widen and the refusal it checks is POSIX policy.
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4242,9 +4293,15 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(shared_dot);
     const shared_link = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../shared-link" });
     defer alloc.free(shared_link);
+    const escaped_0 = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_0);
+    const escaped_1 = try jsonEscapedPath(alloc, shared_dot);
+    defer alloc.free(escaped_1);
+    const escaped_2 = try jsonEscapedPath(alloc, shared_link);
+    defer alloc.free(escaped_2);
     const available_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, shared_dot, shared_link },
+        .{ escaped_0, escaped_1, escaped_2 },
     );
     defer alloc.free(available_fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", available_fixture);
@@ -4287,9 +4344,15 @@ test "workspace directory mutations use workspace access path identity" {
         .{ missing, std.Io.Dir.path.sep, std.Io.Dir.path.sep },
     );
     defer alloc.free(missing_parent);
+    const unavailable_fixture_p0 = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(unavailable_fixture_p0);
+    const unavailable_fixture_p1 = try jsonEscapedPath(alloc, missing_dot);
+    defer alloc.free(unavailable_fixture_p1);
+    const unavailable_fixture_p2 = try jsonEscapedPath(alloc, missing_parent);
+    defer alloc.free(unavailable_fixture_p2);
     const unavailable_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, missing_dot, missing_parent },
+        .{ unavailable_fixture_p0, unavailable_fixture_p1, unavailable_fixture_p2 },
     );
     defer alloc.free(unavailable_fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", unavailable_fixture);
@@ -4338,13 +4401,19 @@ test "workspace directory removal uses observed sources and preserves unseen con
         .identity = first,
     }};
 
-    try tmp.dir.deleteFile(std.testing.io, "observed-link");
+    try removeDirectoryLink(tmp.dir, "observed-link");
     try tmp.dir.symLink(std.testing.io, "second", "observed-link", .{ .is_directory = true });
     try tmp.dir.symLink(std.testing.io, "first", "unseen-link", .{ .is_directory = true });
 
+    const escaped_primary = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_primary);
+    const escaped_observed_source = try jsonEscapedPath(alloc, observed_source);
+    defer alloc.free(escaped_observed_source);
+    const escaped_unseen_source = try jsonEscapedPath(alloc, unseen_source);
+    defer alloc.free(escaped_unseen_source);
     const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, observed_source, unseen_source },
+        .{ escaped_primary, escaped_observed_source, escaped_unseen_source },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -4402,14 +4471,20 @@ test "workspace directory removal stabilizes observed survivor identity" {
         .{ .source = removed_source, .identity = removed },
         .{ .source = survivor_source, .identity = survivor },
     };
+    const escaped_primary = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_primary);
+    const escaped_removed_source = try jsonEscapedPath(alloc, removed_source);
+    defer alloc.free(escaped_removed_source);
+    const escaped_survivor_source = try jsonEscapedPath(alloc, survivor_source);
+    defer alloc.free(escaped_survivor_source);
     const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, removed_source, survivor_source },
+        .{ escaped_primary, escaped_removed_source, escaped_survivor_source },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
 
-    try tmp.dir.deleteFile(std.testing.io, "survivor-link");
+    try removeDirectoryLink(tmp.dir, "survivor-link");
     try tmp.dir.symLink(std.testing.io, "retarget", "survivor-link", .{ .is_directory = true });
 
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -4613,14 +4688,18 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
         .source = source,
         .identity = first,
     }};
+    const escaped_primary = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_primary);
+    const escaped_source = try jsonEscapedPath(alloc, source);
+    defer alloc.free(escaped_source);
     const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
-        .{ primary, source },
+        .{ escaped_primary, escaped_source },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
 
-    try tmp.dir.deleteFile(std.testing.io, "saved-link");
+    try removeDirectoryLink(tmp.dir, "saved-link");
     try tmp.dir.symLink(std.testing.io, "second", "saved-link", .{ .is_directory = true });
 
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -4692,7 +4771,7 @@ test "workspace directory capacity compaction uses observed source identities" {
     try fixture.writer.writeAll("]}}}\n");
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());
 
-    try tmp.dir.deleteFile(std.testing.io, "stable-link-15");
+    try removeDirectoryLink(tmp.dir, "stable-link-15");
     try tmp.dir.symLink(std.testing.io, "retarget", "stable-link-15", .{ .is_directory = true });
 
     var store = try Store.initFromHome(alloc, home, .writable);
