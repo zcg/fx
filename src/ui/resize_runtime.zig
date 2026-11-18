@@ -239,7 +239,35 @@ pub fn collectResizeFacts(
             // Position replies are indistinguishable from pasted bytes, so
             // leave live geometry pending until bracketed paste releases input
             // ownership and the shared parser can begin.
-            if (!cursor_probe_allowed or !probe.canBegin()) return;
+            //
+            // That wait cannot be unbounded. A pending resize keeps
+            // `resize_dirty` set, and `resize_dirty` refuses every frame
+            // commit, so a paste that never releases, or a probe that never
+            // starts because the terminal will not answer, would freeze the
+            // screen for good: no redraw, no input echo. Once the debounce
+            // window has passed twice over, the geometry is taken as it
+            // stands, which is what the frame would have shown anyway.
+            if (!cursor_probe_allowed or !probe.canBegin()) {
+                if (now >= shell.render_requests.resize_apply_after_ms) {
+                    debug_trace.logf("resize", "probe_wait_expired paste_allowed={s} probe_can_begin={s} apply_after_ms={d}", .{
+                        if (cursor_probe_allowed) "true" else "false",
+                        if (probe.canBegin()) "true" else "false",
+                        shell.render_requests.resize_apply_after_ms,
+                    });
+                    try settlePendingResize(
+                        terminal,
+                        shell,
+                        metrics,
+                        probe,
+                        footer_rows,
+                        debounce_ms,
+                        cursor_probe_allowed,
+                        now,
+                    );
+                    return;
+                }
+                return;
+            }
             try observeDirtyResize(
                 terminal,
                 shell,
@@ -290,7 +318,18 @@ pub fn admitResizeSignal(
     debounce_ms: i64,
     source: []const u8,
 ) bool {
-    if (!supports_resize_signal or !resize_interlock.takeResizePending()) return false;
+    // The bit is taken on every platform. A target with no window-change signal
+    // never sets it from a handler, but a pass that compared the terminal's size
+    // can set it the same way, and leaving a set bit behind would make
+    // `resizeLifecyclePending` true for good, which blocks every frame commit.
+    const pending = resize_interlock.takeResizePending();
+    if (!pending) return false;
+    if (!supports_resize_signal) {
+        // Nothing else on such a target: the size was already compared by the
+        // caller, and the frame it asks for is the whole of the reaction.
+        shell.render_requests.observeResizeSignal(now_ms, debounce_ms);
+        return true;
+    }
     shell.render_requests.observeResizeSignal(now_ms, debounce_ms);
     debug_trace.logf(
         "frame_schedule",

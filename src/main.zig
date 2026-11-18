@@ -188,6 +188,7 @@ const paste_framing = @import("core/input/paste_framing.zig");
 const registered_entities = @import("core/input/registered_entities.zig");
 const ui_render = @import("ui/render.zig");
 const shell_runtime = @import("ui/shell_runtime.zig");
+const resize_runtime = @import("ui/resize_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
@@ -3425,15 +3426,27 @@ const App = struct {
     fn pollTerminalSize(self: *App) void {
         const current = self.terminal.queryLayout(footer_rows) catch return;
         if (current.rows == self.shell.layout.rows and current.cols == self.shell.layout.cols) return;
-        self.shell.render_requests.observeResizeSignal(
+        // The same admission a window-change handler goes through, so the
+        // interlock and the render requests stay in one shape on both kinds of
+        // target. A resize the terminal reported while a frame was in flight
+        // then waits for the frame instead of being applied underneath it.
+        resize_interlock.noteResizeSignal();
+        _ = resize_runtime.admitResizeSignal(
+            &self.shell,
+            &resize_interlock,
             app_permission_runtime.monotonicMillis(),
             resize_debounce_ms,
+            "poll",
         );
     }
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
+        debug_trace.logf("resize", "loop_pass_begin", .{});
+        if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) {
+            debug_trace.logf("resize", "loop_pass_refused admission", .{});
+            return;
+        }
 
         // Targets with no SIGWINCH report a resize only when asked, so every
         // pass compares the terminal's size against the one on record. This is
@@ -3524,6 +3537,11 @@ const App = struct {
                 !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
             ) catch |err| {
                 if (err != error.TerminalTooSmall and err != error.UnableToReadTerminalSize) {
+                    // A resize that fails for any other reason ends the loop,
+                    // which is a frozen screen with the process still alive.
+                    // The error is logged before it goes up so the reason is
+                    // visible in a trace rather than only as a hang.
+                    debug_trace.logf("resize", "collect_failed err={s}", .{@errorName(err)});
                     return err;
                 }
             };

@@ -9,6 +9,8 @@ bun.lock
 .zig-cache/
 zig-cache/
 zig-out/
+.zig-out-verify/
+.zig-out-fresh/
 zig-pkg/
 sdk/dist/
 

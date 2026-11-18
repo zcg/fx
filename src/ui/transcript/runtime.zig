@@ -5608,6 +5608,13 @@ pub const TranscriptRuntime = struct {
         if (pending.terminal_cols != self.layout.cols or pending.terminal_rows != self.layout.rows or
             shadow.cols != self.layout.cols or shadow.rows != self.layout.rows)
         {
+            // The sizes recorded with the handoff are the ones it was planned
+            // against, so a resize makes it unusable. It has to be dropped
+            // here: a pending handoff is what `sessionScrollbackHandoffPending`
+            // reports, and a frame is refused for as long as one is set. Left
+            // behind, a resize would freeze the screen for the rest of the
+            // session, keys included.
+            self.cancelSessionScrollbackHandoff("geometry_changed");
             return error.SessionScrollbackHandoffGeometryChanged;
         }
         if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
@@ -5615,6 +5622,15 @@ pub const TranscriptRuntime = struct {
             self.fullTranscriptActive() or self.owned_top_row == 0 or
             (pending.remaining_rows > 0 and pending.remaining_rows < self.owned_top_row))
         {
+            // The rows it planned to push no longer exist above the owned top,
+            // so this handoff can never finish. Waiting for the transient
+            // causes is fine, but a handoff that cannot reach its own rows has
+            // to go, or every frame after it is refused.
+            if (self.owned_top_row != 0 and pending.remaining_rows > 0 and
+                pending.remaining_rows < self.owned_top_row)
+            {
+                self.cancelSessionScrollbackHandoff("rows_out_of_reach");
+            }
             return error.SessionScrollbackHandoffUnavailable;
         }
         const terminal_rows = self.layout.rows;

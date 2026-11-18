@@ -965,13 +965,57 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
-                if (app.shell.sessionScrollbackHandoffPending()) return;
+                if (app.shell.sessionScrollbackHandoffPending()) {
+                    // A handoff is planned against one geometry and one set of
+                    // rows. Either can move under it, and a handoff that can no
+                    // longer finish must not keep every frame refused for the
+                    // rest of the session, so one whose recorded size no longer
+                    // matches the layout is dropped here.
+                    if (comptime @hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff")) {
+                        if (app.shell.pending_session_scrollback_handoff) |handoff| {
+                            if (handoff.terminal_cols != app.shell.layout.cols or
+                                handoff.terminal_rows != app.shell.layout.rows)
+                            {
+                                app.shell.cancelSessionScrollbackHandoff("layout_changed_before_frame");
+                            } else {
+                                debug_trace.logf("frame_schedule", "flush_refused scrollback_handoff remaining={d}", .{handoff.remaining_rows});
+                                return;
+                            }
+                        }
+                    } else return;
+                }
             }
-            if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) return;
+            if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) {
+                // Why a frame never came: the gate that refuses one.
+                debug_trace.logf("frame_schedule", "flush_refused dimensions_invalid={} rows={d} cols={d}", .{
+                    app.shell.terminal_dimensions_invalid,
+                    app.shell.layout.rows,
+                    app.shell.layout.cols,
+                });
+                return;
+            }
             const has_resize_lifecycle =
                 @hasField(@TypeOf(app.shell), "pending_resize_observation");
             if (comptime has_resize_lifecycle) {
-                if (shell_runtime.resizeBlocksFrameCommit(&app.shell)) return;
+                if (shell_runtime.resizeBlocksFrameCommit(&app.shell)) {
+                    // A resize blocks the next frame until it is applied, and
+                    // the pass that applies it can be waiting on a probe the
+                    // terminal will not answer. Past its own deadline the
+                    // geometry is taken as it stands, so the block cannot
+                    // outlive the debounce window and freeze the screen.
+                    if (app.shell.render_requests.shouldApplyDeferredResize(app_permission_runtime.monotonicMillis())) {
+                        debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d}", .{
+                            app.shell.render_requests.resize_apply_after_ms,
+                        });
+                        app.shell.render_requests.completeResizeGeometry(false);
+                        app.shell.pending_resize_observation = null;
+                    } else {
+                        debug_trace.logf("frame_schedule", "flush_refused resize_lifecycle pending_after_ms={d}", .{
+                            app.shell.render_requests.resize_apply_after_ms,
+                        });
+                        return;
+                    }
+                }
             }
             const render_requests = activeRenderRequests(app);
             var attempt = (try render_requests.beginAttempt()) orelse return;
