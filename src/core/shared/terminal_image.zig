@@ -41,27 +41,47 @@ pub const Protocol = enum {
 /// ELYTerminal does: it reports `TERM=xterm-256color` and marks itself with its
 /// own `ELY_*` variables instead. `probeKitty` asks the terminal directly and
 /// is what settles the question when a TTY is available.
-pub fn detect(getenv: anytype) Protocol {
+/// Whether a value answers `get(name)`, directly or through a pointer to the
+/// struct that declares it.
+fn hasGet(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| hasGet(pointer.child),
+        else => std.meta.hasFn(T, "get"),
+    };
+}
+
+/// Reads one variable through whatever `detect` was handed.
+///
+/// A caller passes either a bare `getenv(name)` function, which production does,
+/// or a value that carries the variables and answers through `get`, which is
+/// what a test uses to describe one terminal exactly. Zig has no bound-method
+/// value to hold either one, so the choice is made here on every read.
+fn readEnv(environment: anytype, name: []const u8) ?[]const u8 {
+    if (comptime hasGet(@TypeOf(environment))) return environment.get(name);
+    return environment(name);
+}
+
+pub fn detect(environment: anytype) Protocol {
     // Kitty sets KITTY_WINDOW_ID in every kitty window, including ones started
     // over ssh, so it is the most direct signal there is.
-    if (getenv("KITTY_WINDOW_ID")) |value| {
+    if (readEnv(environment, "KITTY_WINDOW_ID")) |value| {
         if (value.len != 0) return .kitty;
     }
     // A terminal that reports itself through TERM, which is what a kitty
     // derivative or a kitty-compatible multiplexer does.
-    if (getenv("TERM")) |term| {
+    if (readEnv(environment, "TERM")) |term| {
         if (mentions(term, "kitty") or mentions(term, "ghostty")) return .kitty;
     }
     // ELYTerminal draws Kitty graphics while calling itself an xterm, so its
     // own variables are the only signal it gives. `ELY_CMD_PROMPT` is set in
     // every one of its shells.
-    if (getenv("ELY_CMD_PROMPT") != null) return .kitty;
-    if (getenv("ELY_TERMINAL") != null) return .kitty;
+    if (readEnv(environment, "ELY_CMD_PROMPT") != null) return .kitty;
+    if (readEnv(environment, "ELY_TERMINAL") != null) return .kitty;
     // Windows Terminal speaks Sixel rather than Kitty, and marks itself with
     // `WT_SESSION` in every tab.
-    if (getenv("WT_SESSION") != null) return .sixel;
+    if (readEnv(environment, "WT_SESSION") != null) return .sixel;
     // WezTerm and mintty both answer to iTerm2's protocol.
-    if (getenv("TERM_PROGRAM")) |program| {
+    if (readEnv(environment, "TERM_PROGRAM")) |program| {
         if (std.ascii.eqlIgnoreCase(program, "iTerm.app") or
             std.ascii.eqlIgnoreCase(program, "WezTerm") or
             std.ascii.eqlIgnoreCase(program, "mintty"))
@@ -69,10 +89,10 @@ pub fn detect(getenv: anytype) Protocol {
             return .iterm2;
         }
     }
-    if (getenv("WEZTERM_EXECUTABLE")) |value| {
+    if (readEnv(environment, "WEZTERM_EXECUTABLE")) |value| {
         if (value.len != 0) return .iterm2;
     }
-    if (getenv("TERM")) |term| {
+    if (readEnv(environment, "TERM")) |term| {
         if (mentionsSixel(term)) return .sixel;
     }
     return .none;
@@ -165,46 +185,58 @@ fn envLookup(name: []const u8) ?[]const u8 {
     return io_mod.getenv(name);
 }
 
+/// The environment variables the terminal protocol detection reads, filled in
+/// per test case so each one reads as the terminal it describes.
+const Env = struct {
+    kitty_window: ?[]const u8 = null,
+    term: ?[]const u8 = null,
+    term_program: ?[]const u8 = null,
+    wezterm: ?[]const u8 = null,
+    ely_cmd_prompt: ?[]const u8 = null,
+    ely_terminal: ?[]const u8 = null,
+    wt_session: ?[]const u8 = null,
+
+    /// Answers one variable by name, which is the shape `detect` reads.
+    pub fn get(self: *const Env, name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "KITTY_WINDOW_ID")) return self.kitty_window;
+        if (std.mem.eql(u8, name, "TERM")) return self.term;
+        if (std.mem.eql(u8, name, "TERM_PROGRAM")) return self.term_program;
+        if (std.mem.eql(u8, name, "WEZTERM_EXECUTABLE")) return self.wezterm;
+        if (std.mem.eql(u8, name, "ELY_CMD_PROMPT")) return self.ely_cmd_prompt;
+        if (std.mem.eql(u8, name, "ELY_TERMINAL")) return self.ely_terminal;
+        if (std.mem.eql(u8, name, "WT_SESSION")) return self.wt_session;
+        return null;
+    }
+};
+
 test "kitty wins when the window id or the terminal name says so" {
-    const Env = struct {
-        kitty_window: ?[]const u8 = null,
-        term: ?[]const u8 = null,
-        term_program: ?[]const u8 = null,
-        wezterm: ?[]const u8 = null,
-
-        fn get(self: *const @This(), _: *const @This(), name: []const u8) ?[]const u8 {
-            if (std.mem.eql(u8, name, "KITTY_WINDOW_ID")) return self.kitty_window;
-            if (std.mem.eql(u8, name, "TERM")) return self.term;
-            if (std.mem.eql(u8, name, "TERM_PROGRAM")) return self.term_program;
-            if (std.mem.eql(u8, name, "WEZTERM_EXECUTABLE")) return self.wezterm;
-            return null;
-        }
-    };
-
-    var env = Env{ .kitty_window = "1" };
-    try std.testing.expectEqual(Protocol.kitty, detect(Env.get, &env));
+    // `detect` takes a bare `get(name)` callable. This fixture keeps the
+    // variables in one place and answers from whichever test case filled it in,
+    // so each case reads as the environment it describes.
+    var env: Env = .{ .kitty_window = "1" };
+    try std.testing.expectEqual(Protocol.kitty, detect(env));
 
     env = .{ .term = "xterm-kitty" };
-    try std.testing.expectEqual(Protocol.kitty, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.kitty, detect(env));
 
     env = .{ .term = "xterm-ghostty" };
-    try std.testing.expectEqual(Protocol.kitty, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.kitty, detect(env));
 
     env = .{ .term_program = "iTerm.app" };
-    try std.testing.expectEqual(Protocol.iterm2, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.iterm2, detect(env));
 
     env = .{ .term_program = "WezTerm" };
-    try std.testing.expectEqual(Protocol.iterm2, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.iterm2, detect(env));
 
     env = .{ .wezterm = "/usr/bin/wezterm" };
-    try std.testing.expectEqual(Protocol.iterm2, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.iterm2, detect(env));
 
     env = .{ .term = "xterm-sixel" };
-    try std.testing.expectEqual(Protocol.sixel, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.sixel, detect(env));
 
     env = .{ .term = "xterm-256color" };
-    try std.testing.expectEqual(Protocol.none, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.none, detect(env));
 
     env = .{};
-    try std.testing.expectEqual(Protocol.none, detect(Env.get, &env));
+    try std.testing.expectEqual(Protocol.none, detect(env));
 }

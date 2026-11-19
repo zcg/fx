@@ -13,6 +13,7 @@ const PgsoArtifact = enum {
     file_index,
     ui_activity,
     approval_review,
+    unit_tests,
 };
 
 const NapiSurface = enum {
@@ -48,6 +49,14 @@ pub fn build(b: *std.Build) void {
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
+    // Builds and runs the unit suites on Windows, where they are left out by
+    // default because most of them model POSIX behavior. A run there reports
+    // what passes on Windows and skips the rest.
+    const windows_tests = b.option(bool, "windows-tests", "Build and run the unit suites on Windows too") orelse false;
+    // A substring a test's name must contain, so one suite can be run on its
+    // own. Zig applies it while building the test binary, which keeps a run to
+    // the tests a change touched.
+    const test_filter = b.option([]const u8, "test-filter", "Run only the tests whose name contains this text");
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
@@ -118,9 +127,14 @@ pub fn build(b: *std.Build) void {
     // an inode, a kill is a signal, `fsync` works on a directory, and a process
     // group can be addressed. None of that exists on Windows, so the suites are
     // not built there rather than being made to pass on semantics they do not
-    // have. Windows coverage is added as its own tests, written against the
-    // Windows behavior.
-    const posix_suites = target.result.os.tag != .windows;
+    // have.
+    //
+    // `-Dwindows-tests` builds and runs them on Windows anyway. The Windows
+    // branches this branch adds are covered by the same tests that cover the
+    // POSIX ones, and a test that models a POSIX-only facility already returns
+    // `error.SkipZigTest` there, so the run reports what passes and skips the
+    // rest.
+    const posix_suites = target.result.os.tag != .windows or windows_tests;
 
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
@@ -130,6 +144,16 @@ pub fn build(b: *std.Build) void {
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);
+    // The unit tests for the Linux PGSO step that relinks them from
+    // transformed code. It builds them position independent: a test there
+    // defines the wasm host's `extern "fx"` functions itself, and Zig rejects
+    // a library extern in a static executable that is not. `install-test`
+    // does not install fx, so the build links only the tests. Run it from the
+    // repository root after `zig build` with the same prefix.
+    const pgso_tests = b.addTest(.{ .root_module = exe.root_module });
+    pgso_tests.pie = true;
+    const install_pgso_tests = b.addInstallArtifact(pgso_tests, .{ .dest_sub_path = "fx-test" });
+    b.step("install-test", "Install the unit test executable without running it").dependOn(&install_pgso_tests.step);
 
     const test_step = b.step("test", "Run tests");
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
@@ -140,7 +164,18 @@ pub fn build(b: *std.Build) void {
     if (posix_suites) {
         const exe_tests = b.addTest(.{
             .root_module = exe.root_module,
+            .filters = if (test_filter) |filter| &.{filter} else &.{},
         });
+        // Some of fx's modules declare the JavaScript host's `extern "fx"`
+        // functions, which name a library `fx`. An executable leaves them
+        // unresolved, but Zig's Windows test link resolves every library
+        // reference and asks for `fx.lib`, which nothing writes. Building the
+        // tests position independent is the switch `install-test` already sets
+        // for this same reason, and it lets the names stay unresolved.
+        if (target.result.os.tag == .windows) {
+            exe_tests.pie = true;
+            exe_tests.name = "fx-dev";
+        }
         const run_exe_tests = b.addRunArtifact(exe_tests);
         run_exe_tests.step.dependOn(b.getInstallStep());
         // Tests launch the installed fx binary, and the session boundary test
@@ -472,18 +507,25 @@ pub fn build(b: *std.Build) void {
             .file_index => file_index_bench,
             .ui_activity => ui_activity_bench,
             .approval_review => approval_review_bench,
+            .unit_tests => pgso_tests,
         };
         const output_name = switch (artifact) {
             .fx => "pgso/fx.bc",
             .file_index => "pgso/file-index.bc",
             .ui_activity => "pgso/ui-activity.bc",
             .approval_review => "pgso/approval-review.bc",
+            .unit_tests => "pgso/unit-tests.bc",
         };
+        // Zig 0.17.1 writes this bitcode after LLVM's passes. PGSO needs the
+        // module before them, so scripts/pgso/pipeline.py runs this compile
+        // again with --verbose-llvm-bc (`emit_bitcode`).
         const install_ir = b.addInstallFile(
             selected.getEmittedLlvmBc(),
             output_name,
         );
         pgso_ir_step.dependOn(&install_ir.step);
+        // The tests launch the fx installed under this build's prefix.
+        if (artifact == .unit_tests) pgso_ir_step.dependOn(b.getInstallStep());
     } else {
         const missing_artifact = b.addFail(
             "pgso-ir requires -Dpgso-artifact",

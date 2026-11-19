@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
 const session_log = @import("session_log.zig");
@@ -233,7 +234,7 @@ test "session files open without waiting on a FIFO" {
     defer alloc.free(root);
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.mem.printSentinel(&path_buf, "{s}/events.jsonl", .{root}, 0);
-    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    if (posix_symbols.mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
     defer dir.close();
     // A blocking open of a FIFO waits for a writer that never comes.
@@ -243,7 +244,6 @@ test "session files open without waiting on a FIFO" {
     try std.testing.expectEqual(@as(?[]u8, null), try readOptionalSessionFile(alloc, &dir, "missing.json", 16));
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// Reports whether `name` exists directly under the session dir, mapping
 /// unsafe link/dir shapes to `error.SessionPathUnsafe`.
@@ -275,7 +275,7 @@ pub fn eventLogSize(
         error.SymLinkLoop, error.NotDir => return error.SessionPathUnsafe,
         else => return err,
     };
-    if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.SessionPathUnsafe;
     return stat.size;
 }
 

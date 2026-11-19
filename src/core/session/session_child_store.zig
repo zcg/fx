@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const artifact_digest = @import("artifact_digest.zig");
@@ -900,6 +901,7 @@ pub const SessionChildCapability = struct {
             io_mod.setPermissions(route, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
+        try verifyPrivateDirectory(route);
         return initOpenedLegacyRoute(alloc, route, route_path, kind, mode);
     }
 
@@ -919,11 +921,17 @@ pub const SessionChildCapability = struct {
             else => return err,
         };
         errdefer route.close(io_mod.getIo());
+        // An old release left v1's folders readable by others (D61 in
+        // `tests/tla/session_manager/system-design.md`); one others can
+        // write is still refused.
+        try verifyOwnerWritableDirectory(route);
         const display = try std.Io.Dir.path.join(alloc, &.{ display_session_path, "subagent" });
         defer alloc.free(display);
         return try initOpenedLegacyRoute(alloc, route, display, .subagent_control, .read_only);
     }
 
+    /// `route` must already be checked: private, or for a read-only route
+    /// an older release made, writable by its owner only.
     fn initOpenedLegacyRoute(
         alloc: Allocator,
         route: std.Io.Dir,
@@ -931,8 +939,6 @@ pub const SessionChildCapability = struct {
         kind: ManagedChildKind,
         mode: Mode,
     ) !SessionChildCapability {
-        try verifyPrivateDirectory(route);
-
         var retained = try route.openDir(io_mod.getIo(), ".", .{
             .iterate = true,
             .follow_symlinks = false,
@@ -997,6 +1003,36 @@ pub const SessionChildCapability = struct {
         });
         errdefer retained.close(io_mod.getIo());
         try verifyPrivateDirectory(retained);
+        return initRetained(alloc, retained, display_session_path, mode, options);
+    }
+
+    /// `init` read-only on a v1 session folder, which an old release may
+    /// have left readable by others (D61 in
+    /// `tests/tla/session_manager/system-design.md`); one others can write
+    /// is still refused.
+    pub fn initOlderReadOnly(
+        alloc: Allocator,
+        session_dir: std.Io.Dir,
+        display_session_path: []const u8,
+    ) !SessionChildCapability {
+        var retained = try session_dir.openDir(io_mod.getIo(), ".", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        errdefer retained.close(io_mod.getIo());
+        try verifyOwnerWritableDirectory(retained);
+        return initRetained(alloc, retained, display_session_path, .read_only, .{});
+    }
+
+    /// The capability over `retained`, the checked session folder, which
+    /// it takes; the caller closes it on an error.
+    fn initRetained(
+        alloc: Allocator,
+        retained: std.Io.Dir,
+        display_session_path: []const u8,
+        mode: Mode,
+        options: Options,
+    ) !SessionChildCapability {
         const display = try alloc.dupe(u8, display_session_path);
         errdefer alloc.free(display);
         const impl = try alloc.create(CapabilityImpl);
@@ -1029,7 +1065,6 @@ pub const SessionChildCapability = struct {
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
             else => error.SessionChildStoreFailed,
         };
         capability.impl.allowed_kind = .terminal_state;
@@ -1054,7 +1089,6 @@ pub const SessionChildCapability = struct {
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
             else => error.SessionChildStoreFailed,
         };
         capability.impl.allowed_kind = .terminal_proofs;
@@ -1316,7 +1350,10 @@ pub const SessionChildCapability = struct {
         const route_dir = (self.impl.route(kind, true) catch |err| return switch (err) {
             error.SessionChildReadOnly => error.SessionChildReadOnly,
             error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+            error.PrivateStatePermissionsUnsupported => if (comptime io_mod.modeIsEnforced)
+                error.PrivateStatePermissionsUnsupported
+            else
+                error.SessionChildStoreFailed,
             else => error.SessionChildStoreFailed,
         }).?;
         return io_mod.acquireTimedAdvisoryLockWithOps(
@@ -1329,7 +1366,12 @@ pub const SessionChildCapability = struct {
             error.LockBusy => error.LockBusy,
             error.LockUnsupported => error.LockUnsupported,
             error.DurablePathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
+            // The lock's own mode check needs mode bits, so only a platform that
+            // enforces them can answer with this.
+            error.PrivateStatePermissionsUnsupported => if (comptime io_mod.modeIsEnforced)
+                error.PrivateStatePermissionsUnsupported
+            else
+                error.SessionChildStoreFailed,
             else => error.SessionChildStoreFailed,
         };
     }
@@ -1469,6 +1511,13 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     }
 }
 
+/// A directory only its owner can write, though others may read it.
+pub fn verifyOwnerWritableDirectory(dir: std.Io.Dir) !void {
+    const stat = try dir.stat(io_mod.getIo());
+    if (stat.kind != .directory) return error.SessionPathUnsafe;
+    if (io_mod.othersCanWrite(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
+}
+
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     try verifyPrivateStat(try file.stat(io_mod.getIo()));
 }
@@ -1485,7 +1534,7 @@ fn verifyPrivateOpenedStat(
 }
 
 fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
-    if (stat.kind != .file or stat.nlink != 1) {
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) {
         return error.SessionPathUnsafe;
     }
     if (io_mod.modeMismatch(stat.permissions, 0o600)) {
@@ -1620,6 +1669,8 @@ test "private read-only file remains valid after atomic replacement unlinks it" 
 }
 
 test "managed child capability rejects invalid names and unsafe routes" {
+    // The route is made unsafe by hard-linking a file, which needs `linkat`.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

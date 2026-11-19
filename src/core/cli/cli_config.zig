@@ -126,6 +126,7 @@ pub fn parseArgs(
 const Writable = enum {
     auto_compact_percent,
     auto_upgrade,
+    cache_warming,
     collapse_tool_calls,
     context,
     effort,
@@ -133,6 +134,7 @@ const Writable = enum {
     max_agent_steps,
     max_tool_result_bytes,
     subagent_max_children,
+    subagent_max_depth,
     @"prompt_history.enabled",
     provider_strict,
     session_titles,
@@ -168,6 +170,14 @@ pub const WriteProblem = union(enum) {
 /// fails for a key `fx config` doesn't change or a value the key can't take.
 pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSetting, InvalidConfigValue }!Change {
     const key = options.key.?;
+    if (config_runtime.tool_placement.toolOfKey(key)) |tool| {
+        if (options.action == .unset) return .{ .patch = .{ .remove = key }, .value = null };
+        const placement = config_runtime.tool_placement.Placement.parse(options.value.?) orelse return invalid(problem, "toolbox or direct");
+        return .{
+            .patch = .{ .tool_placement = .{ .tool = @tagName(tool), .placement = @tagName(placement) } },
+            .value = .{ .string = @tagName(placement) },
+        };
+    }
     const writable = std.meta.stringToEnum(Writable, key) orelse {
         problem.* = .{ .refused = ownerHint(key) };
         return error.RefusedConfigSetting;
@@ -210,6 +220,15 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
             patch.subagent_max_children = children;
             return .{ .patch = patch, .value = .{ .integer = children } };
         },
+        .subagent_max_depth => {
+            const depth = std.fmt.parseUnsigned(u32, raw, 10) catch
+                return invalid(problem, "a whole number of levels, 0 to 2; 0 turns subagents off, and 1 keeps a subagent from starting its own");
+            if (depth < agent_steps.min_subagent_max_depth or depth > agent_steps.max_subagent_max_depth) {
+                return invalid(problem, "a whole number of levels, 0 to 2; 0 turns subagents off, and 1 keeps a subagent from starting its own");
+            }
+            patch.subagent_max_depth = depth;
+            return .{ .patch = patch, .value = .{ .integer = depth } };
+        },
         .max_tool_result_bytes => {
             const bytes = std.fmt.parseUnsigned(u32, raw, 10) catch 0;
             if (bytes < tool_result_limits.min_configured_tool_result_bytes) {
@@ -230,6 +249,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
     const enabled = parseSwitch(raw) orelse return invalid(problem, "true or false");
     switch (writable) {
         .auto_upgrade => patch.auto_upgrade = enabled,
+        .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
         .fast_mode => patch.fast_mode = enabled,
@@ -245,7 +265,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .@"status_line.session" => patch.statusline_item = .{ .item = .session, .enabled = enabled },
         .@"status_line.workspace" => patch.statusline_item = .{ .item = .workspace, .enabled = enabled },
         .ultrafast_mode => patch.ultrafast_mode = enabled,
-        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent, .subagent_max_children => unreachable,
+        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent, .subagent_max_children, .subagent_max_depth => unreachable,
     }
     return .{ .patch = patch, .value = .{ .bool = enabled } };
 }
@@ -270,7 +290,7 @@ fn wordsProblem(problem: *?[]const u8, text: []const u8) error{InvalidConfigArgs
 
 /// Whether `fx config set` and `unset` change `key`.
 pub fn settable(key: []const u8) bool {
-    return std.meta.stringToEnum(Writable, key) != null;
+    return std.meta.stringToEnum(Writable, key) != null or config_runtime.tool_placement.toolOfKey(key) != null;
 }
 
 /// What to use instead of `fx config` for a setting it doesn't change.
@@ -292,6 +312,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
+        .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
     };
     for (hints) |entry| {
         for (entry.keys) |name| {
@@ -459,7 +480,8 @@ pub const resolved_keys = [_][]const u8{
     "slash_menu_categories", "sound.attention_required", "sound.max",
     "sound.turn_end",        "startup_scrollback",       "status_line.context",
     "status_line.session",   "status_line.workspace",    "subagent_max_children",
-    "theme",                 "ultrafast_mode",           "update_channel",
+    "subagent_max_depth",    "theme",                    "ultrafast_mode",
+    "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -470,7 +492,7 @@ const files_only_keys = [_][]const u8{
     "enableAllProjectMcpServers", "enabledMcpjsonServers",  "fast_mode_model_bound",
     "grok_model",                 "model",                  "models",
     "permission",                 "providers",              "skill_symlink_authorities",
-    "workspaces",                 "yolo_acknowledged",
+    "tool_placement",             "workspaces",             "yolo_acknowledged",
 };
 
 /// The value a run uses for `key`, read from a state that
@@ -493,6 +515,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);
     if (eql(u8, key, "max_tool_result_bytes")) return integer(arena, state.max_tool_result_bytes);
     if (eql(u8, key, "subagent_max_children")) return integer(arena, state.subagent_max_children);
+    if (eql(u8, key, "subagent_max_depth")) return integer(arena, state.subagent_max_depth);
     if (eql(u8, key, "permission_mode")) return string(state.permission_mode.label());
     if (eql(u8, key, "prompt_history.enabled")) return boolean(state.prompt_history_enabled);
     if (eql(u8, key, "provider")) return string(try arena.dupe(u8, provider.label()));
@@ -521,6 +544,9 @@ pub fn effectiveValue(
     }
     if (eql(u8, key, "ultrafast_mode")) return boolean(state.ultrafast_mode);
     if (eql(u8, key, "update_channel")) return string(state.update_channel.label());
+    if (config_runtime.tool_placement.toolOfKey(key)) |tool| {
+        return string(@tagName(config_runtime.tool_placement.placementOf(state.tool_placement, tool)));
+    }
     return .unresolved;
 }
 
@@ -560,7 +586,7 @@ pub fn effectiveEntries(
             .value => |value| try out.append(arena, labeled(set, entry.key, value)),
         }
     }
-    for (resolved_keys) |key| {
+    for (resolved_keys ++ config_runtime.tool_placement.setting_keys) |key| {
         if (seen.contains(key)) continue;
         switch (try effectiveValue(arena, state, provider, key)) {
             .value => |value| try out.append(arena, .{ .key = key, .value = value, .origin = .default }),

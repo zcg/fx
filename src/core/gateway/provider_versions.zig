@@ -116,7 +116,7 @@ fn readCached(alloc: Allocator, dir: std.Io.Dir, provider: Provider) !?Cached {
     };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.InvalidProviderVersionCache;
+    if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.InvalidProviderVersionCache;
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_cache_bytes);
     defer alloc.free(bytes);
     const Record = struct { version: []const u8, checked_at_ms: i64 };

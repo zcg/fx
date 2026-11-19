@@ -1020,7 +1020,8 @@ describe("ultrafast fake Gateway", () => {
             await session.sendText("/ultrafast status");
             await session.waitForText(`requested: ${scenario.ultrafast ? "on" : "off"}`, TIMEOUT);
             expect(gateway.requests).toEqual([]);
-            await session.sendText("Return the interactive launch response.");
+            // The prompt doesn't contain the reply, so the wait can't match the typed text.
+            await session.sendText("Answer the launch check.");
             await session.waitForText("interactive launch response", TIMEOUT);
             await session.waitForStableComposer(TIMEOUT);
             expect((await session.capturePaneEscapes()).includes("\x1b[38;2;255;204;0m⚡︎")).toBe(scenario.ultrafast);
@@ -1046,7 +1047,7 @@ describe("ultrafast fake Gateway", () => {
     );
 
     test(
-      "the Settings Ultra row persists across restart and serializes the next prompt",
+      "the Settings Ultrafast row persists across restart and serializes the next prompt",
       async () => {
         const root = createIsolatedRoot({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
         const gateway = startFakeGateway(
@@ -1067,13 +1068,13 @@ describe("ultrafast fake Gateway", () => {
           await session.sendText("/settings");
           await session.waitForText("←→ change", TIMEOUT);
           await session.sendLiteral("ultra");
-          await session.waitForPane((pane) => /Ultra mode\s+off\s+on/.test(pane), TIMEOUT);
+          await session.waitForPane((pane) => /Ultrafast mode\s+off\s+on/.test(pane), TIMEOUT);
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
             .toMatchObject({ ultrafast_mode: false });
           expect(gateway.requests).toEqual([]);
           await session.sendKeys("Right");
           await session.waitForPane(
-            (pane) => /Ultra mode\s+off\s+on/.test(pane) && pane.includes("* ultrafast: requested on"),
+            (pane) => /Ultrafast mode\s+off\s+on/.test(pane) && pane.includes("* ultrafast: requested on"),
             TIMEOUT,
           );
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
@@ -1103,12 +1104,12 @@ describe("ultrafast fake Gateway", () => {
           await session.sendText("/settings");
           await session.waitForText("←→ change", TIMEOUT);
           await session.sendLiteral("ultra");
-          await session.waitForPane((pane) => /Ultra mode\s+off\s+on/.test(pane), TIMEOUT);
+          await session.waitForPane((pane) => /Ultrafast mode\s+off\s+on/.test(pane), TIMEOUT);
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
             .toMatchObject({ ultrafast_mode: true });
           await session.sendKeys("Left");
           await session.waitForPane(
-            (pane) => /Ultra mode\s+off\s+on/.test(pane) && pane.includes("* ultrafast: requested off"),
+            (pane) => /Ultrafast mode\s+off\s+on/.test(pane) && pane.includes("* ultrafast: requested off"),
             TIMEOUT,
           );
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
@@ -1180,7 +1181,7 @@ describe("ultrafast fake Gateway", () => {
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
             .toMatchObject({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL }, effort: "xhigh" });
           expect(gateway.requests).toEqual([]);
-          await session.sendText("Return the marker selection response.");
+          await session.sendText("Return the model picker marker.");
           await session.waitForText("marker selection response", TIMEOUT);
           expect(gateway.requests).toHaveLength(1);
           expectUltrafastRequest(gateway.requests[0]!.body);
@@ -1210,7 +1211,8 @@ describe("ultrafast fake Gateway", () => {
     test(
       "on, off, and status use the live slash command and persist the request",
       async () => {
-        const root = createIsolatedRoot();
+        // The saved model, not FX_MODEL: a run's model keeps the change to the run.
+        const root = createIsolatedRoot({ models: { gateway: ULTRA_MODEL } });
         const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
         const stderrPath = join(root.root, "stderr.txt");
         let session: TmuxSession | null = null;
@@ -1219,7 +1221,7 @@ describe("ultrafast fake Gateway", () => {
             cwd: root.workspace,
             isolated: true,
             stderrPath,
-            env: fakeGatewayEnv(root, gateway),
+            env: fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_PROVIDER: undefined }),
           });
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
@@ -1242,6 +1244,43 @@ describe("ultrafast fake Gateway", () => {
           await session.sendText("/quit");
           await session.waitForSessionEnd(TIMEOUT);
           expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        } finally {
+          if (session) await session.kill();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+
+    test(
+      "/ultrafast under FX_MODEL changes the run without saving it",
+      async () => {
+        const root = createIsolatedRoot();
+        const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
+        const stderrPath = join(root.root, "stderr.txt");
+        let session: TmuxSession | null = null;
+        try {
+          session = await TmuxSession.create({
+            cwd: root.workspace,
+            isolated: true,
+            stderrPath,
+            env: fakeGatewayEnv(root, gateway),
+          });
+          await session.waitForComposer(TIMEOUT);
+          await waitForGatewayModelCatalog(gateway);
+
+          await session.sendText("/ultrafast on");
+          await session.waitForText("requested on", TIMEOUT);
+          await session.sendText("/ultrafast status");
+          await session.waitForText("requested: on", TIMEOUT);
+          // Ultrafast is saved with its model, so neither outlives this run.
+          const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
+          expect(settings).not.toHaveProperty("ultrafast_mode");
+          expect(settings).not.toHaveProperty("models");
+          await session.sendText("/quit");
+          await session.waitForSessionEnd(TIMEOUT);
           expect(readFileSync(stderrPath, "utf8")).toBe("");
         } finally {
           if (session) await session.kill();

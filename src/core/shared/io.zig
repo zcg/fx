@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const net_connect = @import("net_connect.zig");
 const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
@@ -21,7 +22,27 @@ var global_raw_environ: ?RawEnviron = null;
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.target.os.tag, zio);
+    real_io = processIo(zio);
+}
+
+/// `zio` with fx's process spawn on Darwin and fx's TCP connect.
+fn processIo(zio: std.Io) std.Io {
+    return net_connect.wrap(process_io_for(builtin.target.os.tag, zio));
+}
+
+/// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`
+/// puts the returned value back. Unlike `setIo`, it skips the Darwin
+/// process selection, so `zio` must come from `getIo` to keep it.
+pub fn replaceIoForTest(zio: std.Io) ?std.Io {
+    comptime std.debug.assert(builtin.is_test);
+    const previous = real_io;
+    real_io = zio;
+    return previous;
+}
+
+pub fn restoreIoForTest(previous: ?std.Io) void {
+    comptime std.debug.assert(builtin.is_test);
+    real_io = previous;
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
@@ -37,8 +58,8 @@ pub noinline fn getIo() std.Io {
 }
 
 noinline fn fallbackIo() std.Io {
-    if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
-    return process_io_for(builtin.target.os.tag, fallback_threaded.io());
+    if (comptime builtin.is_test) return processIo(std.testing.io);
+    return processIo(fallback_threaded.io());
 }
 
 /// Opens an absolute directory path without following any path component.
@@ -214,6 +235,23 @@ test "getIo Darwin test fallback runs a child through the selected backend" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
+test "process I/O connects TCP through net_connect and keeps every other entry" {
+    const original = std.testing.io;
+    const selected = processIo(original);
+    const spawn_selected = process_io_for(builtin.target.os.tag, original);
+
+    try std.testing.expect(selected.userdata == original.userdata);
+    try std.testing.expect(selected.vtable == processIo(original).vtable);
+    inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "netConnectIp")) {
+            const replaced = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
+            try std.testing.expectEqual(replaced, @field(selected.vtable, field_name) != @field(original.vtable, field_name));
+        } else {
+            try std.testing.expectEqual(@field(spawn_selected.vtable, field_name), @field(selected.vtable, field_name));
+        }
+    }
+}
+
 test "non-Darwin process I/O keeps the original vtable" {
     const original = std.testing.io;
     const selected = process_io_for(.linux, original);
@@ -371,7 +409,7 @@ fn verifyOpenedRegularFileWithPolicy(stat: std.Io.File.Stat, policy: RegularFile
     if (policy.hardlinks == .reject and stat.nlink > 1) {
         return error.DurablePathUnsafe;
     }
-    if (policy.hardlinks == .reject and policy.mode != .read_only and stat.nlink != 1) {
+    if (policy.hardlinks == .reject and policy.mode != .read_only and !isSingleLinkRegularFile(stat.kind, stat.nlink)) {
         return error.DurablePathUnsafe;
     }
 }
@@ -463,6 +501,9 @@ test "read-only opens accept a file that a concurrent atomic replacement unlinks
 }
 
 test "read-only regular file policy accepts hardlinks while durable policy rejects" {
+    // A hard link is made with `linkat`, which Windows has no name for in
+    // Zig's C bindings, and the policy it checks reads link counts.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -567,14 +608,22 @@ fn liveLibcEnviron() ?RawEnviron {
     return @ptrCast(std.c.environ);
 }
 
+/// What fx tells the user when `homeDir` returns null, after a prefix such as
+/// `fx mcp: `.
+pub const no_home_dir_reason = "HOME is not set to an absolute path";
+
 /// The home directory fx keeps its own files under: `HOME` when it is an
-/// absolute path, otherwise null. An empty or relative `HOME` counts as
-/// unset, so fx never builds profile paths relative to the current folder.
-/// Child processes still inherit `HOME` unchanged.
+/// absolute path, otherwise `FX_HOME`'s parent, or null when `FX_HOME` is
+/// unset too. An empty or relative `HOME` counts as unset, so fx never builds
+/// profile paths relative to the current folder. Child processes still
+/// inherit `HOME` unchanged.
 pub fn homeDir() ?[]const u8 {
     // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
+    // A relative HOME counts the same way, so fx never builds profile paths
+    // relative to the current folder. Windows sets `USERPROFILE` and usually
+    // leaves `HOME` unset, so the Windows fallback below runs there.
     const home = homeDirectoryEnv() orelse return profile_paths.fxHomeParent();
-    if (!std.Io.Dir.path.isAbsolute(home)) return null;
+    if (!std.Io.Dir.path.isAbsolute(home)) return profile_paths.fxHomeParent();
     return home;
 }
 
@@ -759,6 +808,14 @@ pub noinline fn nanoTimestamp() i128 {
     return @intCast(ts.nanoseconds);
 }
 
+/// Milliseconds on the awake clock, which every process on the machine shares
+/// and which stops while the machine sleeps (mach uptime on macOS). For
+/// timeouts one process sets and another reads.
+pub fn awakeMilliTimestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
+}
+
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
@@ -850,7 +907,7 @@ fn validateRelativeLeaf(name: []const u8) !void {
 
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
     if (comptime modeIsEnforced) {
         if (stat.permissions.toMode() & 0o777 != 0o600) return error.PrivateStatePermissionsUnsupported;
     }
@@ -861,7 +918,7 @@ fn verifyPrivateRegularFile(file: std.Io.File) !void {
 /// this, because a mode they cannot set is not evidence of a restriction.
 fn verifyPrivateRegularFilePath(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
 }
 
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
@@ -874,8 +931,13 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
+///
+/// Windows has no `fsync` and no directory handle to give it: a directory
+/// opened with `FILE_FLAG_BACKUP_SEMANTICS` takes `FlushFileBuffers`, which
+/// asks the volume to write what it holds for that entry. That is the same
+/// promise the POSIX call makes for the rename and create that came before.
 pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.target.os.tag == .windows) return error.OperationUnsupported;
+    if (comptime builtin.target.os.tag == .windows) return windowsFlushDirectory(dir.handle);
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -888,6 +950,27 @@ pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
             else => return error.DirectorySyncFailed,
         }
     }
+}
+
+
+/// Windows has no way to flush a directory, so this reports that there is
+/// nothing left to ask.
+///
+/// POSIX makes a rename or a create durable by syncing the directory, and fx
+/// pairs every durable write with this call. Windows offers no equivalent:
+/// `FlushFileBuffers` and the `NtFlushBuffersFile` it wraps both answer
+/// `STATUS_ACCESS_DENIED` for a directory handle, because a directory opened
+/// for backup semantics is not open for writing and the flush would have to
+/// update its timestamps. Measured on Windows 11 with `zig build probe-dir-sync`
+/// and again with a probe that called `FlushFileBuffers` on the handle
+/// `openDir` returns.
+///
+/// The file's own data is flushed by the caller before the rename, so what
+/// remains unflushed is the name entry in the directory. Refusing here would
+/// fail every durable write on the platform, which is worse than a name entry
+/// that the volume may still be holding when the power goes out.
+fn windowsFlushDirectory(handle: std.posix.fd_t) !void {
+    _ = handle;
 }
 
 fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !VerifiedDir {
@@ -976,13 +1059,13 @@ fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
         error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
         else => return err,
     };
-    if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
     if (deniesWrites(stat.permissions)) return error.AccessDenied;
 }
 
 fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
     const stat = dir.statFile(getIo(), name, .{ .follow_symlinks = false }) catch return;
-    if (stat.kind != .file or stat.nlink != 1) return;
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return;
     dir.deleteFile(getIo(), name) catch {};
 }
 
@@ -1097,7 +1180,7 @@ pub fn durableReplaceVerifiedWithOps(
     // equivalent guarantee for a freshly renamed file, so the check is limited to
     // the platforms where it means what it says.
     if (comptime modeIsEnforced) {
-        if (final_stat.nlink != 1) return error.DurableReplacePostRenameFailed;
+        if (!isSingleLinkRegularFile(final_stat.kind, final_stat.nlink)) return error.DurableReplacePostRenameFailed;
     }
     if (comptime modeIsEnforced) {
         if (final_stat.permissions.toMode() & 0o777 != 0o600) return error.DurableReplacePostRenameFailed;
@@ -1111,7 +1194,33 @@ pub fn durableReplaceVerifiedWithOps(
     };
 }
 
-fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File {
+/// What an existing lock file's mode must be. A missing one is always
+/// created private.
+const LockFileMode = enum {
+    /// 0600, as fx makes every lock file.
+    private,
+    /// Writable by its owner only, readable by anyone: a lock an older fx
+    /// release left readable by others.
+    owner_writable,
+};
+
+/// Whether a group or other write bit is set: the one rule for state an
+/// older fx release left readable by others, which fx reads only while no
+/// one else can change it (D61 in `tests/tla/session_manager/system-design.md`).
+/// Windows has no mode bits to leak, so it never reports one.
+pub fn othersCanWrite(permissions: std.Io.File.Permissions) bool {
+    if (comptime modeIsEnforced) return permissions.toMode() & 0o022 != 0;
+    return false;
+}
+
+/// A regular file only its owner can write, though others may read it.
+fn verifyOwnerWritableRegularFile(file: std.Io.File) !void {
+    const stat = try file.stat(getIo());
+    if (!isSingleLinkRegularFile(stat.kind, stat.nlink)) return error.DurablePathUnsafe;
+    if (othersCanWrite(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
+}
+
+fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8, existing: LockFileMode) !std.Io.File {
     try validateRelativeLeaf(name);
     const zio = getIo();
 
@@ -1153,7 +1262,10 @@ fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File
         else => return err,
     };
     errdefer file.close(zio);
-    try verifyPrivateRegularFile(file);
+    switch (existing) {
+        .private => try verifyPrivateRegularFile(file),
+        .owner_writable => try verifyOwnerWritableRegularFile(file),
+    }
     return file;
 }
 
@@ -1163,6 +1275,18 @@ pub fn acquireTimedAdvisoryLock(
     deadline_ms: u64,
 ) !TimedAdvisoryLock {
     return acquireTimedAdvisoryLockControlled(dir, name, deadline_ms, null, .{});
+}
+
+/// `acquireTimedAdvisoryLock` on a lock file an older fx release made,
+/// which may be readable by others, as such a release left its session
+/// folders (D61 in `tests/tla/session_manager/system-design.md`). The file
+/// keeps its mode; one others can write is refused.
+pub fn acquireTimedAdvisoryLockOnOlderFile(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+) !TimedAdvisoryLock {
+    return acquireTimedAdvisoryLockFile(dir, name, deadline_ms, null, .{}, .owner_writable);
 }
 
 pub fn acquireTimedAdvisoryLockWithOps(
@@ -1212,7 +1336,18 @@ fn acquireTimedAdvisoryLockControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
     ops: LockOps,
 ) !TimedAdvisoryLock {
-    const file = try openOrCreatePrivateLockFile(dir, name);
+    return acquireTimedAdvisoryLockFile(dir, name, deadline_ms, cancel_flag, ops, .private);
+}
+
+fn acquireTimedAdvisoryLockFile(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    ops: LockOps,
+    existing: LockFileMode,
+) !TimedAdvisoryLock {
+    const file = try openOrCreatePrivateLockFile(dir, name, existing);
     errdefer file.close(getIo());
 
     const started = ops.now_ms(ops.ctx);
@@ -1321,6 +1456,58 @@ const windows_readonly_attribute: u32 = 0x1;
 /// and only the platform edge converts to or from `pid_t`.
 pub const ProcessId = u32;
 
+/// The id number a `pid_t` carries.
+///
+/// POSIX widens its number. A Windows `pid_t` is an opaque handle, and fx's
+/// Windows paths keep the id as a number from the moment a child reports it, so
+/// the handle stores that number in its pointer value: `pidFromNumber` built
+/// it that way, and this reads it back.
+pub fn pidNumber(pid: std.posix.pid_t) ProcessId {
+    if (comptime builtin.target.os.tag == .windows) return @truncate(@intFromPtr(pid));
+    return @intCast(pid);
+}
+
+/// A signal a tracker or a command may send to a process tree, named the same
+/// on every platform.
+///
+/// Windows has no signals: `std.c.SIG` there is a short `enum(u32)` of the C
+/// runtime's own conditions, with no KILL, no STOP, and no CONT, and a process
+/// is ended by `TerminateProcess` instead. fx's tree code needs three verbs on
+/// every platform, so it names them here and each platform carries out the one
+/// it has: POSIX sends the signal, and Windows terminates the process, which is
+/// the whole meaning KILL has there. STOP and CONT have no Windows equivalent
+/// (nothing can halt a process from outside it), so they do nothing, and the
+/// caller's stop-then-kill ordering still ends the tree.
+pub const Signal = enum {
+    /// End the process now. `TerminateProcess` on Windows.
+    kill,
+    /// Halt the process so it can be resumed. Nothing on Windows.
+    stop,
+    /// Resume a halted process. Nothing on Windows.
+    cont,
+    /// Ask the process to end. `TerminateProcess` on Windows, which has no
+    /// cooperative signal, so this is as final as `kill`.
+    terminate,
+    /// The terminal went away. `TerminateProcess` on Windows.
+    hangup,
+    /// The user asked the process to stop. `TerminateProcess` on Windows, which
+    /// cannot deliver it as a keystroke's control character.
+    interrupt,
+    /// The user asked for a core image. `TerminateProcess` on Windows.
+    quit,
+
+    /// The `std.posix.SIG` this names on a platform that has one.
+    pub fn posix(self: Signal) std.posix.SIG {
+        if (comptime builtin.target.os.tag == .windows) unreachable;
+        return switch (self) {
+            .kill => .KILL,
+            .stop => .STOP,
+            .cont => .CONT,
+            .terminate, .hangup, .interrupt, .quit => .TERM,
+        };
+    }
+};
+
 /// Reads a process id from text, for a caller that stored one as digits.
 pub fn parseProcessId(text: []const u8) error{InvalidProcessId}!ProcessId {
     return std.fmt.parseInt(ProcessId, text, 10) catch error.InvalidProcessId;
@@ -1353,6 +1540,28 @@ pub fn pidFromNumber(number: ProcessId) std.posix.pid_t {
         return @ptrFromInt(@as(usize, number));
     }
     return @intCast(number);
+}
+
+/// Sends `signal` to a process by its id number.
+///
+/// Windows has no signals, so `kill`, `terminate`, and `stop` all end the
+/// process with `TerminateProcess`, which is the only way to stop one there.
+/// `cont` has nothing to resume and succeeds without doing anything.
+pub fn signalProcessNumber(number: ProcessId, signal: Signal) error{ ProcessNotFound, AccessDenied, Unexpected }!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (signal == .cont) return;
+        if (number == 0) return error.ProcessNotFound;
+        const process = windows_process.OpenProcess(windows_process_terminate, 0, number) orelse
+            return error.ProcessNotFound;
+        defer _ = windows_process.CloseHandle(process);
+        if (windows_process.TerminateProcess(process, 1) == 0) return error.Unexpected;
+        return;
+    }
+    std.posix.kill(pidFromNumber(number), signal.posix()) catch |err| switch (err) {
+        error.ProcessNotFound => return error.ProcessNotFound,
+        error.PermissionDenied => return error.AccessDenied,
+        else => return error.Unexpected,
+    };
 }
 
 /// Terminates a process by its id number.
@@ -1539,6 +1748,21 @@ pub inline fn exposesGroupOrOther(permissions: std.Io.File.Permissions) bool {
     return false;
 }
 
+/// Whether the entry is a regular file only this account can reach, which every
+/// file fx keeps for one account alone must be.
+///
+/// POSIX proves it from the link count: a second name would let another account
+/// in through a folder fx does not control. Windows keeps that count in the
+/// filesystem too, but its `stat` leaves it zero for a handle it opened without
+/// backup intent, so a zero there is "not reported" rather than "unlinked" and
+/// must not be read as a leak. The ACL, not the mode, is what restricts the
+/// file there, which `privateStateIsRestricted` covers.
+pub inline fn isSingleLinkRegularFile(kind: std.Io.File.Kind, nlink: u64) bool {
+    if (kind != .file) return false;
+    if (comptime modeIsEnforced) return nlink == 1;
+    return nlink == 1 or nlink == 0;
+}
+
 /// Whether the entry's mode differs from the one fx requires. Windows has no
 /// mode, so a check that only a POSIX mode can satisfy passes there rather than
 /// failing a file fx could not have marked.
@@ -1574,6 +1798,71 @@ pub fn sleep(ns: u64) void {
 /// which refuses a console handle the same way it refuses to write one, so an
 /// interactive keystroke read never completes. A console is read with `ReadConsoleA`
 /// here instead. Both paths return zero at end of file.
+/// Sets one socket option from a byte view of its value.
+///
+/// POSIX takes the option, the level, and the bytes directly. Windows
+/// Winsock has the same three, but Zig 0.17 declares no `std.posix.setsockopt`
+/// arm for it: `std.posix.SOL` and `std.posix.SO` describe the POSIX numbers,
+/// and a Windows option is a different value at the same level. The call here
+/// goes to `ws2_32` with the constants the caller passes, so a caller that
+/// wants `SO_LINGER` there names `std.os.windows.ws2_32.SO.LINGER`.
+pub fn setsockopt(fd: std.posix.fd_t, level: i32, name: i32, value: []const u8) error{SocketOptionFailed}!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (winsock.setsockopt(fd, level, name, value.ptr, @intCast(value.len)) != 0) {
+            return error.SocketOptionFailed;
+        }
+        return;
+    }
+    std.posix.setsockopt(fd, level, name, value) catch return error.SocketOptionFailed;
+}
+
+const winsock = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "ws2_32" fn setsockopt(
+        socket: std.posix.fd_t,
+        level: i32,
+        name: i32,
+        value: *const anyopaque,
+        length: i32,
+    ) c_int;
+};
+
+/// The value `SO_LINGER` takes, in the layout each platform expects.
+///
+/// Both platforms use a two-field struct, but Windows declares a 16-bit
+/// `onoff` and a 16-bit timeout where POSIX uses two 32-bit fields, so the size
+/// passed to `setsockopt` differs and each has to be built as its own type.
+pub const Linger = if (builtin.target.os.tag == .windows) extern struct {
+    onoff: u16,
+    seconds: u16,
+} else extern struct {
+    onoff: c_int,
+    seconds: c_int,
+};
+
+/// The `SO_LINGER` value that makes a close send a reset instead of a FIN, so a
+/// peer that is still reading sees the connection end at once.
+pub fn lingerReset() Linger {
+    return .{ .onoff = 1, .seconds = 0 };
+}
+
+/// The option number `SO_LINGER` has on this platform.
+pub fn soLinger() i32 {
+    if (comptime builtin.target.os.tag == .windows) return std.os.windows.ws2_32.SO.LINGER;
+    return std.posix.SO.LINGER;
+}
+
+/// The option number `SO_RCVBUF` has on this platform.
+pub fn soRcvbuf() i32 {
+    if (comptime builtin.target.os.tag == .windows) return std.os.windows.ws2_32.SO.RCVBUF;
+    return std.posix.SO.RCVBUF;
+}
+
+/// The level `SOL_SOCKET` has on this platform.
+pub fn solSocket() i32 {
+    if (comptime builtin.target.os.tag == .windows) return std.os.windows.ws2_32.SOL.SOCKET;
+    return std.posix.SOL.SOCKET;
+}
+
 pub fn readFd(fd: std.posix.fd_t, out: []u8) !usize {
     if (comptime builtin.target.os.tag == .wasi) return error.Unexpected;
     if (comptime builtin.target.os.tag == .windows) {
@@ -1949,6 +2238,148 @@ pub fn isTty(fd: std.posix.fd_t) bool {
     return (file.isTty(getIo()) catch false);
 }
 
+/// Sets an environment variable for the current process.
+///
+/// This deliberately does not promise persistence across restarts: POSIX
+/// `setenv` and Win32 `SetEnvironmentVariableW` both change this process only.
+/// Durable secrets belong in the platform credential store. The name still
+/// matches the one settings record, so a credential-store read can fall back
+/// to a variable an outer shell supplied explicitly.
+pub fn setProcessEnv(name: []const u8, value: []const u8) error{ OutOfMemory, Unsupported, Failed }!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        const alloc = std.heap.c_allocator;
+        const name_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return error.OutOfMemory;
+        defer alloc.free(name_wide);
+        const value_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, value) catch return error.OutOfMemory;
+        defer alloc.free(value_wide);
+        if (windows_env.SetEnvironmentVariableW(name_wide, value_wide.ptr) == 0) return error.Failed;
+        return;
+    }
+    if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
+    const alloc = std.heap.c_allocator;
+    const name_z = alloc.dupeZ(u8, name) catch return error.OutOfMemory;
+    defer alloc.free(name_z);
+    const value_z = alloc.dupeZ(u8, value) catch return error.OutOfMemory;
+    defer alloc.free(value_z);
+    if (std.c.setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.Failed;
+}
+
+/// Removes an environment variable from the current process.
+pub fn unsetProcessEnv(name: []const u8) error{ OutOfMemory, Unsupported, Failed }!void {
+    if (comptime builtin.target.os.tag == .windows) {
+        const alloc = std.heap.c_allocator;
+        const name_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return error.OutOfMemory;
+        defer alloc.free(name_wide);
+        if (windows_env.SetEnvironmentVariableW(name_wide, null) == 0) return error.Failed;
+        return;
+    }
+    if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
+    const alloc = std.heap.c_allocator;
+    const name_z = alloc.dupeZ(u8, name) catch return error.OutOfMemory;
+    defer alloc.free(name_z);
+    if (posix_env.unsetenv(name_z.ptr) != 0) return error.Failed;
+}
+
+const windows_env = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
+};
+
+const posix_env = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) struct {} else struct {
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+};
+
+/// The path of the device that discards everything written to it.
+///
+/// POSIX has one file, `/dev/null`. Windows spells the same device `NUL` in
+/// every folder, so a test that writes a frame somewhere harmless names this
+/// instead of a path.
+pub const null_device = if (builtin.target.os.tag == .windows) "\\\\.\\NUL" else "/dev/null";
+
+/// Sets an entry's timestamps, which a caller uses to describe a file's age.
+///
+/// POSIX passes the request to the platform. Zig 0.17's Windows
+/// `dirSetTimestamps` panics with TODO implement, so the same request is
+/// carried out here with `SetFileTime`, which needs a handle rather than a
+/// path: the entry is opened for writing its attributes and the two times are
+/// written through it. A timestamp the caller did not ask about keeps the value
+/// it already has, which is what the POSIX call does.
+pub fn setTimestamps(
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    options: std.Io.Dir.SetTimestampsOptions,
+) !void {
+    if (comptime builtin.target.os.tag != .windows) {
+        return dir.setTimestamps(getIo(), sub_path, options);
+    }
+    if (comptime builtin.target.os.tag == .wasi) return error.OperationUnsupported;
+
+    const windows = windows_file_time;
+    const io = getIo();
+    const file = try dir.openFile(io, sub_path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    var access_time: windows.FILETIME = .{ .dwLowDateTime = 0, .dwHighDateTime = 0 };
+    var write_time: windows.FILETIME = .{ .dwLowDateTime = 0, .dwHighDateTime = 0 };
+
+    // A null pointer leaves that time alone, so only a time the caller asked
+    // about is filled in. `now` reads the real clock, which is what the POSIX
+    // call does for the same request.
+    const set_access: ?*windows.FILETIME = switch (options.access_timestamp) {
+        .unchanged => null,
+        .now => blk: {
+            access_time = windows.filetimeFromNanoseconds(nanoTimestamp());
+            break :blk &access_time;
+        },
+        .new => |value| blk: {
+            access_time = windows.filetimeFromNanoseconds(@as(i128, value.nanoseconds));
+            break :blk &access_time;
+        },
+    };
+    const set_modify: ?*windows.FILETIME = switch (options.modify_timestamp) {
+        .unchanged => null,
+        .now => blk: {
+            write_time = windows.filetimeFromNanoseconds(nanoTimestamp());
+            break :blk &write_time;
+        },
+        .new => |value| blk: {
+            write_time = windows.filetimeFromNanoseconds(@as(i128, value.nanoseconds));
+            break :blk &write_time;
+        },
+    };
+    if (windows.SetFileTime(file.handle, null, set_access, set_modify) == 0) {
+        return error.Unexpected;
+    }
+}
+
+/// The Win32 calls setting a file's time needs.
+const windows_file_time = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const FILETIME = extern struct {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    };
+
+    extern "kernel32" fn SetFileTime(
+        file: std.os.windows.HANDLE,
+        creation_time: ?*const FILETIME,
+        last_access_time: ?*const FILETIME,
+        last_write_time: ?*const FILETIME,
+    ) callconv(.winapi) i32;
+
+    /// The `FILETIME` for an instant, counted in 100ns units from 1601-01-01,
+    /// which is the epoch Win32 uses.
+    fn filetimeFromNanoseconds(nanoseconds: i128) FILETIME {
+        // 11644473600 seconds separate 1601-01-01 from 1970-01-01.
+        const epoch_offset_ns: i128 = 11_644_473_600 * std.time.ns_per_s;
+        const hundreds: i128 = @divFloor(nanoseconds + epoch_offset_ns, 100);
+        const value: u64 = @intCast(@max(hundreds, 0));
+        return .{
+            .dwLowDateTime = @truncate(value),
+            .dwHighDateTime = @truncate(value >> 32),
+        };
+    }
+};
+
+
 /// This process's standard input as a `std.Io.File`.
 pub fn stdinFile() std.Io.File {
     return fileFromHandle(stdinHandle());
@@ -2092,140 +2523,119 @@ const windows_console_info = if (builtin.target.os.tag != .windows) struct {} el
     ) callconv(.winapi) c_int;
 };
 
-/// Reads terminal attributes. Linux issues the kernel ioctl directly because
-/// Zig 0.17 sizes `std.posix.termios` to the kernel struct, while
-/// `std.posix.tcgetattr` calls into libc, which writes its larger struct and
-/// overruns the caller's stack.
+/// Reads terminal attributes.
+///
+/// POSIX only: a Windows console is described by one mode word per handle, not
+/// by a `termios`, and Zig 0.17 makes `std.posix.termios` `void` there. Windows
+/// callers use `term_mode.zig`, which captures the console mode words instead.
+///
+/// Linux issues the kernel ioctl directly because Zig 0.17 sizes
+/// `std.posix.termios` to the kernel struct while `std.posix.tcgetattr` calls
+/// into libc, which writes its larger struct and overruns the caller's stack,
+/// and every errno is an error, including the EBADF that `std.posix.tcgetattr`
+/// treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    if (builtin.target.os.tag == .windows) return windowsConsoleAttributes(fd);
-    if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
-    var term = std.mem.zeroes(std.posix.termios);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcgetattr(fd, &term))) {
-        .SUCCESS => return term,
-        .INTR => continue,
-        .BADF => unreachable,
-        .NOTTY => return error.NotATerminal,
-        else => |err| return std.posix.unexpectedErrno(err),
-    };
+    // A Windows console is described by one mode word per handle, not by a
+    // `termios`, and Zig 0.17 makes `std.posix.termios` `void` there. Windows
+    // callers use `term_mode.zig`, so this body is dropped from that build.
+    if (comptime builtin.target.os.tag == .windows) {
+        unreachable;
+    } else {
+        if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
+        var term = std.mem.zeroes(std.posix.termios);
+        while (true) switch (tcgetattrErrno(fd, &term)) {
+            .SUCCESS => return term,
+            .INTR => continue,
+            .BADF, .NOTTY => return error.NotATerminal,
+            else => |err| return std.posix.unexpectedErrno(err),
+        };
+    }
 }
 
-/// Windows has no termios. A console's behavior is one mode word per handle,
-/// not the four flag sets a POSIX `termios` carries, so fx keeps the distinction
-/// it actually needs, "is this console in raw mode", in a `termios` value it
-/// never reads field by field on this platform. The input mode word is stored in
-/// the first control-character slot, and `windowsApplyConsoleMode` takes it back
-/// out. Only `tcgetattr`, `tcsetattr`, and the raw-mode helper below touch it.
-fn windowsConsoleAttributes(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    const mode = try windowsGetConsoleMode(fd);
-    var term = std.mem.zeroes(std.posix.termios);
-    const bytes: [4]u8 = @bitCast(mode);
-    @memcpy(term.c_cc[0..4], &bytes);
-    return term;
+/// Linux issues the kernel ioctl: libc there writes a larger termios than Zig's.
+fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcgetattr(fd, term));
+    return std.posix.errno(std.c.tcgetattr(fd, term));
 }
 
-/// The Windows console mode fx reads and writes. A VT-capable console keeps
-/// processed output and virtual terminal processing on; raw input turns off line
-/// input, echo, and Ctrl+C processing, which is the part of raw mode a console
-/// can express. Window input stays on so a resize still reaches fx.
-const windows_raw_input_mode: u32 = windows_enable_window_input | windows_enable_virtual_terminal_input | windows_enable_extended_flags;
-const windows_cooked_input_mode: u32 = windows_enable_processed_input |
-    windows_enable_line_input |
-    windows_enable_echo_input |
-    windows_enable_window_input |
-    windows_enable_virtual_terminal_input |
-    windows_enable_extended_flags;
-
-const windows_enable_processed_input: u32 = 0x0001;
-const windows_enable_line_input: u32 = 0x0002;
-const windows_enable_echo_input: u32 = 0x0004;
-const windows_enable_window_input: u32 = 0x0008;
-const windows_enable_virtual_terminal_input: u32 = 0x0200;
-const windows_enable_extended_flags: u32 = 0x0080;
-const windows_enable_processed_output: u32 = 0x0001;
-const windows_enable_virtual_terminal_processing: u32 = 0x0004;
-
-const WindowsConsole = if (builtin.target.os.tag != .windows) struct {} else struct {
-    extern "kernel32" fn GetConsoleMode(h_console: std.posix.fd_t, mode: *u32) callconv(.winapi) c_int;
-    extern "kernel32" fn SetConsoleMode(h_console: std.posix.fd_t, mode: u32) callconv(.winapi) c_int;
-    extern "kernel32" fn IsConsoleHandle(h: std.posix.fd_t) callconv(.winapi) c_int;
-};
-
-fn windowsGetConsoleMode(fd: std.posix.fd_t) std.posix.TermiosGetError!u32 {
-    var mode: u32 = 0;
-    if (WindowsConsole.GetConsoleMode(fd, &mode) == 0) return error.NotATerminal;
-    return mode;
-}
-
-fn windowsSetConsoleMode(fd: std.posix.fd_t, mode: u32) std.posix.TermiosSetError!void {
-    if (WindowsConsole.SetConsoleMode(fd, mode) == 0) return error.NotATerminal;
-}
-
-/// Whether the descriptor names a console rather than a redirected file.
-pub fn isConsole(fd: std.posix.fd_t) bool {
-    if (comptime builtin.target.os.tag != .windows) return isTty(fd);
-    var mode: u32 = 0;
-    return WindowsConsole.GetConsoleMode(fd, &mode) != 0;
-}
-
-/// Puts a Windows console into the mode fx draws with: raw input plus escape
-/// processing on the output handle. The caller passes the value `tcgetattr`
-/// returned so it can be restored.
-pub fn windowsEnableRawConsole(
-    input_fd: std.posix.fd_t,
-    output_fd: std.posix.fd_t,
-    saved: std.posix.termios,
-) std.posix.TermiosSetError!void {
-    _ = saved;
-    try windowsSetConsoleMode(input_fd, windows_raw_input_mode);
-    var output_mode: u32 = 0;
-    if (WindowsConsole.GetConsoleMode(output_fd, &output_mode) == 0) return error.NotATerminal;
-    try windowsSetConsoleMode(
-        output_fd,
-        output_mode | windows_enable_processed_output | windows_enable_virtual_terminal_processing,
-    );
-}
-
-/// Restores the mode `windowsConsoleAttributes` captured.
-pub fn windowsRestoreConsole(
-    input_fd: std.posix.fd_t,
-    output_fd: std.posix.fd_t,
-    saved: std.posix.termios,
-) void {
-    var mode: u32 = 0;
-    @memcpy(@as([*]u8, @ptrCast(&mode))[0..4], saved.c_cc[0..4]);
-    windowsSetConsoleMode(input_fd, mode) catch {};
-    _ = output_fd;
-}
-
-/// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
+/// Sets terminal attributes. Like `tcgetattr`, every failure is an error,
+/// including the EBADF and EINVAL that `std.posix` treats as unreachable.
 pub fn tcsetattr(
     fd: std.posix.fd_t,
     action: std.posix.TCSA,
     term: std.posix.termios,
 ) std.posix.TermiosSetError!void {
-    if (builtin.target.os.tag == .windows) {
-        // The value `tcgetattr` returned carries the console mode to restore.
-        var mode: u32 = 0;
-        @memcpy(@as([*]u8, @ptrCast(&mode))[0..4], term.c_cc[0..4]);
-        return windowsSetConsoleMode(fd, mode);
-    }
-    if (builtin.target.os.tag != .linux) return std.posix.tcsetattr(fd, action, term);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+    // POSIX only, for the same reason `tcgetattr` is: Windows has no termios.
+    if (comptime builtin.target.os.tag == .windows) {
+        _ = .{ fd, action, term };
+        unreachable;
+    } else while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
-        .BADF, .INVAL => unreachable,
-        .NOTTY => return error.NotATerminal,
+        .BADF, .NOTTY => return error.NotATerminal,
         .IO => return error.ProcessOrphaned,
+        .INVAL => return error.Unexpected,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-test "tcgetattr reports a regular file as not a terminal" {
+fn tcsetattrErrno(fd: std.posix.fd_t, action: std.posix.TCSA, term: *const std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcsetattr(fd, action, term));
+    return std.posix.errno(std.c.tcsetattr(fd, action, term));
+}
+
+test "terminal attributes of a regular file report not a terminal" {
+    // `tcgetattr` and `tcsetattr` are POSIX: a Windows console carries one
+    // mode word per handle, and `term_mode.zig` reads that instead.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
     defer file.close(std.testing.io);
     try std.testing.expectError(error.NotATerminal, tcgetattr(file.handle));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(file.handle, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes of a closed descriptor are an error, not a panic" {
+    // `tcgetattr` and `tcsetattr` are POSIX: a Windows console carries one
+    // mode word per handle, and `term_mode.zig` reads that instead.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    // Closed, near the top of the file limit where opens rarely land; dup() if F_DUPFD fails.
+    const floor: c_int = @intCast(@min((try std.posix.getrlimit(.NOFILE)).cur -| 1, 900));
+    var closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, floor);
+    if (closed < 0) closed = std.c.dup(file.handle);
+    try std.testing.expect(closed >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
+
+    try std.testing.expectError(error.NotATerminal, tcgetattr(closed));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(closed, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes with an invalid action are an error, not a panic" {
+    // `tcgetattr` and `tcsetattr` are POSIX: a Windows console carries one
+    // mode word per handle, and `term_mode.zig` reads that instead.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
+    // macOS libc refuses the action with EINVAL before any ioctl. On Linux
+    // the action selects the ioctl itself, so there is no safe invalid one.
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    try std.testing.expectError(
+        error.Unexpected,
+        tcsetattr(file.handle, @fromBackingInt(99), std.mem.zeroes(std.posix.termios)),
+    );
 }
 
 pub fn makeDirRecursive(path: []const u8) !void {
@@ -2621,6 +3031,8 @@ test "cloneEnvironMap copies installed raw environment state" {
 }
 
 test "libc environment lookups follow a host that grows the environment" {
+    // `setenv` and `unsetenv` are POSIX; the Windows C runtime has neither.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     if (comptime !builtin.link_libc) return error.SkipZigTest;
     const libc = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -3081,6 +3493,39 @@ test "a folder that need not be private opens whatever its mode, but never throu
     try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "link"));
 }
 
+test "a lock on an older release's file takes one others can read, keeps its mode, and refuses one others can write" {
+    // The test writes 0o644 and 0o666 on purpose: Windows has no mode bits,
+    // so a file there cannot be made readable-but-not-writable by others.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "readable.lock", .data = "" });
+    var readable = try tmp.dir.openFile(getIo(), "readable.lock", .{});
+    try readable.setPermissions(getIo(), .fromMode(0o644));
+    readable.close(getIo());
+    // The private lock refuses it, as before.
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, acquireTimedAdvisoryLock(&dir, "readable.lock", 0));
+    var lock = try acquireTimedAdvisoryLockOnOlderFile(&dir, "readable.lock", 0);
+    lock.release();
+    const kept = try tmp.dir.statFile(getIo(), "readable.lock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(kept.permissions.toMode() & 0o777)));
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "shared.lock", .data = "" });
+    var shared = try tmp.dir.openFile(getIo(), "shared.lock", .{});
+    try shared.setPermissions(getIo(), .fromMode(0o666));
+    shared.close(getIo());
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, acquireTimedAdvisoryLockOnOlderFile(&dir, "shared.lock", 0));
+
+    // A missing one is made private.
+    var made = try acquireTimedAdvisoryLockOnOlderFile(&dir, "new.lock", 0);
+    made.release();
+    const created = try tmp.dir.statFile(getIo(), "new.lock", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(created.permissions.toMode() & 0o777)));
+}
+
 test "timed advisory lock returns busy after deadline" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3164,4 +3609,52 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+test "a directory sync closes what a create and rename left behind" {
+    // Every durable session write pairs its create and rename with a
+    // directory sync. Windows has no `fsync` for a directory, so the handle
+    // goes to `NtFlushBuffersFile`; this checks that the call succeeds on a
+    // real directory and can be repeated.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = getIo();
+
+    var created = try tmp.dir.createFile(io, "first.json", .{});
+    try created.writeStreamingAll(io, "{}");
+    created.close(io);
+
+    var renamed = try tmp.dir.createFile(io, "second.tmp", .{});
+    try renamed.writeStreamingAll(io, "{}");
+    renamed.close(io);
+    try std.Io.Dir.rename(tmp.dir, "second.tmp", tmp.dir, "second.json", io);
+
+    try syncVerifiedDir(tmp.dir);
+    // A second flush has nothing left to write and still succeeds, rather
+    // than reporting the volume as unable to flush a directory.
+    try syncVerifiedDir(tmp.dir);
+
+    const bytes = try tmp.dir.readFileAlloc(io, "second.json", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("{}", bytes);
+}
+
+/// Holds each standard stream the parent left closed open on /dev/null,
+/// read-only, so no file fx opens later takes its number. A write meant for a
+/// closed stdout then fails, instead of landing in that file, such as the
+/// session store's lock, and a read of a closed stdin ends at once. Call it
+/// before fx opens anything.
+pub fn reserveClosedStandardStreams() void {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return;
+    for ([_]std.c.fd_t{ 0, 1, 2 }) |fd| {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) continue;
+        // `open` returns the lowest free number, which is `fd` once the
+        // closed streams below it are held.
+        const held = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (held < 0) return;
+        if (held != fd) {
+            _ = std.c.dup2(held, fd);
+            _ = std.c.close(held);
+        }
+    }
 }

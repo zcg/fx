@@ -519,6 +519,11 @@ test "Darwin explicit inherited descriptor avoids low user descriptors" {
 }
 
 test "Darwin inherited descriptor survives Bash script execution" {
+    // The whole test is about a descriptor number on macOS, and it formats
+    // one as an integer. Zig analyzes the body even behind a runtime return,
+    // so the gate has to be comptime: on Windows `fd_t` is a handle that no
+    // `{d}` can print.
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
     const io = try darwin_io();
     const pipe = try create_pipe(false);
     defer close_pipe(pipe);

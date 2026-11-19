@@ -120,6 +120,9 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
     if (agent_steps.parseSubagentMaxChildren(getenv("FX_SUBAGENT_MAX_CHILDREN"))) |children| {
         try list.append(arena, .{ .variable = "FX_SUBAGENT_MAX_CHILDREN", .key = "subagent_max_children", .value = .{ .integer = @intCast(children) } });
     }
+    if (agent_steps.parseSubagentMaxDepth(getenv("FX_SUBAGENT_MAX_DEPTH"))) |depth| {
+        try list.append(arena, .{ .variable = "FX_SUBAGENT_MAX_DEPTH", .key = "subagent_max_depth", .value = .{ .integer = @intCast(depth) } });
+    }
     if (compactor.parsePercent(getenv("FX_AUTO_COMPACT_PERCENT"))) |percent| {
         try list.append(arena, .{ .variable = "FX_AUTO_COMPACT_PERCENT", .key = "auto_compact_percent", .value = .{ .integer = percent } });
     }

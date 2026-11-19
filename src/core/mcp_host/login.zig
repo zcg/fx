@@ -13,6 +13,7 @@
 //! TLA+ model: `tests/tla/mcp_host/SignIn.tla`.
 
 const std = @import("std");
+const readiness = @import("../shared/readiness.zig");
 const browser_callback = @import("../auth/browser_callback.zig");
 
 const Allocator = std.mem.Allocator;
@@ -143,8 +144,8 @@ fn readReply(stream: std.Io.net.Stream, out: []u8) []const u8 {
     var n: usize = 0;
     while (n < out.len) {
         if (reader.interface.bufferedLen() == 0) {
-            var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            if ((std.posix.poll(&fds, 5000) catch 0) == 0) break;
+            var watches = [_]readiness.Watch{.{ .fd = stream.socket.handle }};
+            if ((readiness.pollDescriptors(&watches, .{ .milliseconds = 5000 }) catch 0) == 0) break;
         }
         const got = reader.interface.readSliceShort(out[n..]) catch break;
         if (got == 0) break;

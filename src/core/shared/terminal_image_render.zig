@@ -140,7 +140,7 @@ test "a large image is chunked with m=1 and ends without it" {
     @memset(&big, 'x');
     var buffer: [16 * 1024]u8 = undefined;
     var w: Writer = .fixed(&buffer);
-    try writePng(&w, big, .{ .columns = 10, .rows = 4, .image_id = 3 });
+    try writePng(&w, &big, .{ .columns = 10, .rows = 4, .image_id = 3 });
     const out = w.buffered();
     // The first chunk announces the image and says more follows.
     try std.testing.expect(std.mem.find(u8, out, "\x1b_Ga=T,f=100,q=2,i=3,c=10,r=4,m=1;") != null);

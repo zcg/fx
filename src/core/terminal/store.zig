@@ -6227,7 +6227,9 @@ fn test_process_owner(
     process_provider: process_provider_mod.Provider,
 ) !contracts.ProcessOwner {
     var pid_buffer: [32]u8 = undefined;
-    const pid = std.c.getpid();
+    // `std.c.getpid` cannot serve: on Windows `pid_t` is a handle, so the value
+    // is `*anyopaque` rather than the number a token is keyed by.
+    const pid = io_mod.currentProcessId();
     const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid});
     const token = try process_provider.captureToken(
         alloc,

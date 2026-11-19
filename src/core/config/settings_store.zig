@@ -14,6 +14,7 @@ const configured_provider = @import("configured_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const tool_placement = @import("tool_placement.zig");
 const settings_keys = @import("settings_keys.zig");
 const session_store_paths = @import("../session/session_store_paths.zig");
 const theme_mod = @import("../shared/theme.zig");
@@ -125,9 +126,13 @@ pub const UserSettingsPatch = struct {
     max_agent_steps: ?u32 = null,
     max_tool_result_bytes: ?u32 = null,
     subagent_max_children: ?u32 = null,
+    subagent_max_depth: ?u32 = null,
     auto_compact_percent: ?u8 = null,
     provider_strict: ?bool = null,
     context: ?bool = null,
+    cache_warming: ?bool = null,
+    /// One `tool_placement.<tool>` entry.
+    tool_placement: ?ToolPlacementPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -166,9 +171,12 @@ pub const UserSettingsPatch = struct {
             self.max_agent_steps == null and
             self.max_tool_result_bytes == null and
             self.subagent_max_children == null and
+            self.subagent_max_depth == null and
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
+            self.cache_warming == null and
+            self.tool_placement == null and
             self.remove == null and
             self.provider_definition == null and
             self.remove_provider == null and
@@ -182,7 +190,17 @@ pub const ConfiguredProviderPatch = struct {
     previous_name: ?[]const u8 = null,
     protocol: []const u8,
     base_url: []const u8,
+    /// The API key the user typed. It is never written to the settings file:
+    /// the file records the environment variable name the key is read from,
+    /// and the caller that owns the key puts it there.
     key: []const u8,
+};
+
+pub const ToolPlacementPatch = struct {
+    /// A built-in tool that can move, `tool_placement.Tool`.
+    tool: []const u8,
+    /// `toolbox` or `direct`.
+    placement: []const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -783,7 +801,7 @@ pub const Store = struct {
 
         for (names.items) |name| {
             const stat = backups.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch continue;
-            if (stat.kind != .file or stat.nlink != 1 or stat.size > max_settings_bytes) continue;
+            if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or stat.size > max_settings_bytes) continue;
             var file = backups.openFile(io_mod.getIo(), name, .{
                 .allow_directory = false,
                 .follow_symlinks = false,
@@ -1041,8 +1059,18 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
             return error.InvalidSettingsFormat;
         }
     }
+    if (patch.subagent_max_depth) |depth| {
+        if (depth < agent_steps.min_subagent_max_depth or depth > agent_steps.max_subagent_max_depth) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (patch.auto_compact_percent) |percent| {
         if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
+    }
+    if (patch.tool_placement) |entry| {
+        if (tool_placement.Tool.parse(entry.tool) == null or tool_placement.Placement.parse(entry.placement) == null) {
+            return error.InvalidSettingsFormat;
+        }
     }
     if (patch.remove) |path| {
         if (!removablePath(path)) return error.InvalidSettingsFormat;
@@ -1055,7 +1083,8 @@ fn removablePath(path: []const u8) bool {
     if (settings_keys.unknownPart(path) != null) return false;
     const dot = std.mem.findScalar(u8, path, '.');
     const key = settings_keys.find(path[0 .. dot orelse path.len]) orelse return false;
-    if (key.map) return false;
+    // A map's entries are free-form; only a tool's placement is one fx sets.
+    if (key.map) return tool_placement.toolOfKey(path) != null;
     return dot == null or key.children.len > 0;
 }
 
@@ -1106,9 +1135,11 @@ test "plain preference patches write their keys and report no change when equal"
         .auto_compact_percent = 70,
         .provider_strict = true,
         .context = false,
+        .cache_warming = false,
     };
     const first = try applyUserPatchToRoot(arena.allocator(), &root, patch);
     try std.testing.expect(first.changed);
+    try std.testing.expect(!root.object.get("cache_warming").?.bool);
     try std.testing.expectEqual(false, root.object.get("auto_upgrade").?.bool);
     try std.testing.expectEqual(@as(i64, 40), root.object.get("max_agent_steps").?.integer);
     try std.testing.expectEqual(@as(i64, 4096), root.object.get("max_tool_result_bytes").?.integer);
@@ -1351,9 +1382,21 @@ fn applyUserPatchToRoot(
     if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
     if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
     if (patch.subagent_max_children) |value| application.changed = try putInteger(arena, &root.object, "subagent_max_children", value) or application.changed;
+    if (patch.subagent_max_depth) |value| application.changed = try putInteger(arena, &root.object, "subagent_max_depth", value) or application.changed;
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
+    if (patch.cache_warming) |value| application.changed = try putBool(arena, &root.object, "cache_warming", value) or application.changed;
+    if (patch.tool_placement) |entry| {
+        const placements = if (root.object.getPtr("tool_placement")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "tool_placement", .{ .object = .empty });
+            break :blk root.object.getPtr("tool_placement").?;
+        };
+        application.changed = try putString(arena, &placements.object, entry.tool, entry.placement) or application.changed;
+    }
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
@@ -1526,16 +1569,18 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [11]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
         if (patch.max_agent_steps != null) "max_agent_steps" else null,
         if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
         if (patch.subagent_max_children != null) "subagent_max_children" else null,
+        if (patch.subagent_max_depth != null) "subagent_max_depth" else null,
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
+        if (patch.cache_warming != null) "cache_warming" else null,
         patch.remove,
     };
 }
@@ -1946,6 +1991,23 @@ fn renamedGroup(
     return &root.getPtr(current).?.object;
 }
 
+/// The environment variable a saved connection's key is read from.
+///
+/// Derived from the connection name so it is stable across runs. Upper case,
+/// with anything that is not alphanumeric becoming `_`. Distinct provider
+/// names can normalize to the same variable, so callers use the credential
+/// store for durable keys; this name is a stable override and reference.
+pub fn providerKeyEnvName(alloc: Allocator, name: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "FX_PROVIDER_");
+    for (name) |byte| {
+        try out.append(alloc, if (std.ascii.isAlphanumeric(byte)) std.ascii.toUpper(byte) else '_');
+    }
+    try out.appendSlice(alloc, "_KEY");
+    return out.toOwnedSlice(alloc);
+}
+
 /// Saves one named connection under `providers`, creating the object when the
 /// settings have none. An existing connection of the same name is replaced
 /// whole: a half-edited definition is worse than a retyped one.
@@ -1977,9 +2039,15 @@ fn putConfiguredProvider(
         .empty;
     try body.put(arena, "protocol", .{ .string = definition.protocol });
     try body.put(arena, "base_url", .{ .string = definition.base_url });
+    // A connection's auth names the environment variable its key is read from,
+    // never the key itself: `settings.json` is a plain file a user shares and
+    // backs up, and this repository's own parser reads `auth.env` for exactly
+    // that reason. The key itself goes to the environment, under the name
+    // written here, so a saved connection works the next time fx starts.
     var auth: std.json.ObjectMap = .empty;
     try auth.put(arena, "type", .{ .string = "bearer" });
-    try auth.put(arena, "key", .{ .string = definition.key });
+    const key_env = try providerKeyEnvName(arena, definition.name);
+    try auth.put(arena, "env", .{ .string = key_env });
     try body.put(arena, "auth", .{ .object = auth });
     var candidate: std.json.ObjectMap = .empty;
     try candidate.put(arena, definition.name, .{ .object = body });
@@ -2544,7 +2612,7 @@ fn containsCopyWithFingerprint(
     while (try iterator.next(io_mod.getIo())) |entry| {
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
         const stat = dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false }) catch continue;
-        if (stat.kind != .file or stat.nlink != 1 or stat.size > max_settings_bytes) continue;
+        if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink) or stat.size > max_settings_bytes) continue;
         var file = dir.openFile(io_mod.getIo(), entry.name, .{
             .allow_directory = false,
             .follow_symlinks = false,
@@ -2586,7 +2654,7 @@ fn pruneSequencedCopies(
     var deleted = false;
     for (names.items[keep_count..]) |name| {
         const stat = dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch continue;
-        if (stat.kind != .file or stat.nlink != 1) continue;
+        if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) continue;
         dir.deleteFile(io_mod.getIo(), name) catch |err| {
             debug_trace.logf("config", "settings backup prune skipped err={s}", .{@errorName(err)});
             continue;
@@ -2594,6 +2662,41 @@ fn pruneSequencedCopies(
         deleted = true;
     }
     if (deleted) try io_mod.syncVerifiedDir(dir);
+}
+
+/// The same path with the characters JSON requires escaped, so a fixture that
+/// names a workspace reads back as that workspace on every platform.
+///
+/// A Windows path carries backslashes, and a backslash opens an escape in JSON,
+/// so a fixture built by writing the path straight into a string literal would
+/// be invalid there (`\w` is not an escape). The caller owns the result.
+fn jsonEscapedPath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (path) |byte| switch (byte) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\r' => try out.appendSlice(alloc, "\\r"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => try out.append(alloc, byte),
+    };
+    return out.toOwnedSlice(alloc);
+}
+
+/// Removes a name that is a folder link, which is how these tests retarget an
+/// additional directory.
+///
+/// POSIX removes a symlink with `unlink`, and so does Windows for a file link.
+/// A folder link there is a junction, which the kernel reports as a directory,
+/// so the removal goes through the tree call that knows the difference.
+fn removeDirectoryLink(dir: std.Io.Dir, sub_path: []const u8) !void {
+    if (comptime !io_mod.modeIsEnforced) {
+        // A junction is removed as a directory, and the tree call does not
+        // follow it, so the target it names is left alone.
+        return dir.deleteTree(io_mod.getIo(), sub_path);
+    }
+    try dir.deleteFile(io_mod.getIo(), sub_path);
 }
 
 fn writeStoreFixture(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
@@ -3278,9 +3381,11 @@ test "user permission mutation preserves local rules" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
     const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"global *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
-        .{workspace},
+        .{escaped_workspace},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3318,9 +3423,11 @@ test "permission mutation validates scope paths and isolates remove and reset" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
     const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\",\"deny *\":\"deny\"}},\"read\":{{\"*\":\"allow\"}}}}}}}}}}\n",
-        .{workspace},
+        .{escaped_workspace},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3668,7 +3775,9 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
+    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{escaped_workspace});
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -3691,9 +3800,11 @@ test "unrelated user patch preserves inert output level values" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
+    const escaped_workspace = try jsonEscapedPath(alloc, workspace);
+    defer alloc.free(escaped_workspace);
     const fixture = try alloc.print(
         "{{\"output_level\":{{\"legacy\":true}},\"workspaces\":{{\"{s}\":{{\"output_level\":[\"quiet\",7],\"future\":true}}}}}}\n",
-        .{workspace},
+        .{escaped_workspace},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3798,6 +3909,10 @@ test "symlinked durable home is rejected before reading settings" {
 }
 
 test "read only settings rejects group or world writable policy files" {
+    // The test widens a folder's mode and expects the store to refuse it.
+    // Windows files carry an inherited ACL instead of a mode, so there is
+    // nothing to widen and the refusal it checks is POSIX policy.
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3836,6 +3951,10 @@ test "read only settings rejects group or world writable policy files" {
 }
 
 test "tightening read-only open removes group and other write access and records it" {
+    // The test widens a folder's mode and expects the store to refuse it.
+    // Windows files carry an inherited ACL instead of a mode, so there is
+    // nothing to widen and the refusal it checks is POSIX policy.
+    if (comptime !io_mod.modeIsEnforced) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4200,9 +4319,15 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(shared_dot);
     const shared_link = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../shared-link" });
     defer alloc.free(shared_link);
+    const escaped_0 = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_0);
+    const escaped_1 = try jsonEscapedPath(alloc, shared_dot);
+    defer alloc.free(escaped_1);
+    const escaped_2 = try jsonEscapedPath(alloc, shared_link);
+    defer alloc.free(escaped_2);
     const available_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, shared_dot, shared_link },
+        .{ escaped_0, escaped_1, escaped_2 },
     );
     defer alloc.free(available_fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", available_fixture);
@@ -4245,9 +4370,15 @@ test "workspace directory mutations use workspace access path identity" {
         .{ missing, std.Io.Dir.path.sep, std.Io.Dir.path.sep },
     );
     defer alloc.free(missing_parent);
+    const unavailable_fixture_p0 = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(unavailable_fixture_p0);
+    const unavailable_fixture_p1 = try jsonEscapedPath(alloc, missing_dot);
+    defer alloc.free(unavailable_fixture_p1);
+    const unavailable_fixture_p2 = try jsonEscapedPath(alloc, missing_parent);
+    defer alloc.free(unavailable_fixture_p2);
     const unavailable_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, missing_dot, missing_parent },
+        .{ unavailable_fixture_p0, unavailable_fixture_p1, unavailable_fixture_p2 },
     );
     defer alloc.free(unavailable_fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", unavailable_fixture);
@@ -4296,13 +4427,19 @@ test "workspace directory removal uses observed sources and preserves unseen con
         .identity = first,
     }};
 
-    try tmp.dir.deleteFile(std.testing.io, "observed-link");
+    try removeDirectoryLink(tmp.dir, "observed-link");
     try tmp.dir.symLink(std.testing.io, "second", "observed-link", .{ .is_directory = true });
     try tmp.dir.symLink(std.testing.io, "first", "unseen-link", .{ .is_directory = true });
 
+    const escaped_primary = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_primary);
+    const escaped_observed_source = try jsonEscapedPath(alloc, observed_source);
+    defer alloc.free(escaped_observed_source);
+    const escaped_unseen_source = try jsonEscapedPath(alloc, unseen_source);
+    defer alloc.free(escaped_unseen_source);
     const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, observed_source, unseen_source },
+        .{ escaped_primary, escaped_observed_source, escaped_unseen_source },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -4360,14 +4497,20 @@ test "workspace directory removal stabilizes observed survivor identity" {
         .{ .source = removed_source, .identity = removed },
         .{ .source = survivor_source, .identity = survivor },
     };
+    const escaped_primary = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_primary);
+    const escaped_removed_source = try jsonEscapedPath(alloc, removed_source);
+    defer alloc.free(escaped_removed_source);
+    const escaped_survivor_source = try jsonEscapedPath(alloc, survivor_source);
+    defer alloc.free(escaped_survivor_source);
     const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, removed_source, survivor_source },
+        .{ escaped_primary, escaped_removed_source, escaped_survivor_source },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
 
-    try tmp.dir.deleteFile(std.testing.io, "survivor-link");
+    try removeDirectoryLink(tmp.dir, "survivor-link");
     try tmp.dir.symLink(std.testing.io, "retarget", "survivor-link", .{ .is_directory = true });
 
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -4571,14 +4714,18 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
         .source = source,
         .identity = first,
     }};
+    const escaped_primary = try jsonEscapedPath(alloc, primary);
+    defer alloc.free(escaped_primary);
+    const escaped_source = try jsonEscapedPath(alloc, source);
+    defer alloc.free(escaped_source);
     const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
-        .{ primary, source },
+        .{ escaped_primary, escaped_source },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
 
-    try tmp.dir.deleteFile(std.testing.io, "saved-link");
+    try removeDirectoryLink(tmp.dir, "saved-link");
     try tmp.dir.symLink(std.testing.io, "second", "saved-link", .{ .is_directory = true });
 
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -4650,7 +4797,7 @@ test "workspace directory capacity compaction uses observed source identities" {
     try fixture.writer.writeAll("]}}}\n");
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());
 
-    try tmp.dir.deleteFile(std.testing.io, "stable-link-15");
+    try removeDirectoryLink(tmp.dir, "stable-link-15");
     try tmp.dir.symLink(std.testing.io, "retarget", "stable-link-15", .{ .is_directory = true });
 
     var store = try Store.initFromHome(alloc, home, .writable);

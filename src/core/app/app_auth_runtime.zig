@@ -2,14 +2,17 @@ const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const settings_store = @import("../config/settings_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
+const configured_provider_key = @import("../auth/configured_provider_key.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const pending_revocation = @import("../auth/pending_revocation.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -17,6 +20,7 @@ const secret_mod = @import("../auth/secret.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
@@ -78,12 +82,14 @@ fn hostManagesAuth(app: anytype) bool {
 
 const TeamCatalogValidation = union(enum) {
     rejected,
+    /// fx could not connect to load the team's catalog.
+    catalog_unreachable,
     accepted: ?[]u8,
 
     fn deinit(self: *TeamCatalogValidation, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .accepted => |model| if (model) |owned| alloc.free(owned),
-            .rejected => {},
+            .rejected, .catalog_unreachable => {},
         }
         self.* = undefined;
     }
@@ -257,6 +263,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn runLogoutCommand(app: *App, agent: *AppAgent, target: []const u8) !void {
             if (try rejectPendingPreparation(app)) return;
+            if (try rejectFinishingSignInRefresh(app)) return;
             if (hostManagesAuth(app)) {
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = credentials.host_managed_auth_message });
                 return;
@@ -306,29 +313,39 @@ pub fn Runtime(comptime App: type) type {
             }
             defer if (hold_turn_start) agent.worker.releaseTurnStartHold();
             if (logout_provider == .grok) return logoutGrok(app, agent);
-            if (logout_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not durably sign out of Codex. The current source is unchanged.",
-                    });
-                    return;
-                };
-                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
-                    try app.auth.reconcileAfterChatGptLogout(app.alloc)
-                else
-                    false;
-                applyCredentialChange(app, changed);
-                try writeAuthNotice(app, switch (outcome) {
-                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
-                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
-                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
-                });
-                try reconcileSubscriptionLogout(app, agent, .codex);
-                return;
-            }
+            if (logout_provider == .codex) return logoutCodex(app, agent);
             return logoutFxLogin(app);
+        }
+
+        /// Signs out of Codex locally, then revokes its refresh token at
+        /// OpenAI in the background.
+        fn logoutCodex(app: *App, agent: *AppAgent) !void {
+            const local = chatgpt_oauth.logoutLocally(std.heap.c_allocator) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably sign out of Codex. The current source is unchanged.",
+                });
+                return;
+            };
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .codex = token } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            const outcome = local.result;
+            const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterChatGptLogout"))
+                try app.auth.reconcileAfterChatGptLogout(app.alloc)
+            else
+                false;
+            applyCredentialChange(app, changed);
+            try writeAuthNotice(app, switch (outcome.deletion) {
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
+            });
+            if (outcome.revocation_failed) {
+                try writeRemoteRevocationWarning(app, .chatgpt_subscription, false);
+            }
+            try reconcileSubscriptionLogout(app, agent, .codex);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// Signs out of Grok locally, then revokes its refresh token at the
@@ -356,10 +373,10 @@ pub fn Runtime(comptime App: type) type {
                 .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
             });
             if (outcome.revocation_failed) {
-                try writeRemoteRevocationWarning(app, .grok_subscription);
+                try writeRemoteRevocationWarning(app, .grok_subscription, false);
             }
             try reconcileSubscriptionLogout(app, agent, .grok);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// Signs out of fx login locally, then revokes the session at the
@@ -378,19 +395,20 @@ pub fn Runtime(comptime App: type) type {
             var revocation: ?auth_runtime.RemoteRevocation = if (local.session) |session| .{ .fx_login = session } else null;
             defer if (revocation) |pending| releaseRemoteRevocation(pending);
             try applyLogoutResult(app, local.result);
-            try startRemoteRevocation(app, &revocation);
+            try startRemoteRevocation(app, &revocation, local.kept);
         }
 
         /// The local sign-out is already done. Revoking the session at its
         /// issuer can take seconds, so it runs off the input loop, and a
         /// failure is reported when `collectRemoteRevocationFacts` sees it.
         /// Takes `pending`, leaving null so the caller's release skips it.
-        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation) !void {
+        /// `kept` says whether its tokens are kept to revoke later.
+        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation, kept: bool) !void {
             const revocation = pending.* orelse return;
             pending.* = null;
             const source = revocation.source();
-            if (!app.auth.beginRemoteRevocation(revocation)) {
-                try writeRemoteRevocationWarning(app, source);
+            if (!app.auth.beginRemoteRevocation(revocation, kept)) {
+                try writeRemoteRevocationWarning(app, source, kept);
             }
         }
 
@@ -405,18 +423,24 @@ pub fn Runtime(comptime App: type) type {
         /// Reports a remote revocation that finished with a failure.
         pub fn collectRemoteRevocationFacts(app: *App) !void {
             while (app.auth.takeRemoteRevocation()) |outcome| {
-                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source);
+                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source, outcome.retry_kept);
             }
         }
 
-        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source) !void {
+        /// `retry_kept` says whether the tokens are kept, so fx revokes them
+        /// later (`pending_revocation`).
+        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source, retry_kept: bool) !void {
+            const grok = "The local Grok session was removed, but remote revocation could not be confirmed.";
+            const codex = "The local Codex session was removed, but remote revocation could not be confirmed.";
+            const retry_later = " " ++ pending_revocation.retry_later ++ ".";
             try writeAuthNotice(app, .{
                 .topic = "auth",
                 .tone = .warning,
-                .body = if (source == .grok_subscription)
-                    "The local Grok session was removed, but remote revocation could not be confirmed."
-                else
-                    login_flow.remote_revocation_warning,
+                .body = switch (source) {
+                    .grok_subscription => if (retry_kept) grok ++ retry_later else grok,
+                    .chatgpt_subscription => if (retry_kept) codex ++ retry_later else codex,
+                    else => if (retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning,
+                },
             });
         }
 
@@ -870,6 +894,17 @@ pub fn Runtime(comptime App: type) type {
                     cancelPromptRetryAfterAuth(app, agent);
                     debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
+                    // A request waits for this sign-in, and its saved login
+                    // may still work: it tries that login once now, and the
+                    // notice says how to try again.
+                    if (requestWaitsForSignIn(app)) if (expiredWhileWaitingNotice(sign_in_source, err)) |body| {
+                        debug_trace.logf("auth", "sign-in code expired; the waiting request tries its saved login source={t}", .{sign_in_source});
+                        try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                        if (comptime @hasDecl(@TypeOf(agent.worker), "requestRecoverySignInClosed")) {
+                            agent.worker.requestRecoverySignInClosed();
+                        }
+                        return;
+                    };
                     try writeLoginError(app, sign_in_source, err);
                 },
                 .succeeded => |completed| {
@@ -1061,6 +1096,11 @@ pub fn Runtime(comptime App: type) type {
                 .clear_key => {
                     if (try rejectProviderDefinitionMutation(app, agent)) return;
                     const definition = app.provider_selection.definitions.get(target.label()) orelse return;
+                    if (definition.auth == .bearer) {
+                        configured_provider_key.remove(app.alloc, definition.auth.bearer) catch |err| {
+                            debug_trace.logf("auth", "provider key clear failed env={s} err={s}", .{ definition.auth.bearer, @errorName(err) });
+                        };
+                    }
                     _ = try config_runtime.setUserPreferences(app.alloc, .{ .provider_definition = .{
                         .name = definition.id,
                         .protocol = @tagName(definition.protocol),
@@ -1085,6 +1125,13 @@ pub fn Runtime(comptime App: type) type {
                     if (try rejectProviderDefinitionMutation(app, agent)) return;
                     const name = try app.alloc.dupe(u8, target.label());
                     defer app.alloc.free(name);
+                    if (app.provider_selection.definitions.get(name)) |definition| {
+                        if (definition.auth == .bearer) {
+                            configured_provider_key.remove(app.alloc, definition.auth.bearer) catch |err| {
+                                debug_trace.logf("auth", "provider key removal failed env={s} err={s}", .{ definition.auth.bearer, @errorName(err) });
+                            };
+                        }
+                    }
                     _ = config_runtime.setUserPreferences(app.alloc, .{ .remove_provider = name }) catch |err| {
                         debug_trace.logf("provider", "provider remove failed err={s}", .{@errorName(err)});
                         try app.writeDomainNotice(.{
@@ -1154,6 +1201,34 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(base_url);
             const protocol = try app.alloc.dupe(u8, draft.protocol);
             defer app.alloc.free(protocol);
+            // The key never goes into the settings file: that file records the
+            // environment variable name, and the key goes to the platform
+            // credential store under that name where one is available.
+            const key_env = try settings_store.providerKeyEnvName(app.alloc, name);
+            defer app.alloc.free(key_env);
+            const key_store = configured_provider_key.store(app.alloc, key_env, draft.key) catch |err| {
+                debug_trace.logf("auth", "add provider key store failed env={s} err={s}", .{ key_env, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = try app.alloc.print(
+                        "The key for {s} could not be stored. Set {s} in your environment, then try again.",
+                        .{ name, key_env },
+                    ),
+                }, true);
+                app.auth.cancelAddProvider(app.alloc);
+                return;
+            };
+            if (key_store == .environment_required) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = try app.alloc.print(
+                        "Saved {s} without a credential store. Set {s} in your environment before using it.",
+                        .{ name, key_env },
+                    ),
+                }, true);
+            }
             _ = config_runtime.setUserPreferences(app.alloc, .{
                 .provider_definition = .{
                     .name = name,
@@ -1568,6 +1643,20 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Refuses an action that takes a sign-in's lock on the input loop,
+        /// such as a logout or a team change, while a refresh nothing waits
+        /// for may hold it (`auth_runtime.Runtime.signInRefreshFinishing`).
+        fn rejectFinishingSignInRefresh(app: *App) !bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "signInRefreshFinishing")) return false;
+            if (!app.auth.signInRefreshFinishing()) return false;
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "A sign-in refresh is still finishing. Try again in a moment.",
+            }, true);
+            return true;
+        }
+
         fn beginPreparation(app: *App, input: auth_runtime.ProviderPreparationInput) !void {
             app.auth.beginProviderPreparation(app.alloc, input) catch |err| {
                 debug_trace.logf("provider", "preparation start failed err={s}", .{@errorName(err)});
@@ -1578,21 +1667,14 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try app.alloc.print("Preparing {s}.", .{provider_catalog.label(input.target())});
-            defer app.alloc.free(body);
-            try app.writeDomainNotice(.{
-                .topic = "provider",
-                .tone = .neutral,
-                .body = body,
-            }, true);
         }
 
         pub fn collectProviderPreparationFacts(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasDecl(@TypeOf(app.auth), "takeProviderPreparation") or host_target.is_wasm) return;
             if (pendingPromptNeedsAdoption(app, agent)) return;
-            const task = app.auth.takeProviderPreparation() orelse return;
-            defer task.deinit();
-            if (task.cancel_requested.load(.seq_cst)) {
+            // A cancelled preparation ends at once, even one in the middle of
+            // a sign-in refresh, which keeps running until it saves the login.
+            if (app.auth.takeCancelledProviderPreparation()) {
                 holdPromptAfterPreparationFailure(app, agent);
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1601,6 +1683,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            const task = app.auth.takeProviderPreparation() orelse return;
+            defer task.deinit();
             const applied = switch (task.input.intent) {
                 .provider => try finishProviderSwitch(app, agent, task),
                 .team => try finishTeamPreparation(app, agent, task),
@@ -1680,11 +1764,21 @@ pub fn Runtime(comptime App: type) type {
                 .catalog => |catalog| catalog,
                 .failure => |failure| {
                     debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                    // A connection fx could not make is named as one.
+                    const unreachable_body = if (failure.category == .transport)
+                        try app.alloc.print("{s}fx couldn't connect to {s} to load {s}. Check your network connection or firewall. The current provider is unchanged.", .{
+                            if (intent == .post_oauth) "Subscription sign-in completed, but " else "",
+                            model_catalog.serviceName(target),
+                            if (intent == .post_oauth) "its model catalog" else "the target provider catalog",
+                        })
+                    else
+                        null;
+                    defer if (unreachable_body) |body| app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = switch (failure.category) {
-                            .cancellation => "Model loading was cancelled. The saved provider is available in /provider.",
+                        .body = unreachable_body orelse switch (failure.category) {
+                            .cancellation => "Provider switching was cancelled. The current provider is unchanged.",
                             .authentication => "The provider rejected its API key. Open /provider and set a new key.",
                             .malformed_response => "The provider returned an invalid model list. Check its Base URL in /provider.",
                             else => providerFailureMessage(intent, "Could not load the provider's model list. Its configuration is saved; choose Refresh in /provider to retry.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
@@ -1938,6 +2032,7 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
             if (try rejectPendingPreparation(app)) return false;
+            if (try rejectFinishingSignInRefresh(app)) return false;
             if (try reject_provider_picker_if_busy(app, agent)) return false;
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
@@ -2001,15 +2096,22 @@ pub fn Runtime(comptime App: type) type {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
-            const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            // Read before the choice reloads the credential.
+            const body = if (teamInUse(app, team))
+                try app.alloc.print("Using Vercel team {s} ({s}).", .{ team.name, team.slug })
+            else
+                try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
-            if (validation == .rejected) {
+            if (validation == .rejected or validation == .catalog_unreachable) {
                 cancelPromptRetryAfterAuth(app, agent);
                 app.auth.closePicker(app.alloc);
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "The selected Vercel team could not be validated for AI Gateway. The current team is unchanged.",
+                    .body = if (validation == .catalog_unreachable)
+                        "fx couldn't connect to AI Gateway to validate the selected Vercel team. Check your network connection or firewall. The current team is unchanged."
+                    else
+                        "The selected Vercel team could not be validated for AI Gateway. The current team is unchanged.",
                 }, true);
                 return false;
             }
@@ -2036,7 +2138,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!try finishProviderSwitch(app, agent, task)) return false;
                     rememberCredentialSource(app, .fx_login);
                     app.auth.closePicker(app.alloc);
-                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+                    try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body, .detail = tokenPassOffer(app) }, true);
                     return true;
                 }
             }
@@ -2083,12 +2185,35 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .warning,
                 .body = "The Vercel team changed and a valid model was selected for this run, but the model preference could not be saved.",
             } else .{
-                .topic = "auth",
+                .topic = "",
                 .tone = .neutral,
                 .body = body,
+                .detail = tokenPassOffer(app),
             }, true);
             try resumePromptAfterAuth(app, agent);
             return true;
+        }
+
+        /// The Token Pass offer under the team notice, or "" when fx already
+        /// knows this team has an active Token Pass.
+        fn tokenPassOffer(app: *App) []const u8 {
+            if (comptime @hasField(App, "model_cache") and @hasDecl(@FieldType(App, "model_cache"), "tokenPassStatus")) {
+                if (app.model_cache.tokenPassStatus() == .active) return "";
+            }
+            return token_pass.offer_line;
+        }
+
+        /// Whether fx already sends with an fx login on this team, so choosing
+        /// it again changes nothing the user should hear about.
+        fn teamInUse(app: *App, team: anytype) bool {
+            if (comptime !@hasField(@TypeOf(app.auth), "selected_credential")) return false;
+            const credential = app.auth.selected_credential orelse return false;
+            if (credential.source != .fx_login) return false;
+            const current = credential.gatewayTeam() orelse return false;
+            if (comptime @hasField(@TypeOf(team), "id")) {
+                if (std.mem.eql(u8, current, team.id)) return true;
+            }
+            return std.mem.eql(u8, current, team.slug);
         }
 
         /// Sign-in launched from the inline `/provider` picker. Esc must close
@@ -2130,7 +2255,7 @@ pub fn Runtime(comptime App: type) type {
             return switch (fetched) {
                 .failure => |failure| result: {
                     debug_trace.logf("auth", "team catalog rejected category={t}", .{failure.category});
-                    break :result .rejected;
+                    break :result if (failure.category == .transport) .catalog_unreachable else .rejected;
                 },
                 .catalog => |catalog_value| result: {
                     const catalog = catalog_value;
@@ -2451,6 +2576,25 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The request that waits for a sign-in took a login another fx
+        /// process saved: the sign-in fx opened for it here, still waiting
+        /// for its code, is no longer needed.
+        pub fn closeRecoverySignInForStoredLogin(app: *App, source: credentials.Source) !void {
+            if (!app.auth.signInEntryActive()) return;
+            // A sign-in for another provider, which the user opened, stays.
+            if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) {
+                if (app.auth.pickerView().sign_in_source != source) return;
+            }
+            debug_trace.logf("auth", "sign-in closed: the waiting request took the login another fx saved, and this sign-in's device code is dropped", .{});
+            _ = app.auth.popPickerStage(app.alloc);
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .neutral,
+                .body = "Signed in from another fx session. Continuing with that login.",
+            });
+            app.shell.render_requests.request(.footer);
+        }
+
         fn recoverPromptCredentialRefreshFailure(app: *App, agent: *AppAgent, err: anyerror) !bool {
             const active_source = app.auth.credentialSource();
             const source = if (active_source) |active|
@@ -2462,6 +2606,15 @@ pub fn Runtime(comptime App: type) type {
 
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
+            if (config_runtime.sessionConnectionNotice(err)) |notice| {
+                // The session's custom connection changed or was removed in
+                // settings: a retry meets the same settings, so say what to
+                // do instead of recording a credential failure.
+                if (compactionOwnsCredentialFeedback(app, agent)) return false;
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = notice }, true);
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
             const failure = auth_runtime.classifyCredentialFailure(source, err);
             debug_trace.logf(
                 "auth",
@@ -2524,6 +2677,25 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
             }
+        }
+
+        /// The notice for a sign-in that expired while a request waited for
+        /// it, or null for any other failure, which keeps its usual notice.
+        fn expiredWhileWaitingNotice(source: credentials.Source, err: anyerror) ?[]const u8 {
+            return switch (source) {
+                .chatgpt_subscription => switch (err) {
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => "Codex sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+                .grok_subscription => switch (err) {
+                    error.GrokLoginTimedOut, error.LoginTimedOut => "Grok sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+                else => switch (err) {
+                    error.ExpiredToken, error.LoginTimedOut => "The Vercel sign-in code expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
+            };
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
@@ -2869,6 +3041,49 @@ const TestAuth = struct {
     inventory_refresh_fails: bool = false,
     prompt_refresh_start: auth_runtime.PromptCredentialRefreshStart = .not_needed,
     prompt_refresh_start_count: usize = 0,
+    /// The add-provider walk these tests drive, when they drive one.
+    add_provider_active: bool = false,
+
+    fn beginAddProvider(self: *TestAuth, _: std.mem.Allocator) bool {
+        self.add_provider_active = true;
+        return true;
+    }
+
+    fn beginAddProviderKey(self: *TestAuth, _: std.mem.Allocator, _: model_provider.ProviderId) !void {
+        self.add_provider_active = true;
+    }
+
+    fn addProviderFlowActive(self: *const TestAuth) bool {
+        return self.add_provider_active;
+    }
+
+    fn cancelAddProvider(self: *TestAuth, _: std.mem.Allocator) void {
+        self.add_provider_active = false;
+    }
+
+    fn deleteAddProviderByte(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn clearAddProviderField(_: *TestAuth) bool {
+        return false;
+    }
+
+    fn addProviderDraftView(_: *const TestAuth) ?auth_runtime.AddProviderProjection {
+        return null;
+    }
+
+    fn advanceAddProvider(_: *TestAuth, _: std.mem.Allocator) ?auth_runtime.AddProviderField {
+        return null;
+    }
+
+    /// Stores the connection names a reload found. The fixture has nowhere to
+    /// put them, so it accepts and drops them.
+    fn setConfiguredProviders(_: *TestAuth, _: std.mem.Allocator, _: []const []const u8) std.mem.Allocator.Error!void {}
+
+    fn appendAddProviderByte(_: *TestAuth, _: std.mem.Allocator, _: u8) !bool {
+        return true;
+    }
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
@@ -3184,6 +3399,8 @@ const TestApp = struct {
     } = .{},
     selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
+    /// The provider runtime a reload writes the new definitions into.
+    provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     input_runtime: @import("../input/runtime.zig").Runtime = .{},
     model_cache: TestModelCache = .{},
     model_cache_warmup_count: usize = 0,
@@ -3201,6 +3418,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.input_runtime.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
+        self.provider_selection.deinit();
     }
 
     pub fn startModelCacheWarmup(self: *TestApp) void {
@@ -3973,6 +4191,17 @@ test "manual compaction missing credentials preserves onboarding when it is enab
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "a session whose custom connection changed says what to do instead of offering a retry" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .configured;
+    try std.testing.expect(!try Runtime(TestApp).recoverCredentialFailure(&app, (&app).agent(), .configured, error.ConfiguredProviderChanged));
+    try std.testing.expect(app.auth.credential_failure == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "custom connection changed") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "retry") == null);
 }
 
 test "manual compaction credential failure leaves feedback to its lifecycle owner" {

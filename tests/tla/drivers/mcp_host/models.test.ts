@@ -2,6 +2,8 @@
 // planted bug, the stated properties the code breaks, repair witnesses), and
 // the trace bridge qualified both ways: a known-good trace per model is
 // ACCEPTED and a known-bad one REJECTED at the record that breaks it.
+// StoreLockBudget's and RefreshLease's traces are checked against rules, not
+// steps, so their known-bad traces VIOLATE the rule they break.
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { artifacts } from "../lib/context";
@@ -14,9 +16,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess, UrlRetry and MixedBuilds joined the four.
-  expect(count("smoke", "PASS")).toBe(8);
-  expect(count("stress", "PASS")).toBe(8);
+  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
+  // RefreshLease and McpRules joined the four.
+  expect(count("smoke", "PASS")).toBe(11);
+  expect(count("stress", "PASS")).toBe(11);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -27,9 +30,16 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it.
-  expect(count("finding", "FINDING")).toBe(2);
-  expect(count("repair", "PASS")).toBe(1);
+  // configs check it. McpRules' three are the code before the fix (each MCP
+  // path picked its rule set on its own, so in full access toolbox search and the
+  // open of a small server ignored deny rules, and every other MCP path still
+  // applied them). SignIn's five findings are fx before the check request
+  // (a login reported as signed in before the server took it, a refused login
+  // saved, a refused login another fx takes), the branch for an unreadable
+  // store answering a sign-in's check request first, and a failed refresh after a
+  // 401 read as a check that couldn't be made; its repair witness is the code.
+  expect(count("finding", "FINDING")).toBe(10);
+  expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
 const controls: { name: string; module: string; constants: Record<string, never> | Record<string, unknown>; good: TraceRecord[]; bad: TraceRecord[]; badAt: number }[] = [
@@ -68,10 +78,11 @@ const controls: { name: string; module: string; constants: Record<string, never>
   },
   {
     name: "sign-in", module: "SignIn",
-    constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false },
+    constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false, ObsCheckFirst: true },
     good: [
       { event: "login" }, { event: "authorize", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "open" } },
       { event: "callback", data: { login: 1, state: 1, kind: "get" } }, { event: "redeem", data: { login: 1 } },
+      { event: "check", data: { login: 1, result: "accept" } },
       { event: "signed_in", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "closed" } },
     ],
     // A code redeemed for a callback whose state fx never made.
@@ -127,6 +138,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
     ],
     badAt: 2,
   },
+  {
+    name: "MCP rules", module: "McpRules",
+    constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
+    good: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "shown" } },
+      { event: "mode", data: { mode: "auto" } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    // A tool a rule names, hidden on one path in full access.
+    bad: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "open_tool", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    badAt: 1,
+  },
 ];
 
 for (const c of controls) {
@@ -140,7 +167,51 @@ for (const c of controls) {
   }, 300_000);
 }
 
+test("bridge control (store lock budget): the known-good trace is ACCEPTED, and a waiter giving up on holders taking turns VIOLATES", async () => {
+  const constants = { ObsBudget: 10_000, ObsSlack: 2_000, ObsTolerance: 600 };
+  const dir = join(artifacts, "bridge", "StoreLockBudget");
+  const take = (p: string, at: number, started: number): TraceRecord => ({ event: "take", data: { p, at, started } });
+  const release = (p: string, at: number): TraceRecord => ({ event: "release", data: { p, at } });
+  // Three holders of 6 s in turn; the last waited 12 s, longer than its own 12 s would allow.
+  const good = [take("a", 0, 0), release("a", 6_000), take("b", 6_010, 0), release("b", 12_000), take("c", 12_010, 0), release("c", 18_000)];
+  // The capped wait the lease replaced: c gives up 12 s after its start while b holds the lock.
+  const bad = [take("a", 0, 0), release("a", 6_000), take("b", 6_010, 0), { event: "giveup", data: { p: "c", at: 12_000, started: 0 } }, release("b", 12_100)];
+  const g = await checkTrace({ module: "StoreLockBudget", records: good, constants, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "StoreLockBudget", records: bad, constants, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["GiveUpOnTime", "NoGiveUpOnLiveHolder"]);
+}, 300_000);
+
+test("bridge control (store lock budget): a hold of two 6 s calls stamped before each is ACCEPTED, and one stamped only when taken VIOLATES", async () => {
+  const constants = { ObsBudget: 10_000, ObsSlack: 2_000, ObsTolerance: 600 };
+  const dir = join(artifacts, "bridge", "StoreLockBudget-calls");
+  const take = (p: string, at: number, started: number): TraceRecord => ({ event: "take", data: { p, at, started } });
+  const good = [take("a", 0, 0), { event: "stamp", data: { p: "a", at: 6_000 } }, { event: "release", data: { p: "a", at: 12_000 } }, take("b", 12_010, 1_000)];
+  const bad = [take("a", 0, 0), { event: "release", data: { p: "a", at: 12_000 } }];
+  const g = await checkTrace({ module: "StoreLockBudget", records: good, constants, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "StoreLockBudget", records: bad, constants, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken).toEqual(["HoldWithinBudget"]);
+}, 300_000);
+
+test("bridge control (refresh lease): going ahead behind a frozen holder on time is ACCEPTED, and going ahead 10 s in behind a live one VIOLATES", async () => {
+  const constants = { ObsRefreshMax: 30_000, ObsBudget: 10_000, ObsSlack: 2_000, ObsTolerance: 600 };
+  const dir = join(artifacts, "bridge", "RefreshLease");
+  const ev = (event: string, p: string, at: number, started?: number): TraceRecord => ({ event, data: started === undefined ? { p, at } : { p, at, started } });
+  // a sends its refresh at 100 and freezes; b, waiting since 50, goes ahead 2 s after a's 30 s step.
+  const good = [ev("take", "a", 0), ev("stamp", "a", 100), ev("freeze", "a", 200), ev("goahead", "b", 32_100, 50)];
+  // The fixed wait the lease replaced: b goes ahead 10 s after it started while a is still refreshing.
+  const bad = [ev("take", "a", 0), ev("stamp", "a", 100), ev("goahead", "b", 10_050, 50)];
+  const g = await checkTrace({ module: "RefreshLease", records: good, constants, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "RefreshLease", records: bad, constants, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["GoAheadOnTime", "NoGoAheadPastLiveRefresher"]);
+}, 300_000);
+
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {
-  const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false }, dir: join(artifacts, "bridge", "empty") });
+  const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false, ObsCheckFirst: true }, dir: join(artifacts, "bridge", "empty") });
   expect(v.verdict).toBe("INCONCLUSIVE");
 });

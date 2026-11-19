@@ -1,8 +1,27 @@
 const types = @import("../../core/shared/types.zig");
 const terminal = @import("terminal.zig");
+const host_link = @import("../../core/hosts/js_host_link.zig");
 
-extern "fx" fn fx_term_size(cols: *u16, rows: *u16) void;
-extern "fx" fn fx_term_poll_input(timeout_ms: i32) i32;
+fn fx_term_size_unlinked(cols: *u16, rows: *u16) callconv(.c) void {
+    _ = .{ cols, rows };
+    unreachable;
+}
+
+fn fx_term_poll_input_unlinked(timeout_ms: i32) callconv(.c) i32 {
+    _ = timeout_ms;
+    unreachable;
+}
+
+const fx_term_size = host_link.declare(
+    "fx_term_size",
+    *const fn (*u16, *u16) callconv(.c) void,
+    fx_term_size_unlinked,
+);
+const fx_term_poll_input = host_link.declare(
+    "fx_term_poll_input",
+    *const fn (i32) callconv(.c) i32,
+    fx_term_poll_input_unlinked,
+);
 
 pub const Size = struct {
     cols: u16,

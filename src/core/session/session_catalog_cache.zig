@@ -7,6 +7,7 @@
 //! A missing, corrupt, or older-version index is ignored, and every session
 //! is classified from its directory, which remains the only authority.
 const std = @import("std");
+const posix_symbols = @import("../shared/posix_symbols.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const child_state = @import("../subagent/child_state.zig");
@@ -269,7 +270,7 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     for ([_][]const u8{ "session.json", "events.jsonl", "authority.json", "authority.pending.json", "display.json" }) |name| {
         const path = try std.mem.print(&path_buffer, "{s}/{s}", .{ id, name });
         if (try statOptional(dir, path)) |stat| {
-            if (stat.kind != .file or stat.nlink != 1) return null;
+            if (!io_mod.isSingleLinkRegularFile(stat.kind, stat.nlink)) return null;
             digest.update(&.{1});
             addStat(&digest, stat);
         } else digest.update(&.{0});
@@ -283,7 +284,7 @@ fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
         for ([_][]const u8{ "owner.json", "control.json" }) |name| {
             const path = try std.mem.print(&path_buffer, "{s}/subagent/{s}", .{ id, name });
             if (try statOptional(dir, path)) |marker| {
-                if (marker.kind != .file or marker.nlink != 1) return null;
+                if (!io_mod.isSingleLinkRegularFile(marker.kind, marker.nlink)) return null;
                 digest.update(&.{1});
                 addStat(&digest, marker);
             } else digest.update(&.{0});
@@ -502,7 +503,6 @@ pub fn listActionableCatalog(
     return catalog;
 }
 
-extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "catalog cache ignores a FIFO without blocking" {
     if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
@@ -513,7 +513,7 @@ test "catalog cache ignores a FIFO without blocking" {
     defer alloc.free(root);
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, file_name }, 0);
-    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    if (posix_symbols.mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
     // Reading a FIFO waits for a writer that never comes; the index is ignored.

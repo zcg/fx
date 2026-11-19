@@ -1,0 +1,34 @@
+# Line endings for every checkout, on every platform.
+#
+# The upstream repository stores source files with LF. This profile builds fx
+# on native Windows, where core.autocrlf=true rewrites the working tree to CRLF
+# and makes every file look modified while its content is unchanged. Pin the
+# working tree to LF everywhere so a diff shows real edits only.
+#
+# This file wins over core.autocrlf, so a clone on Windows and a clone on Linux
+# or macOS agree byte for byte.
+
+* text=auto eol=lf
+
+# Recorded data and media keep their own bytes: no conversion either way.
+*.bin binary
+*.gz binary
+*.png binary
+*.caf binary
+*.m4a binary
+
+# Saved-session fixtures are replayed sessions. Their JSON, JSONL, log, and
+# lock files are compared and re-read as recorded, so hold them byte for byte.
+tests/fixtures/** -text
+
+# The TLA+ models and their TLC configurations are read verbatim by the model
+# checkers, and the traces are generated and compared as text.
+tests/tla/** text eol=lf
+
+# Shell scripts run under sh, dash, bash, and zsh in CI. A CRLF script fails
+# with "bad interpreter" on Linux, so they are stored and checked out with LF.
+*.sh text eol=lf
+
+# The upstream repository stores these three files with LF, but an earlier local
+# commit on this Windows copy checked them in with CRLF. Keeping them as plain
+# text lets this branch's history normalize them back to LF on the next touch.

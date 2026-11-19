@@ -307,8 +307,9 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `runtime_context` (D94), `turn_end` (files and
-  turn summary), `interruption` (reason detail, partial text, command
+  `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
+  `mcp_bridge_call` (D99), `cancelled_command` (D100), `turn_end` (files
+  and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery` and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
@@ -888,9 +889,10 @@ Settled while wiring side files, `fx sessions` and doctor (2026-09-28):
   process (D26), and the converter is its own step. **Alternative:** build
   the converter now, or run v1's migration from a v2 process.
 - **D36 Decision:** with v2 on, `fx doctor` verifies up to 64 sessions,
-  v1's bound, says when it stopped early, and reports damage, and removes
-  only side folders whose session is gone (D27), as v1's doctor removes
-  stray temporary files. A folder changed in the last 24 hours stays: a new session keeps side files
+  v1's bound, says when it stopped early, and reports damage. It finds
+  only side folders whose session is gone (D27) and removes them only
+  with `fx doctor --fix`; without it, doctor says how many `--fix` would
+  remove. A folder changed in the last 24 hours stays: a new session keeps side files
   (an attached image) before its first turn creates its log, so a young
   folder may still have an owner. It rebuilds nothing
   and forks nothing; `fx session recover` stays the way to salvage a
@@ -945,8 +947,8 @@ Settled on 2026-09-28:
   failed switch leaves the current session in place. While a switch is
   pending, the current session's turn may still end and its children may
   still finish, but no turn or child starts; the current session closes
-  only after its children are joined, and closing the next one instead
-  abandons the switch. **Why:** found by the trace check of `Wiring`:
+  only after its children are joined, which the switch stops first
+  (D97), and closing the next one instead abandons the switch. **Why:** found by the trace check of `Wiring`:
   every ACP switch in the E2E runs opened the next session first, which
   the spec's single session slot did not allow. **Alternative:** close the
   current session first, which leaves ACP without a session when the next
@@ -1071,6 +1073,9 @@ Settled after main's new compactor landed (2026-10-01):
   a side folder kept only for records, which D48 rules out. `Fork.tla`
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
+  Writes of one session run one at a time, so a subagent's finish line
+  written during main's compaction never lists the same records again
+  (`tests/tla/session/SessionWrite.tla`).
 
 Settled after the first dogfood finding (2026-10-01):
 - **D51 Decision:** the message that issues running calls keeps its text
@@ -1172,20 +1177,24 @@ Settled for `/fork` (2026-10-02):
   to the end of the previous turn under a new id and hard-links the
   blobs (D5), so the source is never written. The app switches to the
   fork as a resume does, opening it before it closes the source (D41),
-  writes `original session fx --resume` and the source's id in the
-  transcript, and puts the prompt back in the input box. The fork's title
+  writes `Resume the original session with:` and, on the line below,
+  `fx --resume` and the source's id after the replayed turns, so they stay
+  in view however long the session is, and puts the prompt back in the
+  input box. The fork's title
   is the source's with ` (fork)` once. `/fork` waits for a running turn
   to end. (Until D53 removed the switch, the line named `--sessions-v2`
   and `/fork` refused without it.)
   Subagent children and hosted terminals stay with the source, since the
-  fold counts children only after a fork point. The adapter adds two
+  fold counts children only after a fork point; since D97, the fork can
+  take a copy of each child. The adapter adds two
   calls: `forkPoints`, each turn's prompt and number, and
   `fork(before_turn, …)`. **Why:** the manager already forks at turn
   boundaries, so the feature adds no format and no new way to write a
   log. **Alternative:** fork after the chosen turn's reply; or copy the
   log in fx instead of the manager. `Fork.tla` models the manager's fork
   at a boundary with blob links. `Wiring.tla` gains `Fork`:
-  between turns and with no child running, a session that never existed
+  between turns, also while a child of the source runs, which the switch
+  then stops (D97), a session that never existed
   becomes the one to switch to, and the source is not written
   (`ForkIsNewSession`, `ForkLeavesSource`, `ForkBetweenTurns`).
   `trace/check_wiring_traces.py` checks the `wiring` traces of `/fork`
@@ -1247,7 +1256,29 @@ Settled for the converter (2026-10-06):
   82% of a real profile) convert too, through v1's older reader; a slow
   one shows the slow notice. So do v1 folders an old release left
   world-readable (0755), which today's v1 refuses: others could only read
-  them, the v2 copy is private, and the readable v1 copy is deleted. `--resume last` picks the newest of the
+  them, the v2 copy is private, and the readable v1 copy is deleted. A
+  member folder others can write, or one with a file or folder directly
+  in it or directly in its `subagent` folder that others can write (its
+  `session.json`, `events.jsonl`, `permissions.json`, lock file,
+  `subagent` folder, `children.json`, relationship index and child
+  markers, and side folders), is not taken (2026-11-16): those files have
+  no digest, so fx could not tell a change from what it saved. Every
+  command gives the same reason: what others can write ("its folder" or
+  the entry's name, written terminal-safe), for a subagent's folder its
+  id, and the fix `chmod -R go-w ~/.fx/sessions/{id}` (`"$FX_HOME"` in
+  place of `~/.fx` when that is set), which needs no quoting since an id
+  holds only letters, digits, `.`, `-` and `_`. A name too long for the reason
+  is left out, not cut. `fx session {id}` and `fx session recover` refuse
+  it as unsafe storage (`DurablePathUnsafe`) with that reason; a
+  symlinked or FIFO folder too, without one. Conversion, `fx ask
+  --resume` and `fx doctor` report it unreadable with that reason, and
+  its v1 folder stays. The leftover v1 folder of a session v2 already
+  holds is kept, not reported. Files deeper in side folders are not
+  checked by mode, so opening a member reads two folders: salvage checks
+  a saved result against the digest its handle names (D74), and
+  conversion copies them as they are. Only mode bits are read, not access
+  control lists, as for all of fx's private state, and a group that holds
+  only the owner counts as others. `--resume last` picks the newest of the
   merged listing. `fx session {id}` shows an unconverted v1 session read
   only, without converting it. A converted session is a v2 session and
   behaves as one: nothing special for converted sessions. The slow notice
@@ -1710,33 +1741,195 @@ permission mode does not rewrite a cached prompt prefix):
   prompt for every model.
 
 Settled for named skills (2026-10-24, so naming a skill does not rewrite a
-cached prompt prefix):
+cached prompt prefix; revised 2026-11-09, so later turns send the skill turn
+as it was sent):
 - **D95 Decision:** the text of a skill the user names with `$name` rides
-  on that turn's user message, and the turn saves a short note in its
-  place.
+  on that turn's user message, and the turn saves it as sent.
   - **The turn:** fx loads the full text as before and adds it as a
     context note (D93) at the turn's first step boundary, after any note
     already there, so it joins the user's message. Every request of the
     turn sends it there, and the instructions stay as they were.
-  - **Saved:** the turn saves only the short note, opened by
-    `<fx-skill-used>`. It names the skills, says fx sent their full text
-    with that message, and says to load them again with the skill tool if
-    they still apply. Later turns and resumes send that note. A recovered
-    turn sends the full text again in the note's place.
+  - **Saved:** the turn saves the note with the full text, so later turns
+    and resumes send that turn's message exactly as the turn sent it. A
+    recovered turn keeps the note its checkpoint saved. A session an older
+    fx saved holds a short note opened by `<fx-skill-used>` in the text's
+    place; later turns send it as saved, and a turn recovered from such a
+    checkpoint sends the full text there again.
   - **Compaction:** when an in-turn compaction cuts the note, fx adds it
     again where the kept messages start, so the text still rides on the
-    turn's message and the turn still saves the short note.
+    turn's message.
 
   **Why:** the text sat in the instructions for one turn, so it rewrote the
   cached prefix twice: when it appeared and when it went. On the message,
-  the skill turn reads the whole conversation from the cache, and the next
-  turn pays again only from that message. In live runs of eleven model
-  families, every skill turn followed the skill, against ten of eleven with
-  the text in the instructions, and new tokens at those two requests fell
-  by about half. With the text gone and no note, one model took back its
-  earlier reply on the next turn, saying it had never loaded the skill.
-  **Alternative:** keep the full text in the conversation, which every
-  later request pays for, or keep it in the instructions.
+  the skill turn reads the whole conversation from the cache. In live runs
+  of eleven model families, every skill turn followed the skill, against ten
+  of eleven with the text in the instructions. Until the revision the turn
+  saved a short note in the text's place, so the next turn paid again from
+  that message. Anthropic models from 5.1 on bind each thinking block to
+  everything sent before it and reject or drop the block when that changes,
+  so the swap broke the skill turn's thinking on the next request: Fable 5.2
+  dropped it at the turn's first step. Keeping the text costs its tokens on
+  every later request, read from the cache, and keeps the whole conversation
+  cached for every family.
+  **Alternative:** swap the text for a short note on later turns, which
+  breaks that thinking check, or keep it in the instructions.
+- **D96 Decision:** every model call a turn's agent loop makes, its
+  retries, replays after a refreshed login, failed attempts and compactions
+  included, is saved with the turn as a `model_call`
+  item: when it settled, how long it took, what it was for, how it ended,
+  the provider, model and serving provider, the gateway's generation id or
+  the provider's response id, the finish or failure kind, a retry wait, and
+  the tokens. Ctrl+O shows each where it happened, live and after a resume.
+  The model never sees one.
+  - **Place:** a record keeps the tool step boundary of the call
+    (`after_tool_step_count`) and how many of the turn's steering messages
+    came before it (`after_steering_count`), both taken from the first save
+    after the call settles and kept from then on. A write puts a boundary's
+    records after its notes, before each steering message they don't
+    count, and before the step's pieces, so every write of a turn only adds
+    to the end and a streamed turn keeps its prefix, also when a message
+    such as a subagent's report arrives after a saved call
+    (`tests/tla/full_detail/FullDetailLog.tla` AppendOnly). A replay shows
+    a step's failed attempts before its text and the call that wrote it
+    after (`FullDetailOrder.tla` ReplayMatchesSaved).
+  - **Compaction:** an in-turn cut, and a resume's view after one, leaves
+    out the records of the steps it covers and counts the rest from the
+    cut, as it does steering (`history_range.rebasedModelCalls`).
+  - **Reading:** a record is read with its unknown fields ignored, and one
+    whose strings aren't short, valid UTF-8 without control characters, or
+    whose numbers are out of range, is left out with a trace line, so a
+    record never fails a session. A v1 log never holds one.
+  - **Older fx:** an fx from before D96 leaves the item out (D17).
+  - **Not yet:** calls made inside tools, such as web search and image
+    descriptions, and the permission reviewer's calls have no record.
+
+  **Why:** the generation id is what support and billing ask for, and a call
+  record kept only in memory was gone after a restart, so Ctrl+O showed
+  ids only for the session's newest live calls, all at the top of its first
+  page. Saving them with the turn costs one short line per call.
+  **Alternative:** keep records in memory only, or in a separate file,
+  which a resume and a fork would have to join back to their turns.
+- **D97 Decision:** a session switch keeps the session's subagents, and
+  `/fork` can take a copy of each of them.
+  - **Switch:** `/fork`, `/resume`, `/new`, `/clear` and `/reset` stop the
+    session's subagents before its close joins their slot threads, as
+    `/close` and quit do (`stopSubagentsForSwitch`). Only the work they
+    have running ends, as cancelled and owing no report. None is closed
+    for good, so the session's log still lists them: reopened, it shows
+    them, and each takes new work with its history. A line in the session
+    the switch opens says how many tasks it stopped. Before, the close
+    joined a hosted child's slot thread while that thread waited for the
+    main loop to end its run, and the app froze. `Wiring.tla` gains the
+    one-threaded main loop: a close is `StartClose`, then `Close`, and
+    starts only once the children are joined (`StoppedFirst`), so a
+    started close always ends (`SwitchEnds`, under `LiveSpec`). The trace
+    check takes each `Close` line as both steps.
+  - **Fork:** when the session had subagents at the chosen prompt, the
+    menu asks once, `Bring N subagents into the fork?`: Enter or `y`
+    forks with a copy of each, `n` or Esc without. A subagent made after
+    that prompt is not offered, nor one closed for good, nor one whose
+    newest work there was lost, which had no log to copy (D33). Each copy is a
+    new child session of the fork whose lines are the child's own up to
+    the fork point, byte for byte, and the fork's first batch registers
+    each copy as one finished work item with the child's spawn data
+    (`openForkWithChildren`; `stateAt` reads the children as they stood at
+    the fork point). A child's turn can hold many work items, so its cut
+    is the time of the fork point's line, not a turn: a turn open there
+    ends in the copy as cancelled, as Esc ends one, and so does the copy's
+    registration. A copy's finish says it owes no report, so not even an
+    interrupted work wakes the fork. Every copy is on disk before the
+    fork, so the fork never names a copy that is missing and has all of
+    them or none. A failure before the fork is published deletes the
+    copies it made; a crash between
+    the copies and the fork can leave a copy no session names, which
+    nothing lists. That copy is not a spawned child of any session, so it
+    is outside `Subagents.tla`'s `NoOrphanChild`; writing the fork first
+    would instead leave the fork naming a copy that is missing. The source
+    and its children are never written. A child's own subagents are not
+    copied. A fork's copies are registered after the lines it copied, so
+    when a fork is itself forked at a point inside those lines, such as
+    before its first own prompt, `stateAt` gives it each copy whose source
+    child those lines show at that point, standing as that child stood
+    there. It traces a copy of a copy back through each `forked_from`, and
+    leaves out a copy whose trail is gone.
+  - **Why:** the switch fix sits in the one step all five commands share
+    and reuses `/close`'s stop. The copy is made by the manager, as a fork
+    is, so it adds no format beyond `forked_from` on a child, and stays
+    checkable byte for byte.
+  - **Alternative:** refuse to switch while a subagent works, which can
+    block a switch for hours; keep subagents running across the switch,
+    which needs a background lifecycle; let the fork own the source's
+    children, which two sessions would then write.
+  - **Models:** `ForkChildren.tla` models the question, the copies and the
+    registration (`OnlyEligible`, `CopyAtPoint`, `RegisteredExist`,
+    `AllOrNone`); a line written in the fork point's own millisecond after
+    the copy may fall on either side. `trace/ForkLog.tla` accepts a
+    child's copy that ends inside a turn only when its next line ends the
+    turn as cancelled, and checks its lines against the fork point's time.
+- **D99 Decision:** each call a command makes through `fx mcp call` and
+  the TUI shows as a row is saved, when it ends, as an `mcp_bridge_call`
+  item in the open turn:
+  `{"call_id":…,"request_id":…,"tool":…,"outcome":…}`, the shell call
+  whose command made it, the bridge's request id, the MCP tool's name, and
+  `completed`, `failed` or `cancelled`. It never holds the call's
+  arguments or its result. A resume shows the row again right after its
+  shell call's row, so the compact view groups it as it did live.
+  - **Write:** the item goes out on its own write, outside the streamed
+    pieces, as `tool_running` (D28) and `recovery` do, and that write takes
+    the session's lock as every write does
+    (`tests/tla/session/SessionWrite.tla` NoStaleRemoval). The shell call
+    is still running, so its turn is open. With no turn open, or when the
+    write fails, the row is logged as dropped and the call goes on.
+  - **Who writes:** only the TUI, which is the only host that shows the
+    rows. A subagent, ACP and `fx ask` save none.
+  - **Reading:** a record is read with its unknown fields ignored, and one
+    whose strings aren't short, valid UTF-8 without control characters, or
+    whose outcome this fx doesn't know, is left out with a trace line. A
+    record whose shell call the turn no longer holds, such as after a
+    compaction, shows no row. A turn closed as superseded loses its
+    records with it.
+  - **Interrupted turn:** when the user cancels a turn while the command
+    runs, the resume draws the cancelled command's row and the call's
+    rows after it, as live. A command that saved no output keeps its row
+    through D100.
+  - **Older fx:** an fx from before D99 leaves the item out (D17).
+
+  **Why:** the rows existed only in the live screen, so a resumed session
+  showed the command without the calls it made. The name and the outcome
+  are what the row shows, so nothing more is kept.
+  **Alternative:** save the arguments too, which can be large or hold
+  secrets; or carry the records in the turn's execution and save them
+  with the shell call's result, which reaches the agent loop and every
+  host's saved state for rows only the TUI shows.
+- **D100 Decision:** when the user cancels a turn while a command runs
+  and the command saved no output, such as one cancelled before it
+  printed anything, the turn saves a `cancelled_command` item right
+  before its `interruption`: `{"call_id":…}`, the call whose command was
+  cancelled. A resume then shows the command's row as live, with no
+  output under it. A command that saved output keeps its row through the
+  `interruption`'s replay and artifact refs as before, and gets no item.
+  - **Write:** the item goes out in the turn's commit, with the
+    `interruption` it comes before, so it takes the session's lock with
+    it (`tests/tla/session/SessionWrite.tla`). The `interruption` piece
+    keeps the same bytes.
+  - **Reading:** the replay keeps the call id until the `interruption`
+    ends the turn, and gives the turn a cancelled command with no output
+    only when the id is the turn's own call. An item it can't read, or
+    one for another call, is left out with a trace line, and the turn
+    reads as before D100.
+  - **Row:** the resumed row gets the live row's command text and label,
+    so the compact view shows the command by its short name, such as
+    `Cancelled touch, sleep`, never its full line.
+  - **Older fx:** an fx from before D100 leaves the item out (D17) and
+    shows the turn as before, with no command row.
+
+  **Why:** the `interruption` named only the saved output, so a command
+  that saved none left no trace of its row, and a resume showed only the
+  turn's cancellation.
+  **Alternative:** a new field in the `interruption` piece, which an
+  older fx's strict reader rejects with the whole session; or treating
+  every interrupted turn with a command call as a cancelled command,
+  which also gives rows to calls that never ran a command.
 
 ## Design Risks And Failure Behavior
 

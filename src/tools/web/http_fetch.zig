@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const net_connect = @import("../../core/shared/net_connect.zig");
 const select_watch = @import("../../core/shared/select_watch.zig");
 const url_policy = @import("url_policy.zig");
 
@@ -828,9 +829,9 @@ fn readResponse(
     errdefer body.deinit(alloc);
     const pending_body = received.items[final_head_end..];
     switch (framing) {
-        .no_body => {
-            if (pending_body.len > 0) return error.UnexpectedBodyForBodylessResponse;
-        },
+        // A 204 or 304 ends at its head (RFC 9112 section 6.3). Like bytes after a framed
+        // body, later bytes belong to no response, since each connection carries one request.
+        .no_body => {},
         .chunked => {
             var chunk_reader = BodyReader.init(reader, pending_body, options);
             try readChunkedBody(&chunk_reader, &body, alloc, cap);
@@ -1419,7 +1420,7 @@ fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
             continue;
         },
         .INPROGRESS, .AGAIN, .ALREADY => {
-            try pollFd(fd, posix.POLL.OUT, options);
+            try pollFd(fd, poll_out, options);
             try checkSocketError(fd);
             return fd;
         },
@@ -1470,9 +1471,32 @@ fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
     };
 }
 
+/// A socket for one fetch, close-on-exec and non-blocking from the moment it
+/// exists where `socket` takes those flags, as std's own sockets are. macOS
+/// takes neither, so there `fcntl` sets both right after it opens.
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
+    // `SOCK_CLOEXEC` and `SOCK_NONBLOCK` are POSIX flags that ask the kernel to
+    // create the socket already non-inheritable and non-blocking. Winsock has no
+    // such flags and no `fcntl` to add them afterwards: the socket it creates is
+    // non-inheritable already, and the non-blocking mode is set with
+    // `ioctlsocket`, which `net_connect.setNonblocking` performs. So Windows
+    // opens the socket plainly and takes that same follow-up path.
+    if (comptime builtin.target.os.tag == .windows) {
+        const fd = while (true) {
+            const rc = net_connect.openStreamSocket(family) catch |err| switch (err) {
+                error.AddressFamilyUnsupported => return error.AddressFamilyUnsupported,
+                error.SystemResources => return error.SystemResources,
+                else => return error.SocketOpenFailed,
+            };
+            break rc;
+        };
+        errdefer closeFd(fd);
+        try setNonblocking(fd);
+        return fd;
+    }
+    const flags: u32 = posix.SOCK.STREAM | if (std.Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const fd = while (true) {
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
+        const rc = posix.system.socket(family, flags, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
             .INTR => continue,
@@ -1484,12 +1508,15 @@ fn openSocket(family: posix.sa_family_t) !posix.fd_t {
         }
     };
     errdefer closeFd(fd);
-    try setCloexec(fd);
-    try setNonblocking(fd);
+    if (std.Io.Threaded.socket_flags_unsupported) {
+        try setCloexec(fd);
+        try setNonblocking(fd);
+    }
     return fd;
 }
 
 fn setCloexec(fd: posix.fd_t) !void {
+    if (comptime builtin.target.os.tag == .windows) return;
     while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
         .SUCCESS => return,
         .INTR => continue,
@@ -1498,6 +1525,9 @@ fn setCloexec(fd: posix.fd_t) !void {
 }
 
 fn setNonblocking(fd: posix.fd_t) !void {
+    if (comptime builtin.target.os.tag == .windows) {
+        return net_connect.setNonblocking(fd) catch error.SocketOptionFailed;
+    }
     const current = while (true) {
         const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
         switch (posix.errno(rc)) {
@@ -1669,31 +1699,76 @@ fn DeadlineWriter(comptime buffer_len: usize) type {
     };
 }
 
+/// The `MSG_NOSIGNAL` bit, which asks the kernel not to raise `SIGPIPE` when
+/// the peer is gone. Windows has no such signal and no such flag.
+const msg_nosignal: c_int = if (builtin.target.os.tag == .windows) 0 else posix.MSG.NOSIGNAL;
+
+/// The event bits a poll wait uses.
+///
+/// `std.posix.POLL` resolves through `ws2_32` on Windows, which declares no such
+/// type, so the values live in a declaration that build never analyzes. Zero is
+/// what Windows gets: the POSIX body that reads them is not built there either.
+const PollEvents = if (builtin.target.os.tag == .windows) struct {
+    const in: i16 = 0;
+    const out: i16 = 0;
+    const hup: i16 = 0;
+    const err: i16 = 0;
+    const nval: i16 = 0;
+} else struct {
+    const in: i16 = posix.POLL.IN;
+    const out: i16 = posix.POLL.OUT;
+    const hup: i16 = posix.POLL.HUP;
+    const err: i16 = posix.POLL.ERR;
+    const nval: i16 = posix.POLL.NVAL;
+};
+
+const poll_in: i16 = PollEvents.in;
+const poll_out: i16 = PollEvents.out;
+const poll_hup: i16 = PollEvents.hup;
+const poll_err: i16 = PollEvents.err;
+const poll_nval: i16 = PollEvents.nval;
+
 const PollError = posix.PollError || error{Interrupted};
 
-const Poller = struct {
+const Poller = if (builtin.target.os.tag == .windows) struct {
+    ctx: ?*anyopaque = null,
+} else struct {
     ctx: ?*anyopaque,
     poll_fn: *const fn (?*anyopaque, []posix.pollfd, i32) PollError!usize,
 };
 
-fn pollDefault(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
-    const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
+const pollDefault = if (builtin.target.os.tag == .windows) struct {
+    fn poll(_: ?*anyopaque, fds: anytype, timeout_ms: i32) PollError!usize {
+        _ = .{ fds, timeout_ms };
         return error.SystemResources;
-    const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .INTR => error.Interrupted,
-        .NOMEM => error.SystemResources,
-        .NETDOWN => error.NetworkDown,
-        .FAULT, .INVAL => unreachable,
-        else => |err| posix.unexpectedErrno(err),
-    };
-}
+    }
+}.poll else struct {
+    // Zig 0.17 has no `poll` on Windows: `std.c` resolves it through `ws2_32`,
+    // where neither the call nor its types exist. The Windows fetch path opens
+    // its socket through its own connector and never asks this poller, so this
+    // declaration is not analyzed there at all.
+    fn poll(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+        const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
+            return error.SystemResources;
+        const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => error.Interrupted,
+            .NOMEM => error.SystemResources,
+            .NETDOWN => error.NetworkDown,
+            .FAULT, .INVAL => unreachable,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
+}.poll;
 
-const default_poller: Poller = .{
-    .ctx = null,
-    .poll_fn = pollDefault,
-};
+const default_poller: Poller = if (builtin.target.os.tag == .windows)
+    .{}
+else
+    .{
+        .ctx = null,
+        .poll_fn = pollDefault,
+    };
 
 const SyscallErrorAction = union(enum) {
     retry,
@@ -1767,7 +1842,7 @@ fn rawReadWith(
     syscall: ReadSyscall,
 ) !usize {
     while (true) {
-        try pollFdWith(fd, posix.POLL.IN, options, poller);
+        try pollFdWith(fd, poll_in, options, poller);
         switch (syscall.read_fn(syscall.ctx, fd, buf)) {
             .count => |count| return count,
             .failure => |err| switch (classifyReadErrno(err)) {
@@ -1788,12 +1863,12 @@ fn rawWriteAll(fd: posix.fd_t, bytes: []const u8, options: FetchOptions) !void {
 fn rawWriteAllWith(fd: posix.fd_t, bytes: []const u8, options: FetchOptions, poller: Poller) !void {
     var written: usize = 0;
     while (written < bytes.len) {
-        try pollFdWith(fd, posix.POLL.OUT, options, poller);
+        try pollFdWith(fd, poll_out, options, poller);
         const rc = std.c.send(
             fd,
             bytes[written..].ptr,
             bytes.len - written,
-            @intCast(posix.MSG.NOSIGNAL),
+            msg_nosignal,
         );
         const errno = posix.errno(rc);
         if (errno != .SUCCESS) switch (classifyWriteErrno(errno)) {
@@ -1814,7 +1889,13 @@ fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
 }
 
 fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
-    while (true) {
+    // Every name in this body is POSIX: `pollfd`, `POLL`, and the poller's
+    // function type. Windows fetches through its own connector, which never
+    // asks this, so the body is dropped from that build.
+    if (comptime builtin.target.os.tag == .windows) {
+        _ = .{ fd, events, options, poller };
+        return error.Unsupported;
+    } else while (true) {
         var fds = [_]posix.pollfd{.{
             .fd = fd,
             .events = events,
@@ -1837,12 +1918,17 @@ fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller
 }
 
 fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
-    if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
-    if ((revents & events) != 0) return;
-    if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;
-    if ((revents & posix.POLL.ERR) != 0) return pollSocketError(fd);
-    if ((revents & posix.POLL.HUP) != 0) return error.UnexpectedClose;
-    return error.UnexpectedClose;
+    if (comptime builtin.target.os.tag == .windows) {
+        _ = .{ fd, events, revents };
+        return error.Unsupported;
+    } else {
+        if ((revents & poll_nval) != 0) return error.InvalidDescriptor;
+        if ((revents & events) != 0) return;
+        if (events == poll_in and (revents & poll_hup) != 0) return;
+        if ((revents & poll_err) != 0) return pollSocketError(fd);
+        if ((revents & poll_hup) != 0) return error.UnexpectedClose;
+        return error.UnexpectedClose;
+    }
 }
 
 fn pollSocketError(fd: posix.fd_t) !void {
@@ -2070,7 +2156,7 @@ test "web_fetch transfer encoding parser validates ordered coding members" {
     );
 }
 
-test "web_fetch bodyless response framing ignores fields and rejects pending body" {
+test "web_fetch bodyless response framing ignores fields" {
     try expectResponseBody(
         "HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\nContent-Length: 99\r\n\r\n",
         204,
@@ -2081,10 +2167,26 @@ test "web_fetch bodyless response framing ignores fields and rejects pending bod
         304,
         "",
     );
-    try expectResponseError(
-        error.UnexpectedBodyForBodylessResponse,
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nunexpected",
-    );
+}
+
+test "web_fetch bodyless response ends at its head however the bytes after it are split" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { head: []const u8, status: u16 }{
+        .{ .head = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", .status = 204 },
+        .{ .head = "HTTP/1.1 304 Not Modified\r\n\r\n", .status = 304 },
+    };
+    for (cases) |case| {
+        const wire = try alloc.print("{s}unexpected", .{case.head});
+        defer alloc.free(wire);
+        const whole = [_]usize{wire.len};
+        const at_head = [_]usize{ case.head.len, wire.len };
+        for ([_][]const usize{ &whole, &at_head }) |splits| {
+            var response = try readFuzzResponse(alloc, wire, splits, max_body_bytes);
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(case.status, @backingInt(response.status));
+            try std.testing.expectEqualStrings("", response.body);
+        }
+    }
 }
 
 test "web_fetch response parser consumes informational heads before final response" {
@@ -2697,6 +2799,9 @@ fn pipeBackedTlsBoundaryReader(
 }
 
 test "web_fetch TLS boundary completes self delimited response without reading eof" {
+    // The fixture builds a real pipe with `std.c.pipe`, which only POSIX
+    // has. A Windows build skips these instead of asking the linker for it.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var transport_reader: PlainDeadlineReader = undefined;
     var boundary_reader: ScriptedTlsBoundaryReader = undefined;
@@ -2721,6 +2826,9 @@ test "web_fetch TLS boundary completes self delimited response without reading e
 }
 
 test "web_fetch TLS boundary accepts clean close delimited eof" {
+    // The fixture builds a real pipe with `std.c.pipe`, which only POSIX
+    // has. A Windows build skips these instead of asking the linker for it.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var transport_reader: PlainDeadlineReader = undefined;
     var boundary_reader: ScriptedTlsBoundaryReader = undefined;
@@ -2742,6 +2850,9 @@ test "web_fetch TLS boundary accepts clean close delimited eof" {
 }
 
 test "web_fetch TLS boundary unwraps truncated close delimited eof" {
+    // The fixture builds a real pipe with `std.c.pipe`, which only POSIX
+    // has. A Windows build skips these instead of asking the linker for it.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var transport_reader: PlainDeadlineReader = undefined;
     var boundary_reader: ScriptedTlsBoundaryReader = undefined;
@@ -2822,6 +2933,9 @@ test "web_fetch response parser ignores pending bytes beyond content length" {
 }
 
 test "web_fetch TLS encrypted transport buffers satisfy stdlib minimums" {
+    // The fixture builds a real pipe with `std.c.pipe`, which only POSIX
+    // has. A Windows build skips these instead of asking the linker for it.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var reader: TlsDeadlineReader = undefined;
     reader.init(-1, .{});
@@ -2833,6 +2947,9 @@ test "web_fetch TLS encrypted transport buffers satisfy stdlib minimums" {
 }
 
 test "web_fetch TLS deadline reader fills internal buffer for zero length readVec" {
+    // The fixture builds a real pipe with `std.c.pipe`, which only POSIX
+    // has. A Windows build skips these instead of asking the linker for it.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
     defer closeFd(fds[0]);
@@ -3773,7 +3890,14 @@ test "web_fetch connect errno classification keeps terminal local failures out o
     }
 }
 
-const ScriptedPoller = struct {
+/// A poller that answers from a script, so a poll failure can be driven exactly.
+///
+/// Its `poll` takes a `pollfd` array, which does not exist on Windows, so the
+/// whole fixture is replaced by an empty type there. The tests that use it are
+/// POSIX-only for the same reason.
+const ScriptedPoller = if (builtin.target.os.tag == .windows) struct {
+    revents: i16 = 0,
+} else struct {
     result: enum { ready, interrupted_once, system_resources, network_down } = .ready,
     revents: i16 = 0,
     calls: usize = 0,
@@ -3808,17 +3932,17 @@ const ScriptedPoller = struct {
 
 test "web_fetch poll events preserve requested readiness and hangup semantics" {
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.ERR);
-    try classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.OUT | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.HUP);
+    try classifyPollEvents(-1, poll_in, poll_in | poll_hup);
+    try classifyPollEvents(-1, poll_in, poll_in | poll_err);
+    try classifyPollEvents(-1, poll_out, poll_out | poll_hup);
+    try classifyPollEvents(-1, poll_in, poll_hup);
     try std.testing.expectError(
         error.UnexpectedClose,
-        classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.HUP),
+        classifyPollEvents(-1, poll_out, poll_hup),
     );
     try std.testing.expectError(
         error.InvalidDescriptor,
-        classifyPollEvents(-1, posix.POLL.IN, posix.POLL.NVAL),
+        classifyPollEvents(-1, poll_in, poll_nval),
     );
 
     var sockets: [2]std.c.fd_t = undefined;
@@ -3828,44 +3952,47 @@ test "web_fetch poll events preserve requested readiness and hangup semantics" {
     defer closeFd(sockets[1]);
     try std.testing.expectError(
         error.UnexpectedClose,
-        classifyPollEvents(sockets[0], posix.POLL.IN, posix.POLL.ERR),
+        classifyPollEvents(sockets[0], poll_in, poll_err),
     );
 }
 
 test "web_fetch injected poll failures and arguments remain exact" {
+    // The test drives the poll path with a fabricated descriptor number,
+    // which only a POSIX `fd_t` can be.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var interrupted = ScriptedPoller{
         .result = .interrupted_once,
-        .revents = posix.POLL.IN,
+        .revents = poll_in,
     };
     try pollFdWith(
         42,
-        posix.POLL.IN,
+        poll_in,
         .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
         interrupted.poller(),
     );
     try std.testing.expectEqual(@as(usize, 2), interrupted.calls);
-    try std.testing.expectEqual(posix.POLL.IN, interrupted.observed_events);
+    try std.testing.expectEqual(poll_in, interrupted.observed_events);
 
     var resources = ScriptedPoller{ .result = .system_resources };
     try std.testing.expectError(error.SystemResources, pollFdWith(
         42,
-        posix.POLL.IN,
+        poll_in,
         .{},
         resources.poller(),
     ));
     try std.testing.expectEqual(@as(usize, 1), resources.calls);
-    try std.testing.expectEqual(posix.POLL.IN, resources.observed_events);
+    try std.testing.expectEqual(poll_in, resources.observed_events);
     try std.testing.expectEqual(@as(i32, 1000), resources.observed_timeout_ms);
 
     var network_down = ScriptedPoller{ .result = .network_down };
     try std.testing.expectError(error.NetworkDown, pollFdWith(
         42,
-        posix.POLL.OUT,
+        poll_out,
         .{},
         network_down.poller(),
     ));
     try std.testing.expectEqual(@as(usize, 1), network_down.calls);
-    try std.testing.expectEqual(posix.POLL.OUT, network_down.observed_events);
+    try std.testing.expectEqual(poll_out, network_down.observed_events);
 }
 
 fn noOpSignalHandler(_: posix.SIG) callconv(.c) void {}
@@ -3917,7 +4044,7 @@ test "web_fetch poll deadline is not extended by interrupted syscalls" {
 
     try std.testing.expectError(error.Timeout, pollFd(
         fds[0],
-        posix.POLL.IN,
+        poll_in,
         .{ .deadline = .{ .deadline_ms = deadline_ms } },
     ));
     const elapsed_ms = monotonicMillis() - started_ms;
@@ -3978,8 +4105,10 @@ const InterruptingRead = struct {
 };
 
 test "web_fetch interrupted socket read rechecks cancellation before retry" {
+    // As above: the descriptor is a number, which only POSIX has.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var cancel_flag: std.atomic.Value(bool) = .init(false);
-    var poller = ScriptedPoller{ .revents = posix.POLL.IN };
+    var poller = ScriptedPoller{ .revents = poll_in };
     var read = InterruptingRead{ .cancel_flag = &cancel_flag };
     var buf: [1]u8 = undefined;
 
@@ -3995,6 +4124,8 @@ test "web_fetch interrupted socket read rechecks cancellation before retry" {
 }
 
 test "web_fetch deadline reader drains bytes after hangup and then returns eof" {
+    // The fixture writes into a real pipe, which Windows does not have.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
     defer closeFd(fds[0]);
@@ -4020,6 +4151,9 @@ test "web_fetch deadline reader drains bytes after hangup and then returns eof" 
 }
 
 test "web_fetch deadline adapters retain invalid descriptor causes" {
+    // The fixture builds a real pipe with `std.c.pipe`, which only POSIX
+    // has. A Windows build skips these instead of asking the linker for it.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
     closeFd(fds[0]);
@@ -4045,6 +4179,27 @@ test "web_fetch deadline adapters retain invalid descriptor causes" {
     try std.testing.expectEqual(error.InvalidDescriptor, writer.err.?);
 }
 
+test "web_fetch sockets are close-on-exec and non-blocking from the start" {
+    // The test reads `FD_CLOEXEC` and `O_NONBLOCK` back with `fcntl`. A
+    // Windows socket has no such flags to read: it is non-inheritable from
+    // creation and its non-blocking mode lives in `FIONBIO`.
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
+    for ([_]posix.sa_family_t{ posix.AF.INET, posix.AF.INET6 }) |family| {
+        const fd = openSocket(family) catch |err| switch (err) {
+            error.AddressFamilyUnsupported => continue,
+            else => return err,
+        };
+        defer closeFd(fd);
+        const fd_flags = posix.system.fcntl(fd, posix.F.GETFD, @as(usize, 0));
+        try std.testing.expect(fd_flags >= 0);
+        try std.testing.expect(@as(usize, @intCast(fd_flags)) & posix.FD_CLOEXEC != 0);
+        const status = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        try std.testing.expect(status >= 0);
+        const nonblock: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+        try std.testing.expect(@as(usize, @intCast(status)) & nonblock != 0);
+    }
+}
+
 test "web_fetch closed peer write returns a cause without terminating process" {
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     var sockets: [2]std.c.fd_t = undefined;
@@ -4055,7 +4210,7 @@ test "web_fetch closed peer write returns a cause without terminating process" {
         return error.SocketShutdownFailed;
     closeFd(sockets[1]);
 
-    var poller = ScriptedPoller{ .revents = posix.POLL.OUT | posix.POLL.HUP };
+    var poller = ScriptedPoller{ .revents = poll_out | poll_hup };
     rawWriteAllWith(
         sockets[0],
         "x",

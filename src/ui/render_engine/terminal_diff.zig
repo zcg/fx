@@ -65,6 +65,8 @@ pub const FrameSinkWriteResult = union(enum) {
     complete,
     partial: struct {
         accepted_bytes: usize,
+        /// `error.TerminalHungUp` when the sink found the terminal hung up,
+        /// as `transcript/io.zig` writeFrameBytes does.
         err: anyerror,
     },
 };
@@ -820,12 +822,22 @@ fn recoverPartialFrame(
     };
     switch (cleanup_result) {
         .complete => {},
-        .partial => {
+        .partial => |partial| {
             debug_trace.logf(
                 "frame_commit",
-                "wire_frame bytes={d} accepted_bytes={d} applied_scroll_rows={d} cleanup={s}",
-                .{ wire_frame.len, accepted_write.accepted_bytes, accepted_write.applied_scroll_rows, @tagName(CleanupState.failed) },
+                "wire_frame bytes={d} accepted_bytes={d} applied_scroll_rows={d} cleanup={s} err={s}",
+                .{ wire_frame.len, accepted_write.accepted_bytes, accepted_write.applied_scroll_rows, @tagName(CleanupState.failed), @errorName(partial.err) },
             );
+            // The window is gone, so nothing can repair the frame: fx closes
+            // as a hang-up does.
+            if (partial.err == error.TerminalHungUp) {
+                debug_trace.logf(
+                    "frame_commit",
+                    "frame dropped: the terminal hung up during its write accepted_bytes={d} bytes={d}",
+                    .{ accepted_write.accepted_bytes, wire_frame.len },
+                );
+                return error.TerminalHungUp;
+            }
             return error.TerminalSyncRecoveryFailed;
         },
     }
@@ -1737,6 +1749,8 @@ const TestSink = struct {
     fail_after_prefix: ?usize = null,
     fail_after_scroll_rows: ?u16 = null,
     fail_on_call: ?usize = null,
+    /// Every write fails as a hung-up terminal's does.
+    hung_up: bool = false,
     invalid_progress: bool = false,
     write_calls: usize = 0,
 
@@ -1751,6 +1765,9 @@ const TestSink = struct {
     fn writeFrame(ctx: *anyopaque, _: *Metrics, bytes: []const u8) FrameSinkWriteResult {
         const self: *TestSink = @ptrCast(@alignCast(ctx));
         self.write_calls += 1;
+        if (self.hung_up) {
+            return .{ .partial = .{ .accepted_bytes = 0, .err = error.TerminalHungUp } };
+        }
         if (self.fail_on_call == self.write_calls) {
             return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestFrameWriteFailure } };
         }
@@ -1849,13 +1866,16 @@ test "an image overlay reaches the sink after the text frame commits" {
     var sink = TestSink{};
     defer sink.deinit(alloc);
 
+    // A one-pixel PNG is enough to carry through the frame; the test reads the
+    // escape sequence around it, not the picture.
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     const placements = [_]image_overlay_module.Placement{.{
         .row = 2,
         .column = 3,
         .columns = 12,
         .rows = 4,
         .image_id = 7,
-        .source = .{ .file = "C:\\shots\\a.jpg" },
+        .png = &png,
     }};
     const overlay = image_overlay_module.Overlay{
         .placements = &placements,
@@ -1865,12 +1885,11 @@ test "an image overlay reaches the sink after the text frame commits" {
     const result = try flush_test_frame(&previous, &sink, .{ .image_overlay = &overlay });
     try std.testing.expect(result.is_committed());
 
-    // The image bytes are a separate write, after the text, and they carry a
-    // file placement rather than a PNG payload.
+    // The image bytes are a separate write, after the text, and they carry the
+    // PNG payload itself rather than a path for the terminal to open.
     try std.testing.expect(sink.write_calls >= 2);
     const written = sink.bytes.items;
-    try std.testing.expect(std.mem.find(u8, written, "\x1b_Ga=T,q=2,i=7,c=12,r=4,C=1,t=f;") != null);
-    try std.testing.expect(std.mem.find(u8, written, "Qzpcc2hvdHNcYS5qcGc=") != null);
+    try std.testing.expect(std.mem.find(u8, written, "\x1b_Ga=T,f=100,q=2,i=7,c=12,r=4,C=1;") != null);
     try std.testing.expect(std.mem.find(u8, written, "\x1b8") != null);
 }
 
@@ -4389,6 +4408,28 @@ test "flushFrame cleanup rejection stops retry and row acknowledgment" {
         .sink = sink.frameSink(),
         .metrics = &metrics,
     }));
+    try std.testing.expectEqual(@as(usize, 2), sink.write_calls);
+}
+
+test "flushFrame closes as a hang-up when the terminal hung up during the write" {
+    var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer previous.deinit();
+    var surface = try makeSurface(std.testing.allocator, previous, testPlan());
+    defer surface.deinit();
+    var sink = TestSink{ .hung_up = true };
+    defer sink.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+
+    try std.testing.expectError(error.TerminalHungUp, flushFrame(.{
+        .previous = &previous,
+        .surface = &surface,
+        .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(surface.plan, .{ .include_transcript = true }),
+        .synchronized_update = true,
+        .scroll_plan = testScrollPlan(1),
+        .sink = sink.frameSink(),
+        .metrics = &metrics,
+    }));
+    // The frame and its cleanup were each written once.
     try std.testing.expectEqual(@as(usize, 2), sink.write_calls);
 }
 

@@ -1,13 +1,30 @@
 const std = @import("std");
+const host_link = @import("js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 const max_message_bytes: usize = 64 * 1024;
 const max_messages: usize = 64;
 const max_id_bytes: usize = 128;
 
-extern "fx" fn fx_steering_take(output_ptr: [*]u8, output_cap: usize) i32;
-extern "fx" fn fx_steering_close() void;
-extern "fx" fn fx_steering_state() i32;
+const fx_steering_take = host_link.declare("fx_steering_take", *const fn (output_ptr: [*]u8, output_cap: usize) callconv(.c) i32, fx_steering_take_unlinked);
+
+fn fx_steering_take_unlinked(output_ptr: [*]u8, output_cap: usize) callconv(.c) i32 {
+    _ = output_ptr;
+    _ = output_cap;
+    unreachable;
+}
+
+const fx_steering_close = host_link.declare("fx_steering_close", *const fn () callconv(.c) void, fx_steering_close_unlinked);
+
+fn fx_steering_close_unlinked() callconv(.c) void {
+    unreachable;
+}
+
+const fx_steering_state = host_link.declare("fx_steering_state", *const fn () callconv(.c) i32, fx_steering_state_unlinked);
+
+fn fx_steering_state_unlinked() callconv(.c) i32 {
+    unreachable;
+}
 
 pub fn close() void {
     fx_steering_close();

@@ -53,12 +53,16 @@ pub fn permissionsForMode(mode: std.posix.mode_t) std.Io.File.Permissions {
     return if (mode & 0o040 != 0) .default_dir else .default_file;
 }
 
-/// Reads the mode back for a caller that verifies what it created. Windows has
-/// no mode to report, so this answers zero rather than inventing one; callers
-/// gate the comparison on `modeIsEnforced`.
+/// Reads the mode back for a caller that verifies what it created.
+///
+/// Windows has no mode bits. The one thing it does carry is the READONLY
+/// attribute, which `permissionsForMode` sets for a mode with no owner write
+/// bit, so a caller asking whether the entry refuses writes still gets the
+/// right answer there. Every other bit is reported as zero rather than
+/// invented, and callers compare full modes only where `modeIsEnforced`.
 pub fn modeOf(permissions: std.Io.File.Permissions) std.posix.mode_t {
     if (comptime modeIsEnforced) return permissions.toMode() & 0o777;
-    return 0;
+    return if (@backingInt(permissions) & windows_readonly_attribute != 0) 0o400 else 0o600;
 }
 
 /// Whether the entry refuses writes. POSIX reads the mode's write bits, and
@@ -176,9 +180,22 @@ pub const Storage = struct {
         return s.openDir(parent, name);
     }
 
+    /// Opens `name` inside `parent`, refusing anything a link redirects out.
+    ///
+    /// POSIX passes `follow_symlinks = false`, and the kernel refuses a link on
+    /// its own. Windows cannot use that flag: a junction is how a package
+    /// manager's link farm, a user's own link, and a redirected profile folder
+    /// all present themselves, and a handle opened with `OPEN_REPARSE_POINT`
+    /// cannot even be statted (`STATUS_REPARSE_POINT_NOT_RESOLVED`). So the
+    /// component is opened with following allowed and the result is checked
+    /// instead: what it resolved to has to stay inside the directory the
+    /// component was found in.
     pub fn openDir(s: Storage, parent: Dir, name: []const u8) Error!Dir {
         try s.alive();
         assertComponent(name);
+        if (comptime builtin.target.os.tag == .windows) {
+            return .{ .handle = openDirRefusingOutside(s.io, parent, name) catch |err| return translate(err) };
+        }
         const handle = parent.handle.openDir(s.io, name, .{
             .iterate = true,
             .follow_symlinks = false,
@@ -233,9 +250,20 @@ pub const Storage = struct {
     }
 
     /// Opens an existing regular file. A symlink or a folder is Refused.
+    /// Opens `name` inside `dir` for reading, or for reading and writing.
+    ///
+    /// `follow_symlinks = false` is what refuses a link on POSIX. Windows has
+    /// no such flag for a file: the entry is asked about first, so a link is
+    /// refused before it is opened, and the open itself does not follow one.
     pub fn openFile(s: Storage, dir: Dir, name: []const u8, access: Access) Error!File {
         try s.alive();
         assertComponent(name);
+        if (comptime builtin.target.os.tag == .windows) {
+            // A missing name is reported by the open below, with the same
+            // translation, so the link check only has to answer for a name that
+            // is there.
+            if (isReparsePoint(s.io, dir, name) catch false) return error.Refused;
+        }
         const handle = dir.handle.openFile(s.io, name, .{
             .mode = switch (access) {
                 .read_only => .read_only,
@@ -365,15 +393,41 @@ pub const Storage = struct {
         if (hooks) if (s.fault) |f| try f.noteRename(s, old_dir, old_name, new_dir, new_name);
     }
 
+    /// Makes `name` refuse a write, which is what a blob is.
+    ///
+    /// On POSIX the file already carries `blob_mode`, so this has nothing to do.
+    /// On Windows Zig 0.17's `createFile` ignores `permissions` and its
+    /// `setFilePermissions` panics with TODO implement, so the READONLY
+    /// attribute is set here. It has to be set after the blob is under its
+    /// final name, because Windows cannot rename a READONLY file, and a blob is
+    /// written under a staging name and then moved to its hash.
+    pub fn makeReadOnly(s: Storage, dir: Dir, name: []const u8) Error!void {
+        try s.alive();
+        try s.mutate();
+        assertComponent(name);
+        if (comptime modeIsEnforced) return;
+        setReadOnlyAttribute(s.io, dir, name) catch |err| return translate(err);
+    }
+
     /// Hard link (fork blobs). Fails if the new name exists.
+    ///
+    /// Zig 0.17 reports `OperationUnsupported` for a directory hard link on
+    /// Windows, but the volume supports one: a fork's blob is the same bytes
+    /// under a second name, and copying them instead would double the space a
+    /// fork costs and lose the shared page cache. `CreateHardLinkW` is the call
+    /// std does not make, so it is made here.
     pub fn link(s: Storage, old_dir: Dir, old_name: []const u8, new_dir: Dir, new_name: []const u8) Error!void {
         try s.alive();
         try s.mutate();
         assertComponent(old_name);
         assertComponent(new_name);
-        Io.Dir.hardLink(old_dir.handle, old_name, new_dir.handle, new_name, s.io, .{
-            .follow_symlinks = false,
-        }) catch |err| return translate(err);
+        if (comptime builtin.target.os.tag == .windows) {
+            windowsCreateHardLink(s.io, old_dir, old_name, new_dir, new_name) catch |err| return translate(err);
+        } else {
+            Io.Dir.hardLink(old_dir.handle, old_name, new_dir.handle, new_name, s.io, .{
+                .follow_symlinks = false,
+            }) catch |err| return translate(err);
+        }
         if (hooks) if (s.fault) |f| try f.noteCreate(s, new_dir, new_name);
     }
 
@@ -381,6 +435,15 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
+        // Windows deletes a READONLY file only after its attribute is cleared,
+        // which is the one thing a POSIX mode carries that Windows keeps.
+        if (comptime !modeIsEnforced) {
+            if (s.stat(dir, name)) |entry| {
+                if (entry.mode & 0o200 == 0) {
+                    clearReadOnlyAttribute(s.io, dir, name) catch |err| return translate(err);
+                }
+            } else |_| {}
+        }
         dir.handle.deleteFile(s.io, name) catch |err| return translate(err);
     }
 
@@ -389,6 +452,12 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
+        // Windows refuses to delete a READONLY entry, and a session folder holds
+        // blobs, which are READONLY on purpose. The attribute is cleared through
+        // the tree first, so the delete below sees ordinary entries.
+        if (comptime !modeIsEnforced) {
+            clearReadOnlyTree(s.io, dir, name) catch |err| return translate(err);
+        }
         dir.handle.deleteTree(s.io, name) catch |err| return translate(err);
     }
 
@@ -405,7 +474,11 @@ pub const Storage = struct {
                 .directory => .directory,
                 else => .other,
             },
-            .mode = modeOf(st.permissions),
+            // Zig 0.17's Windows `statFile` leaves `Permissions` zeroed, so the
+            // READONLY attribute is read here instead. It is the one bit this
+            // module sets and reads back, and without it a blob would report
+            // itself writable.
+            .mode = if (comptime modeIsEnforced) modeOf(st.permissions) else attributeModeOf(s.io, dir, name) catch |err| return translate(err),
             .mtime_ms = st.mtime.toMilliseconds(),
         };
     }
@@ -451,6 +524,222 @@ fn assertComponent(name: []const u8) void {
     std.debug.assert(!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."));
 }
 
+/// Clears the READONLY attribute on `name` inside `dir` and on everything
+/// beneath it, so the tree can be deleted.
+///
+/// A name that is not there is left alone: the delete that follows reports it,
+/// and this pass exists only to remove an obstacle the delete cannot pass.
+fn clearReadOnlyTree(io: Io, dir: Dir, name: []const u8) !void {
+    clearReadOnlyAttribute(io, dir, name) catch return;
+    const opened = dir.handle.openDir(io, name, .{ .iterate = true, .follow_symlinks = true }) catch |err| switch (err) {
+        // A file, or a name that is not a folder, has no tree beneath it.
+        error.NotDir, error.FileNotFound => return,
+        else => return err,
+    };
+    const child: Dir = .{ .handle = opened };
+    defer child.handle.close(io);
+    var iterator = child.handle.iterate();
+    while (try iterator.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => clearReadOnlyTree(io, child, entry.name) catch {},
+            else => clearReadOnlyAttribute(io, child, entry.name) catch {},
+        }
+    }
+}
+
+/// Clears the READONLY attribute on `name` inside `dir`, so the entry can be
+/// renamed or deleted.
+fn clearReadOnlyAttribute(io: Io, dir: Dir, name: []const u8) !void {
+    const alloc = std.heap.page_allocator;
+    const path = try absoluteChildPath(alloc, io, dir, name);
+    defer alloc.free(path);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    if (win_file_attributes.SetFileAttributesW(wide, win_file_attributes.normal) == 0) {
+        // `ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND`.
+        return switch (win_file_attributes.GetLastError()) {
+            2, 3 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+}
+
+/// The mode a Windows entry reports, built from its file attributes.
+///
+/// `FILE_ATTRIBUTE_READONLY` is the only bit this module sets, so the answer is
+/// `0o400` for an entry that refuses writes and `0o600` for one that accepts
+/// them. Every other mode bit is reported as zero rather than invented.
+fn attributeModeOf(io: Io, dir: Dir, name: []const u8) !std.posix.mode_t {
+    const alloc = std.heap.page_allocator;
+    const path = try absoluteChildPath(alloc, io, dir, name);
+    defer alloc.free(path);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    const attributes = win_file_attributes.GetFileAttributesW(wide);
+    const invalid: u32 = 0xffffffff;
+    if (attributes == invalid) {
+        return switch (win_file_attributes.GetLastError()) {
+            2, 3 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+    return if (attributes & win_file_attributes.readonly != 0) 0o400 else 0o600;
+}
+
+/// Sets the READONLY attribute on `name` inside `dir`, which is how Windows
+/// makes a file refuse a write.
+fn setReadOnlyAttribute(io: Io, dir: Dir, name: []const u8) !void {
+    const alloc = std.heap.page_allocator;
+    const path = try absoluteChildPath(alloc, io, dir, name);
+    defer alloc.free(path);
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    if (win_file_attributes.SetFileAttributesW(wide, win_file_attributes.readonly) == 0) {
+        // `ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND`.
+        return switch (win_file_attributes.GetLastError()) {
+            2, 3 => error.FileNotFound,
+            else => error.Unexpected,
+        };
+    }
+}
+
+const win_file_attributes = if (builtin.target.os.tag != .windows) struct {} else struct {
+    /// `FILE_ATTRIBUTE_READONLY`: the attribute that makes a write fail.
+    const readonly: u32 = 0x1;
+    /// `FILE_ATTRIBUTE_NORMAL`, which clears every attribute that can be set
+    /// on its own, so it is what restoring an ordinary entry uses.
+    const normal: u32 = 0x80;
+    extern "kernel32" fn SetFileAttributesW(file_name: [*:0]const u16, attributes: u32) callconv(.winapi) i32;
+    extern "kernel32" fn GetFileAttributesW(file_name: [*:0]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+};
+
+/// Links `old_name` in `old_dir` to `new_name` in `new_dir` with
+/// `CreateHardLinkW`, which Zig 0.17's `Io.Dir.hardLink` does not reach on
+/// Windows.
+fn windowsCreateHardLink(
+    io: Io,
+    old_dir: Dir,
+    old_name: []const u8,
+    new_dir: Dir,
+    new_name: []const u8,
+) !void {
+    const alloc = std.heap.page_allocator;
+    const old_path = try absoluteChildPath(alloc, io, old_dir, old_name);
+    defer alloc.free(old_path);
+    const new_path = try absoluteChildPath(alloc, io, new_dir, new_name);
+    defer alloc.free(new_path);
+
+    const old_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, old_path);
+    defer alloc.free(old_wide);
+    const new_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, new_path);
+    defer alloc.free(new_wide);
+
+    if (win_hard_link.CreateHardLinkW(new_wide, old_wide, null) == 0) {
+        // `ERROR_ALREADY_EXISTS`, `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND`,
+        // and `ERROR_ACCESS_DENIED`, by their Win32 values.
+        return switch (win_hard_link.GetLastError()) {
+            183 => error.PathAlreadyExists,
+            2, 3 => error.FileNotFound,
+            5 => error.AccessDenied,
+            else => error.Unexpected,
+        };
+    }
+}
+
+/// The resolved path of `name` inside `dir`, so a link is created between the
+/// real entries rather than between whatever a link would have resolved to.
+fn absoluteChildPath(
+    alloc: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    name: []const u8,
+) ![]u8 {
+    const parent_path = try resolvedPathOf(alloc, io, dir);
+    defer alloc.free(parent_path);
+    return std.Io.Dir.path.join(alloc, &.{ parent_path, name });
+}
+
+const win_hard_link = if (builtin.target.os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn CreateHardLinkW(
+        new_file_name: [*:0]const u16,
+        existing_file_name: [*:0]const u16,
+        security_attributes: ?*anyopaque,
+    ) callconv(.winapi) i32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+};
+
+/// Opens `name` inside `parent` on Windows and refuses a link that leaves it.
+///
+/// The parent's resolved path is the anchor and the child's resolved path is
+/// what it is compared against: a link that redirects outside fails that
+/// comparison, and a junction that stays inside is opened normally, which is
+/// what a redirected profile folder and a package manager's link farm both
+/// need. Comparing resolved paths is what makes this work on a handle opened
+/// with `OPEN_REPARSE_POINT`, which `GetFinalPathNameByHandle` refuses.
+fn openDirRefusingOutside(io: Io, parent: Dir, name: []const u8) !Io.Dir {
+    // The name itself is refused when it is a link, whether or not the link
+    // stays inside: this module's contract is that nothing under the root is
+    // reached through one. That is a reparse point on Windows, and the
+    // attribute is on the entry rather than on what it resolves to, so the name
+    // is asked about before it is opened.
+    if (try isReparsePoint(io, parent, name)) return error.SymLinkLoop;
+
+    const opened = try parent.handle.openDir(io, name, .{ .iterate = true, .follow_symlinks = true });
+    errdefer opened.close(io);
+
+    // A link that arrived between the check and the open would still be caught
+    // here, because what it resolved to has to stay inside `parent`.
+    const alloc = std.heap.page_allocator;
+    const parent_path = try resolvedPathOf(alloc, io, parent);
+    defer alloc.free(parent_path);
+    const opened_path = try resolvedPathOf(alloc, io, .{ .handle = opened });
+    defer alloc.free(opened_path);
+
+    if (!pathIsInside(parent_path, opened_path)) return error.SymLinkLoop;
+    return opened;
+}
+
+/// Whether `name` inside `parent` is a reparse point, which is how Windows
+/// spells a symlink or a junction.
+///
+/// The file attribute is read from the directory entry, so the answer describes
+/// the name rather than whatever a link points at.
+fn isReparsePoint(io: Io, parent: Dir, name: []const u8) !bool {
+    const stat = try parent.handle.statFile(io, name, .{ .follow_symlinks = false });
+    return stat.kind == .sym_link;
+}
+
+/// The absolute, resolved path of an open directory.
+fn resolvedPathOf(alloc: std.mem.Allocator, io: Io, dir: Dir) ![]u8 {
+    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const length = try dir.handle.realPath(io, &buffer);
+    return alloc.dupe(u8, buffer[0..length]);
+}
+
+/// Whether `child` lies beneath `parent`, comparing whole path components.
+///
+/// Windows compares paths without regard to letter case, so a comparison that
+/// respected it would reject `C:\Users\Ann` against `c:\users\ann`, the
+/// same directory written two ways. A separator counts as a boundary, because a
+/// path can arrive with either one.
+fn pathIsInside(parent: []const u8, child: []const u8) bool {
+    if (child.len < parent.len) return false;
+    for (parent, child[0..parent.len]) |a, b| {
+        if (isPathSeparator(a) and isPathSeparator(b)) continue;
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    if (child.len == parent.len) return true;
+    // A parent that already ends at a separator ("C:\") has no boundary byte of
+    // its own to check; everything after it is beneath it.
+    if (parent.len == 0 or isPathSeparator(parent[parent.len - 1])) return true;
+    return isPathSeparator(child[parent.len]);
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == std.Io.Dir.path.sep or byte == '/' or byte == '\\';
+}
+
 fn translate(err: anyerror) Error {
     return switch (err) {
         error.FileNotFound => error.NotFound,
@@ -494,6 +783,10 @@ test "an I/O failure keeps its OS cause, and only unknown ones become Io (D29)" 
 }
 
 test "folders are 0700 and files are 0600" {
+    // Windows has no mode bits: a folder or file is protected by the ACL it
+    // inherits, and `setPermissions` there carries only the read-only
+    // attribute. The modes are asserted where the platform has them, and the
+    // kinds are asserted everywhere.
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
@@ -502,9 +795,17 @@ test "folders are 0700 and files are 0600" {
     defer s.closeDir(sub);
     const file = try s.createFile(sub, "log.jsonl");
     s.closeFile(file);
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(root, "session")).mode);
-    try testing.expectEqual(@as(std.posix.mode_t, file_mode), (try s.stat(sub, "log.jsonl")).mode);
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(root, "session")).mode);
+        try testing.expectEqual(@as(std.posix.mode_t, file_mode), (try s.stat(sub, "log.jsonl")).mode);
+    } else {
+        // A folder and a file a durable write creates are writable on
+        // Windows, so neither carries the READONLY attribute.
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(root, "session")).mode);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(sub, "log.jsonl")).mode);
+    }
     try testing.expectEqual(Kind.directory, (try s.stat(root, "session")).kind);
+    try testing.expectEqual(Kind.file, (try s.stat(sub, "log.jsonl")).kind);
 }
 
 test "a read-only file is written through its own handle and opens read-only only" {
@@ -512,17 +813,30 @@ test "a read-only file is written through its own handle and opens read-only onl
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
     const root = testRoot(&tmp);
-    const file = try s.createReadOnlyFile(root, "blob");
+    const file = try s.createReadOnlyFile(root, "blob.staged");
     try s.writeAt(file, "body", 0);
     try s.sync(file);
     s.closeFile(file);
+    // A blob is written under a staging name and renamed to its hash, which is
+    // the name it keeps. That is where the read-only state is applied on
+    // Windows: a READONLY file cannot be renamed, so the attribute is set once
+    // the final name exists. POSIX carries the mode with the inode, so the
+    // rename leaves it alone.
+    try s.rename(root, "blob.staged", root, "blob");
+    try s.makeReadOnly(root, "blob");
     try testing.expectEqual(@as(std.posix.mode_t, blob_mode), (try s.stat(root, "blob")).mode);
     try testing.expectError(error.Refused, s.openFile(root, "blob", .read_write));
     const again = try s.openFile(root, "blob", .read_only);
-    defer s.closeFile(again);
     var buffer: [4]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), try s.readAt(again, &buffer, 0));
     try testing.expectEqualStrings("body", &buffer);
+    s.closeFile(again);
+    // The temporary folder is removed after this test, and Windows will not
+    // delete a READONLY file, so the attribute is cleared here rather than
+    // leaving cleanup to fail.
+    if (comptime !modeIsEnforced) {
+        clearReadOnlyAttribute(s.io, root, "blob") catch {};
+    }
 }
 
 test "openRoot creates the root 0700 and refuses a symlinked root" {
@@ -539,13 +853,27 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
     const root = try s.openRoot(root_path);
     s.closeDir(root);
     const top: Dir = .{ .handle = tmp.dir };
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(top, "a")).mode);
+    // Windows protects these folders through the ACL they inherit, so there
+    // is no mode to read back; the folders still have to be folders.
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(top, "a")).mode);
+    } else {
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(top, "a")).mode);
+    }
     var a = try tmp.dir.openDir(io, "a", .{});
     defer a.close(io);
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = a }, "sessions")).mode);
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = a }, "sessions")).mode);
+    } else {
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(.{ .handle = a }, "sessions")).mode);
+    }
     var parent = try a.openDir(io, "sessions", .{});
     defer parent.close(io);
-    try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = parent }, "v2")).mode);
+    if (comptime modeIsEnforced) {
+        try testing.expectEqual(@as(std.posix.mode_t, folder_mode), (try s.stat(.{ .handle = parent }, "v2")).mode);
+    } else {
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), (try s.stat(.{ .handle = parent }, "v2")).mode);
+    }
 
     try tmp.dir.createDir(io, "real", .default_dir);
     try tmp.dir.symLink(io, "real", "linked", .{ .is_directory = true });

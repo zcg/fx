@@ -2,10 +2,11 @@ const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const host_stream = @import("host_stream_provider.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
+const host_link = @import("../core/hosts/js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 
-extern "fx" fn fx_http_request(
+const fx_http_request = host_link.declare("fx_http_request", *const fn (
     method_ptr: [*]const u8,
     method_len: usize,
     url_ptr: [*]const u8,
@@ -17,7 +18,34 @@ extern "fx" fn fx_http_request(
     status_out: *u16,
     response_ptr: [*]u8,
     response_cap: usize,
-) i32;
+) callconv(.c) i32, fx_http_request_unlinked);
+
+fn fx_http_request_unlinked(
+    method_ptr: [*]const u8,
+    method_len: usize,
+    url_ptr: [*]const u8,
+    url_len: usize,
+    headers_ptr: [*]const u8,
+    headers_len: usize,
+    body_ptr: [*]const u8,
+    body_len: usize,
+    status_out: *u16,
+    response_ptr: [*]u8,
+    response_cap: usize,
+) callconv(.c) i32 {
+    _ = method_ptr;
+    _ = method_len;
+    _ = url_ptr;
+    _ = url_len;
+    _ = headers_ptr;
+    _ = headers_len;
+    _ = body_ptr;
+    _ = body_len;
+    _ = status_out;
+    _ = response_ptr;
+    _ = response_cap;
+    unreachable;
+}
 
 pub const provider = model_catalog.Provider{ .fetch_fn = fetch };
 

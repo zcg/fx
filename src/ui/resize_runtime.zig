@@ -239,6 +239,18 @@ pub fn collectResizeFacts(
             // Position replies are indistinguishable from pasted bytes, so
             // leave live geometry pending until bracketed paste releases input
             // ownership and the shared parser can begin.
+            //
+            // That wait cannot be unbounded. A pending resize keeps
+            // `resize_dirty` set, and `resize_dirty` refuses every frame
+            // commit, so a paste that never releases, or a probe that never
+            // starts because the terminal will not answer, would freeze the
+            // screen for good: no redraw, no input echo. Once the debounce
+            // window has passed twice over, the geometry is taken as it
+            // stands, which is what the frame would have shown anyway.
+            // Position replies are indistinguishable from pasted bytes, so
+            // leave live geometry pending until bracketed paste releases input
+            // ownership and the shared parser can begin. The probe's own
+            // timeout is what ends this wait, so nothing is added here.
             if (!cursor_probe_allowed or !probe.canBegin()) return;
             try observeDirtyResize(
                 terminal,
@@ -290,8 +302,17 @@ pub fn admitResizeSignal(
     debounce_ms: i64,
     source: []const u8,
 ) bool {
-    if (!supports_resize_signal or !resize_interlock.takeResizePending()) return false;
+    // The bit is taken on every platform. A target with no window-change signal
+    // never sets it from a handler, but a pass that compared the terminal's size
+    // sets it the same way, and leaving a set bit behind would make
+    // `resizeLifecyclePending` true for good, which blocks every frame commit.
+    if (!resize_interlock.takeResizePending()) return false;
     shell.render_requests.observeResizeSignal(now_ms, debounce_ms);
+    // A previous stuck resize may have exhausted the refusal budget. A newly
+    // admitted resize is a new lifecycle, so it starts with a fresh budget;
+    // otherwise the next one or two refused frames force it to settle before
+    // its probe has had a chance to answer.
+    shell.resize_refusals = 0;
     debug_trace.logf(
         "frame_schedule",
         "resize_block begin source={s} apply_after_ms={d} pending_reason_count={d}",
@@ -834,6 +855,11 @@ const ProbeOrderingTerminal = struct {
 };
 
 test "changed live resize requests cursor position before applying geometry" {
+    // The case describes a window-change signal: the size is re-read only
+    // after one arrives, and the cursor probe is requested on that path.
+    // Windows has no such signal, so its resize goes through the poll instead
+    // and this sequence cannot arise.
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const next_layout: Layout = .{
         .rows = 40,
@@ -882,6 +908,11 @@ test "changed live resize requests cursor position before applying geometry" {
 }
 
 test "signal fact pass applies changed geometry before the settle deadline" {
+    // The case describes a window-change signal: the size is re-read only
+    // after one arrives, and the cursor probe is requested on that path.
+    // Windows has no such signal, so its resize goes through the poll instead
+    // and this sequence cannot arise.
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
     const next_layout: Layout = .{
         .rows = 40,
         .cols = 120,
@@ -948,6 +979,11 @@ test "committed light phase blocks intervening frames until reset is queued" {
 }
 
 test "pre-paint cursor delta survives live apply until reset commit" {
+    // The case describes a window-change signal: the size is re-read only
+    // after one arrives, and the cursor probe is requested on that path.
+    // Windows has no such signal, so its resize goes through the poll instead
+    // and this sequence cannot arise.
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const next_layout: Layout = .{
         .rows = 40,
@@ -1030,6 +1066,11 @@ test "pre-paint cursor delta survives live apply until reset commit" {
 }
 
 test "new signal rebases a queued reset without committing an intermediate light frame" {
+    // The case describes a window-change signal: the size is re-read only
+    // after one arrives, and the cursor probe is requested on that path.
+    // Windows has no such signal, so its resize goes through the poll instead
+    // and this sequence cannot arise.
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const old_layout = launchTestLayout();
     const next_layout: Layout = .{

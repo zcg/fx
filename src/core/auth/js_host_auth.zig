@@ -3,13 +3,14 @@ const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const host_link = @import("../hosts/js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 const max_response_bytes: usize = 64 * 1024;
 pub const max_session_bytes: usize = 64 * 1024;
 pub const max_revision_bytes: usize = 1024;
 
-extern "fx" fn fx_http_request(
+const fx_http_request = host_link.declare("fx_http_request", *const fn (
     method_ptr: [*]const u8,
     method_len: usize,
     url_ptr: [*]const u8,
@@ -21,17 +22,59 @@ extern "fx" fn fx_http_request(
     status_out: *u16,
     response_ptr: [*]u8,
     response_cap: usize,
-) i32;
+) callconv(.c) i32, fx_http_request_unlinked);
 
-extern "fx" fn fx_oauth_session_load(
+fn fx_http_request_unlinked(
+    method_ptr: [*]const u8,
+    method_len: usize,
+    url_ptr: [*]const u8,
+    url_len: usize,
+    headers_ptr: [*]const u8,
+    headers_len: usize,
+    body_ptr: [*]const u8,
+    body_len: usize,
+    status_out: *u16,
+    response_ptr: [*]u8,
+    response_cap: usize,
+) callconv(.c) i32 {
+    _ = method_ptr;
+    _ = method_len;
+    _ = url_ptr;
+    _ = url_len;
+    _ = headers_ptr;
+    _ = headers_len;
+    _ = body_ptr;
+    _ = body_len;
+    _ = status_out;
+    _ = response_ptr;
+    _ = response_cap;
+    unreachable;
+}
+
+const fx_oauth_session_load = host_link.declare("fx_oauth_session_load", *const fn (
     bytes_ptr: [*]u8,
     bytes_cap: usize,
     revision_ptr: [*]u8,
     revision_cap: usize,
     revision_len_out: *usize,
-) i32;
+) callconv(.c) i32, fx_oauth_session_load_unlinked);
 
-extern "fx" fn fx_oauth_session_commit(
+fn fx_oauth_session_load_unlinked(
+    bytes_ptr: [*]u8,
+    bytes_cap: usize,
+    revision_ptr: [*]u8,
+    revision_cap: usize,
+    revision_len_out: *usize,
+) callconv(.c) i32 {
+    _ = bytes_ptr;
+    _ = bytes_cap;
+    _ = revision_ptr;
+    _ = revision_cap;
+    _ = revision_len_out;
+    unreachable;
+}
+
+const fx_oauth_session_commit = host_link.declare("fx_oauth_session_commit", *const fn (
     bytes_ptr: [*]const u8,
     bytes_len: usize,
     expected_revision_ptr: [*]const u8,
@@ -39,12 +82,40 @@ extern "fx" fn fx_oauth_session_commit(
     revision_ptr: [*]u8,
     revision_cap: usize,
     revision_len_out: *usize,
-) i32;
+) callconv(.c) i32, fx_oauth_session_commit_unlinked);
 
-extern "fx" fn fx_oauth_session_remove(
+fn fx_oauth_session_commit_unlinked(
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
     expected_revision_ptr: [*]const u8,
     expected_revision_len: usize,
-) i32;
+    revision_ptr: [*]u8,
+    revision_cap: usize,
+    revision_len_out: *usize,
+) callconv(.c) i32 {
+    _ = bytes_ptr;
+    _ = bytes_len;
+    _ = expected_revision_ptr;
+    _ = expected_revision_len;
+    _ = revision_ptr;
+    _ = revision_cap;
+    _ = revision_len_out;
+    unreachable;
+}
+
+const fx_oauth_session_remove = host_link.declare("fx_oauth_session_remove", *const fn (
+    expected_revision_ptr: [*]const u8,
+    expected_revision_len: usize,
+) callconv(.c) i32, fx_oauth_session_remove_unlinked);
+
+fn fx_oauth_session_remove_unlinked(
+    expected_revision_ptr: [*]const u8,
+    expected_revision_len: usize,
+) callconv(.c) i32 {
+    _ = expected_revision_ptr;
+    _ = expected_revision_len;
+    unreachable;
+}
 
 pub const oauth_provider: oauth_transport.Provider = if (host_target.is_wasm)
     .{ .execute_fn = executeOAuthRequest }

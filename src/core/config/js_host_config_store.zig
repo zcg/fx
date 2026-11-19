@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_link = @import("../hosts/js_host_link.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -13,19 +14,45 @@ pub const SaveError = error{HostFailure};
 const initial_capacity = 256;
 const max_value_bytes = 16 * 1024;
 
-extern "fx" fn fx_config_get(
+const fx_config_get = host_link.declare("fx_config_get", *const fn (
     id_ptr: [*]const u8,
     id_len: usize,
     out_ptr: [*]u8,
     out_cap: usize,
-) i32;
+) callconv(.c) i32, fx_config_get_unlinked);
 
-extern "fx" fn fx_config_set(
+fn fx_config_get_unlinked(
+    id_ptr: [*]const u8,
+    id_len: usize,
+    out_ptr: [*]u8,
+    out_cap: usize,
+) callconv(.c) i32 {
+    _ = id_ptr;
+    _ = id_len;
+    _ = out_ptr;
+    _ = out_cap;
+    unreachable;
+}
+
+const fx_config_set = host_link.declare("fx_config_set", *const fn (
     id_ptr: [*]const u8,
     id_len: usize,
     value_ptr: [*]const u8,
     value_len: usize,
-) i32;
+) callconv(.c) i32, fx_config_set_unlinked);
+
+fn fx_config_set_unlinked(
+    id_ptr: [*]const u8,
+    id_len: usize,
+    value_ptr: [*]const u8,
+    value_len: usize,
+) callconv(.c) i32 {
+    _ = id_ptr;
+    _ = id_len;
+    _ = value_ptr;
+    _ = value_len;
+    unreachable;
+}
 
 /// Loads a host-owned configuration value. The caller owns the returned bytes.
 pub fn load(alloc: Allocator, id: []const u8) LoadError!?[]u8 {

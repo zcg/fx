@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../../tooling/toolbox.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
@@ -29,6 +30,10 @@ pub const Config = struct {
     model_prompt_overlay: ?[]const u8 = null,
     host_instructions: []const u8 = "",
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    /// The configured MCP servers the toolbox menu lists, by name.
+    toolbox_mcp_servers: []const []const u8 = &.{},
+    /// Built-in tools the toolbox menu lists instead of fx sending them.
+    toolbox_behind: []const []const u8 = &toolbox.default_behind,
     skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
@@ -51,6 +56,10 @@ pub const Config = struct {
     /// request that needs the user then waits for this flag or the cancel
     /// flag. Without it, such a request ends the turn.
     recovery_continue_flag: ?*std.atomic.Value(bool) = null,
+    /// Set by the same host when the sign-in it opened for a request that
+    /// waits for one closes without a new login, so the request tries the
+    /// saved login once more.
+    recovery_sign_in_closed_flag: ?*std.atomic.Value(bool) = null,
     review_enabled: bool = false,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
@@ -76,7 +85,6 @@ pub const Config = struct {
     /// persistent child. Internal assistant-authored delegations leave this
     /// false.
     current_prompt_is_root_authority: bool = false,
-    enforce_response_language: bool = true,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,

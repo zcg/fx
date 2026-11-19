@@ -1,7 +1,14 @@
 const std = @import("std");
 const host = @import("host.zig");
+const host_link = @import("js_host_link.zig");
 
-extern "fx" fn fx_clipboard_copy(text_ptr: [*]const u8, text_len: usize) i32;
+const fx_clipboard_copy = host_link.declare("fx_clipboard_copy", *const fn (text_ptr: [*]const u8, text_len: usize) callconv(.c) i32, fx_clipboard_copy_unlinked);
+
+fn fx_clipboard_copy_unlinked(text_ptr: [*]const u8, text_len: usize) callconv(.c) i32 {
+    _ = text_ptr;
+    _ = text_len;
+    unreachable;
+}
 
 pub const clipboard: host.Clipboard = .{ .copy_fn = copy };
 

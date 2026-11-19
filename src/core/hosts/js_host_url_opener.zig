@@ -1,7 +1,14 @@
 const std = @import("std");
 const host = @import("host.zig");
+const host_link = @import("js_host_link.zig");
 
-extern "fx" fn fx_open_url(url_ptr: [*]const u8, url_len: usize) i32;
+const fx_open_url = host_link.declare("fx_open_url", *const fn (url_ptr: [*]const u8, url_len: usize) callconv(.c) i32, fx_open_url_unlinked);
+
+fn fx_open_url_unlinked(url_ptr: [*]const u8, url_len: usize) callconv(.c) i32 {
+    _ = url_ptr;
+    _ = url_len;
+    unreachable;
+}
 
 pub const opener: host.UrlOpener = .{ .open_fn = open };
 

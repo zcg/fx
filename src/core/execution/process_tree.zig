@@ -5,6 +5,11 @@ const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// What delivering a signal can fail with. POSIX `kill(2)` and the Windows
+/// `TerminateProcess` edge report the same three outcomes, so one error set
+/// covers both.
+const SendError = error{ ProcessNotFound, PermissionDenied, Unexpected };
+
 const DarwinPipeIdentity = struct {
     handle: u64,
     peer_handle: u64,
@@ -99,6 +104,9 @@ const Identity = union(enum) {
 const TrackedProcess = struct {
     pid: std.posix.pid_t,
     identity: Identity,
+    /// A stop pass stopped this process, and this tracker has not killed or
+    /// resumed it since.
+    stopped: bool = false,
 };
 
 const ProcessSnapshot = struct {
@@ -170,8 +178,18 @@ const SystemSignalEffects = struct {
         return inspectSession(pid);
     }
 
-    fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
-        return std.posix.kill(pid, signal);
+    fn send(pid: std.posix.pid_t, signal: io_mod.Signal) SendError!void {
+        // Windows names a process by its id number, not by an opaque handle, and
+        // ends it with `TerminateProcess`, so the number goes to the helper the
+        // rest of the platform edge uses.
+        if (comptime builtin.target.os.tag == .windows) {
+            return io_mod.signalProcessNumber(io_mod.pidNumber(pid), signal) catch |err| switch (err) {
+                error.ProcessNotFound => error.ProcessNotFound,
+                error.AccessDenied => error.PermissionDenied,
+                error.Unexpected => error.Unexpected,
+            };
+        }
+        return std.posix.kill(pid, signal.posix());
     }
 };
 
@@ -308,20 +326,21 @@ pub const Tracker = struct {
         }
     }
 
-    pub fn signalAll(self: *Tracker, signal: std.posix.SIG) usize {
+    pub fn signalAll(self: *Tracker, signal: io_mod.Signal) usize {
         return self.signalProcessesChecked(signal, null).delivered;
     }
 
     /// Stops every tracked process, parents first, for a caller that kills
     /// some of them another way, such as by process group, before this
-    /// tracker kills the rest.
+    /// tracker kills the rest. That kill resumes any stopped process that
+    /// neither kill reached.
     pub fn stopAll(self: *Tracker) void {
         self.stopProcessesWith(null, SystemSignalEffects);
     }
 
     pub fn signalOutsideProcessGroup(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         preserved_group: std.posix.pid_t,
     ) usize {
         return self.signalProcessesChecked(signal, preserved_group).delivered;
@@ -329,7 +348,7 @@ pub const Tracker = struct {
 
     pub fn signalOutsideProcessGroupChecked(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         preserved_group: std.posix.pid_t,
     ) DeliverySummary {
         return self.signalProcessesChecked(signal, preserved_group);
@@ -337,7 +356,7 @@ pub const Tracker = struct {
 
     fn signalProcessesChecked(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         preserved_group: ?std.posix.pid_t,
     ) DeliverySummary {
         return self.signalProcessesWith(
@@ -349,12 +368,17 @@ pub const Tracker = struct {
 
     fn signalProcessesWith(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         preserved_group: ?std.posix.pid_t,
         comptime Effects: type,
     ) DeliverySummary {
-        if (signal == std.posix.SIG.KILL) self.stopProcessesWith(preserved_group, Effects);
-        return self.signalProcessesOnceWith(signal, preserved_group, Effects);
+        if (signal != .kill) {
+            return self.signalProcessesOnceWith(signal, preserved_group, Effects);
+        }
+        self.stopProcessesWith(preserved_group, Effects);
+        const summary = self.signalProcessesOnceWith(signal, preserved_group, Effects);
+        self.resumeStoppedWith(Effects);
+        return summary;
     }
 
     /// Stops every tracked process before a SIGKILL. A parent whose child
@@ -368,18 +392,18 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) void {
         var summary: DeliverySummary = .{};
-        if (self.root) |root| {
-            self.signalTrackedProcessWith(root, std.posix.SIG.STOP, preserved_group, &summary, Effects);
+        if (self.root) |*root| {
+            self.signalTrackedProcessWith(root, .stop, preserved_group, &summary, Effects);
         }
-        for (self.processes.items) |process| {
-            self.signalTrackedProcessWith(process, std.posix.SIG.STOP, preserved_group, &summary, Effects);
+        for (self.processes.items) |*process| {
+            self.signalTrackedProcessWith(process, .stop, preserved_group, &summary, Effects);
         }
     }
 
     /// Sends `signal` to each tracked process, children before parents.
     fn signalProcessesOnceWith(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         preserved_group: ?std.posix.pid_t,
         comptime Effects: type,
     ) DeliverySummary {
@@ -388,14 +412,14 @@ pub const Tracker = struct {
         while (index > 0) {
             index -= 1;
             self.signalTrackedProcessWith(
-                self.processes.items[index],
+                &self.processes.items[index],
                 signal,
                 preserved_group,
                 &summary,
                 Effects,
             );
         }
-        if (self.root) |root| {
+        if (self.root) |*root| {
             self.signalTrackedProcessWith(
                 root,
                 signal,
@@ -407,10 +431,33 @@ pub const Tracker = struct {
         return summary;
     }
 
+    /// Resumes each process a stop pass stopped that the kill after it
+    /// skipped, so a stop never outlasts its kill. A process can leave the
+    /// command's session or process group after the stop pass reads it but
+    /// before its SIGSTOP lands, and the kill then leaves it alone.
+    fn resumeStoppedWith(self: *Tracker, comptime Effects: type) void {
+        var summary: DeliverySummary = .{};
+        if (self.root) |*root| self.resumeIfStoppedWith(root, &summary, Effects);
+        for (self.processes.items) |*process| {
+            self.resumeIfStoppedWith(process, &summary, Effects);
+        }
+    }
+
+    fn resumeIfStoppedWith(
+        self: *Tracker,
+        process: *TrackedProcess,
+        summary: *DeliverySummary,
+        comptime Effects: type,
+    ) void {
+        if (!process.stopped) return;
+        process.stopped = false;
+        self.signalTrackedProcessWith(process, .cont, null, summary, Effects);
+    }
+
     fn signalTrackedProcessWith(
         self: *Tracker,
-        process: TrackedProcess,
-        signal: std.posix.SIG,
+        process: *TrackedProcess,
+        signal: io_mod.Signal,
         preserved_group: ?std.posix.pid_t,
         summary: *DeliverySummary,
         comptime Effects: type,
@@ -438,6 +485,8 @@ pub const Tracker = struct {
             },
         };
         summary.delivered += 1;
+        if (signal == .stop) process.stopped = true;
+        if (signal == .kill) process.stopped = false;
     }
 
     pub fn anyAlive(self: *Tracker) bool {
@@ -458,7 +507,7 @@ pub const Tracker = struct {
     /// processes that moved to their own session running.
     pub fn signalAttached(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         command_session: std.posix.pid_t,
     ) CompletionDelivery {
         return self.signalAttachedWith(signal, command_session, SystemSignalEffects);
@@ -474,12 +523,17 @@ pub const Tracker = struct {
 
     fn signalAttachedWith(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionDelivery {
-        if (signal == std.posix.SIG.KILL) self.stopAttachedWith(command_session, Effects);
-        return self.signalAttachedOnceWith(signal, command_session, Effects);
+        if (signal != .kill) {
+            return self.signalAttachedOnceWith(signal, command_session, Effects);
+        }
+        self.stopAttachedWith(command_session, Effects);
+        const result = self.signalAttachedOnceWith(signal, command_session, Effects);
+        self.resumeStoppedWith(Effects);
+        return result;
     }
 
     /// Stops the attached processes, parents first, for the reasons
@@ -490,17 +544,17 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) void {
         var result: CompletionDelivery = .{};
-        if (self.root) |root| {
-            self.signalIfAttachedWith(root, std.posix.SIG.STOP, command_session, &result, Effects);
+        if (self.root) |*root| {
+            self.signalIfAttachedWith(root, .stop, command_session, &result, Effects);
         }
-        for (self.processes.items) |process| {
-            self.signalIfAttachedWith(process, std.posix.SIG.STOP, command_session, &result, Effects);
+        for (self.processes.items) |*process| {
+            self.signalIfAttachedWith(process, .stop, command_session, &result, Effects);
         }
     }
 
     fn signalAttachedOnceWith(
         self: *Tracker,
-        signal: std.posix.SIG,
+        signal: io_mod.Signal,
         command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionDelivery {
@@ -509,14 +563,14 @@ pub const Tracker = struct {
         while (index > 0) {
             index -= 1;
             self.signalIfAttachedWith(
-                self.processes.items[index],
+                &self.processes.items[index],
                 signal,
                 command_session,
                 &result,
                 Effects,
             );
         }
-        if (self.root) |root| {
+        if (self.root) |*root| {
             self.signalIfAttachedWith(root, signal, command_session, &result, Effects);
         }
         return result;
@@ -524,13 +578,13 @@ pub const Tracker = struct {
 
     fn signalIfAttachedWith(
         self: *Tracker,
-        process: TrackedProcess,
-        signal: std.posix.SIG,
+        process: *TrackedProcess,
+        signal: io_mod.Signal,
         command_session: std.posix.pid_t,
         result: *CompletionDelivery,
         comptime Effects: type,
     ) void {
-        switch (self.completionStandingWith(process, command_session, Effects)) {
+        switch (self.completionStandingWith(process.*, command_session, Effects)) {
             .attached => self.signalTrackedProcessWith(
                 process,
                 signal,
@@ -981,7 +1035,7 @@ test "checked signal delivery distinguishes vanished stale and failed targets" {
             };
         }
 
-        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+        fn send(pid: std.posix.pid_t, _: io_mod.Signal) SendError!void {
             return switch (pid) {
                 17 => error.PermissionDenied,
                 18 => error.ProcessNotFound,
@@ -1000,7 +1054,7 @@ test "checked signal delivery distinguishes vanished stale and failed targets" {
     }
 
     const summary = tracker.signalProcessesWith(
-        std.posix.SIG.TERM,
+        .terminate,
         41,
         FakeEffects,
     );
@@ -1026,7 +1080,7 @@ test "checked signal delivery keeps vanished stale and excluded targets complete
             };
         }
 
-        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+        fn send(_: std.posix.pid_t, _: io_mod.Signal) SendError!void {
             return;
         }
     };
@@ -1041,7 +1095,7 @@ test "checked signal delivery keeps vanished stale and excluded targets complete
     }
 
     const summary = tracker.signalProcessesWith(
-        std.posix.SIG.TERM,
+        .terminate,
         41,
         FakeEffects,
     );
@@ -1073,7 +1127,8 @@ test "natural completion detaches only processes that left the command session" 
 test "natural completion stops attached processes and keeps detached daemons" {
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
-        var sent: [16]std.posix.pid_t = undefined;
+        var pids: [16]std.posix.pid_t = undefined;
+        var signals: [16]io_mod.Signal = undefined;
         var sent_count: usize = 0;
 
         fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
@@ -1104,11 +1159,9 @@ test "natural completion stops attached processes and keeps detached daemons" {
             };
         }
 
-        fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
-            // The stop pass before each kill is covered by "a kill stops
-            // every tracked process before killing any".
-            if (signal != std.posix.SIG.KILL) return;
-            sent[sent_count] = pid;
+        fn send(pid: std.posix.pid_t, signal: io_mod.Signal) SendError!void {
+            pids[sent_count] = pid;
+            signals[sent_count] = signal;
             sent_count += 1;
         }
     };
@@ -1123,11 +1176,20 @@ test "natural completion stops attached processes and keeps detached daemons" {
     }
 
     FakeEffects.sent_count = 0;
-    const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
+    const completed = tracker.signalAttachedWith(.kill, 500, FakeEffects);
+    // The attached processes stop and then die. The daemons 31 and 33 get
+    // no signal at all, not even the stop.
+    const stop = .stop;
+    const kill = .kill;
     try std.testing.expectEqualSlices(
         std.posix.pid_t,
-        &.{ 37, 32, 30 },
-        FakeEffects.sent[0..FakeEffects.sent_count],
+        &.{ 30, 32, 37, 37, 32, 30 },
+        FakeEffects.pids[0..FakeEffects.sent_count],
+    );
+    try std.testing.expectEqualSlices(
+        io_mod.Signal,
+        &.{ stop, stop, stop, kill, kill, kill },
+        FakeEffects.signals[0..FakeEffects.sent_count],
     );
     try std.testing.expectEqual(@as(usize, 3), completed.delivery.delivered);
     try std.testing.expectEqual(@as(usize, 2), completed.kept_detached);
@@ -1148,7 +1210,7 @@ test "a kill stops every tracked process before killing any" {
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const FakeEffects = struct {
         var pids: [16]std.posix.pid_t = undefined;
-        var signals: [16]std.posix.SIG = undefined;
+        var signals: [16]io_mod.Signal = undefined;
         var sent_count: usize = 0;
 
         fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
@@ -1163,13 +1225,13 @@ test "a kill stops every tracked process before killing any" {
             return .{ .found = 500 };
         }
 
-        fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
+        fn send(pid: std.posix.pid_t, signal: io_mod.Signal) SendError!void {
             pids[sent_count] = pid;
             signals[sent_count] = signal;
             sent_count += 1;
         }
 
-        fn expectSent(expected_pids: []const std.posix.pid_t, expected_signals: []const std.posix.SIG) !void {
+        fn expectSent(expected_pids: []const std.posix.pid_t, expected_signals: []const io_mod.Signal) !void {
             try std.testing.expectEqualSlices(std.posix.pid_t, expected_pids, pids[0..sent_count]);
             for (expected_signals, signals[0..sent_count]) |expected, actual| {
                 try std.testing.expectEqual(expected, actual);
@@ -1189,11 +1251,11 @@ test "a kill stops every tracked process before killing any" {
             .identity = .{ .linux_start_ticks = @intCast(pid) },
         });
     }
-    const stop = std.posix.SIG.STOP;
-    const kill = std.posix.SIG.KILL;
+    const stop = .stop;
+    const kill = .kill;
     // Parents stop first, so none is running to see a child stop or die.
     const pids = [_]std.posix.pid_t{ 60, 61, 62, 62, 61, 60 };
-    const signals = [_]std.posix.SIG{ stop, stop, stop, kill, kill, kill };
+    const signals = [_]io_mod.Signal{ stop, stop, stop, kill, kill, kill };
 
     FakeEffects.sent_count = 0;
     const summary = tracker.signalProcessesWith(kill, null, FakeEffects);
@@ -1207,8 +1269,131 @@ test "a kill stops every tracked process before killing any" {
 
     // Other signals go out once.
     FakeEffects.sent_count = 0;
-    _ = tracker.signalProcessesWith(std.posix.SIG.TERM, null, FakeEffects);
+    _ = tracker.signalProcessesWith(.terminate, null, FakeEffects);
     try std.testing.expectEqual(@as(usize, 3), FakeEffects.sent_count);
+}
+
+test "a stopped child, an exited child, and a gone pid count as stopped, and a running one does not" {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var running = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const pid = running.id.?;
+    try std.testing.expect(!try processIsStopped(alloc, pid));
+    try std.posix.kill(pid, .STOP);
+    // The stop lands a moment after kill(2) returns.
+    const stopped = for (0..1_000) |_| {
+        if (try processIsStopped(alloc, pid)) break true;
+        io_mod.sleep(std.time.ns_per_ms);
+    } else false;
+    try std.testing.expect(stopped);
+    try std.posix.kill(pid, .KILL);
+    // Killed and not yet reaped, it has exited.
+    const exited = for (0..1_000) |_| {
+        if (!try processIsAlive(alloc, pid)) break true;
+        io_mod.sleep(std.time.ns_per_ms);
+    } else false;
+    try std.testing.expect(exited);
+    try std.testing.expect(try processIsStopped(alloc, pid));
+    _ = try running.wait(io);
+    try std.testing.expect(try processIsStopped(alloc, pid));
+}
+
+test "a kill resumes the processes it stopped but did not kill" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const FakeEffects = struct {
+        var session_reads: usize = 0;
+        var group_reads: usize = 0;
+        var pids: [8]std.posix.pid_t = undefined;
+        var signals: [8]io_mod.Signal = undefined;
+        var sent_count: usize = 0;
+
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return .{ .identity = .{ .linux_start_ticks = @intCast(pid) }, .parent_pid = 1 };
+        }
+
+        // 71 joins process group 700 just after the stop pass reads its
+        // group. 72 is always in it.
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            switch (pid) {
+                71 => {
+                    group_reads += 1;
+                    return .{ .found = if (group_reads == 1) 71 else 700 };
+                },
+                72 => return .{ .found = 700 },
+                else => return .{ .found = pid },
+            }
+        }
+
+        // 71 calls setsid() just after the stop pass reads its session.
+        fn session(pid: std.posix.pid_t) SessionState {
+            if (pid != 71) return .{ .found = 500 };
+            session_reads += 1;
+            return .{ .found = if (session_reads == 1) 500 else 71 };
+        }
+
+        fn send(pid: std.posix.pid_t, signal: io_mod.Signal) SendError!void {
+            pids[sent_count] = pid;
+            signals[sent_count] = signal;
+            sent_count += 1;
+        }
+
+        fn reset() void {
+            session_reads = 0;
+            group_reads = 0;
+            sent_count = 0;
+        }
+
+        fn expectSent(expected_pids: []const std.posix.pid_t, expected_signals: []const io_mod.Signal) !void {
+            try std.testing.expectEqualSlices(std.posix.pid_t, expected_pids, pids[0..sent_count]);
+            try std.testing.expectEqualSlices(io_mod.Signal, expected_signals, signals[0..sent_count]);
+        }
+    };
+
+    // The root 70 runs 71.
+    var tracker = Tracker{
+        .alloc = std.testing.allocator,
+        .root = .{ .pid = 70, .identity = .{ .linux_start_ticks = 70 } },
+    };
+    defer tracker.deinit();
+    try tracker.processes.append(std.testing.allocator, .{
+        .pid = 71,
+        .identity = .{ .linux_start_ticks = 71 },
+    });
+    const stop = .stop;
+    const kill = .kill;
+    const cont = .cont;
+    // 71 stops, then the kill skips it, so it is resumed instead of being
+    // left stopped.
+    const pids = [_]std.posix.pid_t{ 70, 71, 70, 71 };
+    const signals = [_]io_mod.Signal{ stop, stop, kill, cont };
+
+    // A forced kill that spares process group 700.
+    FakeEffects.reset();
+    const summary = tracker.signalProcessesWith(kill, 700, FakeEffects);
+    try FakeEffects.expectSent(&pids, &signals);
+    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+
+    // Natural-completion cleanup, which keeps 71 running as a daemon once
+    // it has left the command's session.
+    FakeEffects.reset();
+    const completed = tracker.signalAttachedWith(kill, 500, FakeEffects);
+    try FakeEffects.expectSent(&pids, &signals);
+    try std.testing.expectEqual(@as(usize, 1), completed.delivery.delivered);
+    try std.testing.expectEqual(@as(usize, 1), completed.kept_detached);
+
+    // `stopAll` stops 72, the caller's own kill of group 700 misses it, and
+    // the kill of everything outside that group resumes it.
+    var grouped = Tracker{ .alloc = std.testing.allocator };
+    defer grouped.deinit();
+    try grouped.processes.append(std.testing.allocator, .{
+        .pid = 72,
+        .identity = .{ .linux_start_ticks = 72 },
+    });
+    FakeEffects.reset();
+    grouped.stopProcessesWith(null, FakeEffects);
+    _ = grouped.signalProcessesWith(kill, 700, FakeEffects);
+    try FakeEffects.expectSent(&.{ 72, 72 }, &.{ stop, cont });
 }
 
 test "natural completion keeps an unreadable process attached and reports it" {
@@ -1231,7 +1416,7 @@ test "natural completion keeps an unreadable process attached and reports it" {
             return .{ .found = pid };
         }
 
-        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+        fn send(_: std.posix.pid_t, _: io_mod.Signal) SendError!void {
             sent_count += 1;
         }
     };
@@ -1244,7 +1429,7 @@ test "natural completion keeps an unreadable process attached and reports it" {
     });
 
     FakeEffects.sent_count = 0;
-    const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
+    const completed = tracker.signalAttachedWith(.kill, 500, FakeEffects);
     // Without a snapshot the process cannot be signaled safely, but it is
     // neither kept as a daemon nor treated as gone.
     try std.testing.expectEqual(@as(usize, 0), FakeEffects.sent_count);
@@ -1310,6 +1495,32 @@ fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     };
 }
 
+/// The Win32 calls the liveness probe needs.
+///
+/// Windows has no `kill(pid, 0)` and no `/proc`, and this file does not walk a
+/// tree there: a terminal never runs on Windows, and a shell command is
+/// contained by its job object instead. The one question Windows callers do ask
+/// is whether a process is still running, which `OpenProcess` plus
+/// `GetExitCodeProcess` answers without a right beyond querying.
+const windows_process_tree = if (builtin.target.os.tag != .windows) struct {} else struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const DWORD = u32;
+    const BOOL = i32;
+    const process_query_limited_information: DWORD = 0x1000;
+    const still_active: DWORD = 259;
+    extern "kernel32" fn OpenProcess(desired_access: DWORD, inherit: BOOL, process_id: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetExitCodeProcess(process: HANDLE, exit_code: *DWORD) callconv(.winapi) BOOL;
+};
+
+fn windowsProcessIsAlive(pid: std.posix.pid_t) bool {
+    const windows = windows_process_tree;
+    const handle = windows.OpenProcess(windows.process_query_limited_information, 0, @intCast(pid)) orelse return false;
+    defer _ = std.os.windows.CloseHandle(handle);
+    var code: windows.DWORD = 0;
+    if (windows.GetExitCodeProcess(handle, &code) == 0) return false;
+    return code == windows.still_active;
+}
+
 fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     if (comptime builtin.target.os.tag != .linux) return error.ProcessTreeUnsupported;
     const path = try alloc.print("/proc/{d}/stat", .{pid});
@@ -1361,6 +1572,20 @@ fn readLinuxProcFile(file: std.Io.File, buffer: []u8) !usize {
         }
     }
 }
+/// Whether `pid` names a process that is still running.
+///
+/// POSIX reads the process table. Windows has no `/proc` and no `kill(pid, 0)`
+/// probe: it opens the process for the least right that answers the question,
+/// `PROCESS_QUERY_LIMITED_INFORMATION`, and asks `GetExitCodeProcess`. An id
+/// that names nothing fails to open, which is a process that is gone.
+pub fn processIsAlive(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    if (comptime builtin.target.os.tag == .windows) return windowsProcessIsAlive(pid);
+    const snapshot = captureSnapshot(alloc, pid) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return err,
+    };
+    return snapshotIsAlive(snapshot);
+}
 
 fn captureMacOSSnapshot(pid: std.posix.pid_t) !ProcessSnapshot {
     if (comptime builtin.target.os.tag != .macos) return error.ProcessTreeUnsupported;
@@ -1400,16 +1625,62 @@ fn captureMacOSSnapshot(pid: std.posix.pid_t) !ProcessSnapshot {
     };
 }
 
-pub fn processIsAlive(alloc: Allocator, pid: std.posix.pid_t) !bool {
-    const snapshot = captureSnapshot(alloc, pid) catch |err| switch (err) {
-        error.ProcessNotFound => return false,
-        else => return err,
-    };
-    return snapshotIsAlive(snapshot);
-}
-
 fn snapshotIsAlive(snapshot: ProcessSnapshot) bool {
     return !snapshot.zombie;
+}
+
+/// Whether `pid` can run no more: every thread of it is stopped by a signal,
+/// it has exited, or it is gone. kill(2) only queues a SIGSTOP, so a caller
+/// that must know the stop has landed, before it looks at what the process
+/// started, asks this.
+///
+/// Windows has no SIGSTOP and no way to halt a process's threads from outside
+/// it, so no process there is ever stopped by a signal: what can be answered is
+/// whether it has ended. A caller that asks, to decide whether a job-object
+/// kill has landed, gets the same meaning: a process that cannot run any more.
+pub fn processIsStopped(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    if (comptime builtin.target.os.tag == .windows) return !windowsProcessIsAlive(pid);
+    return switch (builtin.target.os.tag) {
+        .linux => linuxProcessIsStopped(alloc, pid),
+        .macos => macOSProcessIsStopped(pid),
+        else => error.ProcessTreeUnsupported,
+    };
+}
+
+fn linuxProcessIsStopped(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    if (comptime builtin.target.os.tag != .linux) return error.ProcessTreeUnsupported;
+    const task_path = try alloc.print("/proc/{d}/task", .{pid});
+    defer alloc.free(task_path);
+    var task_dir = (try openLinuxProcDir(task_path)) orelse return true;
+    defer task_dir.close(io_mod.getIo());
+    var tasks = task_dir.iterateAssumeFirstIteration();
+    while (try tasks.next(io_mod.getIo())) |entry| {
+        const tid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        const path = try alloc.print("/proc/{d}/task/{d}/stat", .{ pid, tid });
+        defer alloc.free(path);
+        var file = (try openLinuxProcFile(path)) orelse continue;
+        defer file.close(io_mod.getIo());
+        var buffer: [4096]u8 = undefined;
+        const read_len = readLinuxProcFile(file, &buffer) catch |err| switch (err) {
+            error.ProcessNotFound => continue,
+            else => return err,
+        };
+        const stat = buffer[0..read_len];
+        const close_paren = std.mem.findScalarLast(u8, stat, ')') orelse return error.ProcessIdentityUnavailable;
+        if (close_paren + 2 >= stat.len) return error.ProcessIdentityUnavailable;
+        // T: stopped by a signal; t: stopped by a tracer; Z and X: exited.
+        if (std.mem.findScalar(u8, "TtZX", stat[close_paren + 2]) == null) return false;
+    }
+    return true;
+}
+
+fn macOSProcessIsStopped(pid: std.posix.pid_t) !bool {
+    if (comptime builtin.target.os.tag != .macos) return error.ProcessTreeUnsupported;
+    var info: Darwin.ProcBsdInfo = undefined;
+    const read_len = Darwin.proc_pidinfo(pid, 3, 0, &info, @sizeOf(Darwin.ProcBsdInfo));
+    if (read_len == 0) return true;
+    if (read_len != @sizeOf(Darwin.ProcBsdInfo)) return error.ProcessIdentityUnavailable;
+    return info.pbi_status == Darwin.process_status_stopped or info.pbi_status == Darwin.process_status_zombie;
 }
 
 const Darwin = struct {
@@ -1417,6 +1688,7 @@ const Darwin = struct {
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
     const proc_pid_fd_pipe_info: c_int = 6;
+    const process_status_stopped: u32 = 4;
     const process_status_zombie: u32 = 5;
 
     const ProcFileInfo = extern struct {

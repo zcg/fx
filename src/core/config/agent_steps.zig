@@ -16,15 +16,29 @@ pub const default_subagent_max_agent_steps: usize = 100;
 
 /// How many subagents main may run at once when the profile sets no
 /// `subagent_max_children`. The ceiling is small on purpose: each child is a
-/// session with its own worker and slot thread, and nesting is already
-/// limited to one level (`subagent/authority.zig` `max_subagent_depth`).
-pub const default_subagent_max_children: usize = 4;
+/// session with its own worker and slot thread, and the depth bound below
+/// keeps the whole tree inside a handful of conversations.
+pub const default_subagent_max_children: usize = 8;
 
 /// Zero turns subagents off: main does the work itself. A session that wants
 /// none sets it, which is also the bound a profile in an untrusted project
 /// cannot raise.
 pub const min_subagent_max_children: usize = 0;
 pub const max_subagent_max_children: usize = 16;
+
+/// How many levels of subagents a session may run below main when the profile
+/// sets no `subagent_max_depth`. Depth 1 is the default on purpose: main may
+/// start children, and a child cannot start one of its own, which is the
+/// audited shape the tree had before nesting shipped. A session that wants
+/// the nested tree sets 2, and depth 0 turns subagents off.
+pub const default_subagent_max_depth: usize = 1;
+pub const min_subagent_max_depth: usize = 0;
+pub const max_subagent_max_depth: usize = 2;
+
+/// The structural bound the registry accepts. `max_subagent_max_children`
+/// bounds what a profile may configure; this bounds what the data structure
+/// itself stores, so a wrong save or resume cannot blow the tree up.
+pub const structural_max_children: usize = 256;
 
 pub fn resolveMaxAgentSteps(configured: ?usize, default_value: usize) usize {
     return configured orelse default_value;
@@ -51,6 +65,20 @@ pub fn resolveSubagentMaxChildren(configured: ?usize) usize {
     return value;
 }
 
+pub fn resolveSubagentMaxDepth(configured: ?usize) usize {
+    const value = configured orelse return default_subagent_max_depth;
+    if (value < min_subagent_max_depth or value > max_subagent_max_depth) {
+        return default_subagent_max_depth;
+    }
+    return value;
+}
+
+/// The same, with `FX_SUBAGENT_MAX_DEPTH` in front of the profile's setting.
+pub fn resolveSubagentMaxDepthWithOverride(configured: ?usize) usize {
+    return parseSubagentMaxDepth(io_mod.getenv("FX_SUBAGENT_MAX_DEPTH")) orelse
+        resolveSubagentMaxDepth(configured);
+}
+
 /// The same, with `FX_SUBAGENT_MAX_CHILDREN` in front of the profile's
 /// setting, as every other `FX_*` override works.
 pub fn resolveSubagentMaxChildrenWithOverride(configured: ?usize) usize {
@@ -63,6 +91,14 @@ pub fn parseSubagentMaxChildren(raw: ?[]const u8) ?usize {
     if (trimmed.len == 0) return null;
     const value = std.fmt.parseUnsigned(usize, trimmed, 10) catch return null;
     if (value < min_subagent_max_children or value > max_subagent_max_children) return null;
+    return value;
+}
+
+pub fn parseSubagentMaxDepth(raw: ?[]const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw orelse return null, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const value = std.fmt.parseUnsigned(usize, trimmed, 10) catch return null;
+    if (value < min_subagent_max_depth or value > max_subagent_max_depth) return null;
     return value;
 }
 
