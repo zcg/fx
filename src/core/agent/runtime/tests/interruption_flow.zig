@@ -262,7 +262,7 @@ test "streamed presentation preserves raw partial through cancellation" {
     }
 }
 
-test "clear language mismatch is absent from cancelled history" {
+test "non-English partial output is absent from cancelled history" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
     const completions = [_]FakeCompletion{.{

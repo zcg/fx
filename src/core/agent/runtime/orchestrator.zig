@@ -79,7 +79,6 @@ const observation = @import("observation.zig");
 const model_call_record = @import("model_call_record.zig");
 const resend_strategy = @import("resend_strategy.zig");
 const runtime_request_recovery = @import("request_recovery.zig");
-const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -247,12 +246,6 @@ const repeated_shell_execution_failure_notice =
     "Repeated identical shell failures stopped the tool loop. The failed action was not retried again; inspect the environment or change the action before continuing.";
 const repeated_malformed_arguments_notice =
     "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
-const response_language_control =
-    "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority.\n</response_language_control>";
-const response_language_correction_control =
-    "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
-const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -3857,33 +3850,21 @@ const ProviderPromptProjection = struct {
     current_user_index: usize,
 };
 
-fn build_provider_prompt_with_response_language_control(
+fn build_provider_prompt_for_runtime(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
     ephemeral_overlay: []const ChatMessage,
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
-    origin: runtime_config.TurnOrigin,
-    enforce_response_language: bool,
-    correction_attempted: bool,
     compaction_handoff: ?[]const u8,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
-    const effective_overlay = if (enforce_response_language and origin == .root) blk: {
-        const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
-        @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
-        projected[ephemeral_overlay.len] = .{
-            .role = .system,
-            .content = response_language_control,
-        };
-        break :blk projected;
-    } else ephemeral_overlay;
     var prompt = try buildProviderPromptForCompactionWindow(
         alloc,
         stable_prefix,
-        effective_overlay,
+        ephemeral_overlay,
         durable_history,
         current_user_message,
         within_turn_suffix,
@@ -3892,12 +3873,6 @@ fn build_provider_prompt_with_response_language_control(
         compacted_suffix_len,
     );
     errdefer prompt.deinit(alloc);
-    if (enforce_response_language and origin == .root and correction_attempted) {
-        try prompt.messages.append(alloc, .{
-            .role = .user,
-            .content = response_language_correction_control,
-        });
-    }
     return .{
         .instructions = prompt.instructions,
         .messages = prompt.messages,
@@ -3909,7 +3884,7 @@ fn build_provider_prompt_with_response_language_control(
 }
 
 test "compacted request keeps the pending user prompt after the handoff" {
-    var projected = try build_provider_prompt_with_response_language_control(
+    var projected = try build_provider_prompt_for_runtime(
         std.testing.allocator,
         &.{.{ .role = .system, .content = "stable" }},
         &.{.{ .role = .system, .content = "overlay" }},
@@ -3919,9 +3894,6 @@ test "compacted request keeps the pending user prompt after the handoff" {
             .{ .role = .assistant, .content = "compacted suffix" },
             .{ .role = .tool, .content = "new suffix" },
         },
-        .subagent,
-        false,
-        false,
         "handoff",
         &.{.{ .role = .assistant, .content = "retained tail" }},
         1,
@@ -3944,21 +3916,6 @@ test "compacted request keeps the pending user prompt after the handoff" {
     }
     try std.testing.expectEqual(@as(usize, 2), projected.current_user_index);
     try agent_stream_provider.validate_prompt_lanes(projected.instructions.items, projected.messages.items);
-}
-
-fn response_language_context_conflicts(
-    expected: ?response_language.Script,
-    messages: []const ChatMessage,
-) bool {
-    const expected_script = expected orelse return false;
-    for (messages) |message| {
-        if (message.role == .user) continue;
-        const content = message.content orelse continue;
-        const probe = content[0..@min(content.len, 4096)];
-        const actual = response_language.evidence(probe).script orelse continue;
-        if (actual != expected_script) return true;
-    }
-    return false;
 }
 
 fn recoveryToolEvidence(
@@ -8022,13 +7979,6 @@ fn processQueuedPromptLoop(
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
-    const response_language_expectation = if (config.enforce_response_language and
-        config.origin == .root and
-        job.recovery_checkpoint == null)
-        response_language.infer_expectation(job.prompt)
-    else
-        null;
-    var response_language_correction_attempted = false;
     // How the next resend is phrased, from the tool evidence of the attempt
     // that failed. `src/core/recovery/` decides when to resend.
     var recovery_strategy: ?resend_strategy.Strategy = if (job.recovery_checkpoint) |checkpoint|
@@ -8125,16 +8075,13 @@ fn processQueuedPromptLoop(
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
-        var provider_prompt = try build_provider_prompt_with_response_language_control(
+        var provider_prompt = try build_provider_prompt_for_runtime(
             overlay_arena,
             stable_prefix,
             ephemeral_overlay.items,
             history_messages.items,
             current_user_effective,
             within_turn_suffix.items,
-            config.origin,
-            config.enforce_response_language,
-            response_language_correction_attempted,
             active_compaction_handoff,
             active_compaction_history_tail,
             compacted_suffix_len,
@@ -8145,12 +8092,6 @@ fn processQueuedPromptLoop(
         last_gateway_message_count = gateway_instructions.items.len + gateway_messages.items.len +
             @intFromBool(initial_decision_pending);
         var current_user_message_index = provider_prompt.current_user_index;
-        const response_language_hold_until_completion =
-            response_language_context_conflicts(response_language_expectation, stable_prefix) or
-            response_language_context_conflicts(response_language_expectation, ephemeral_overlay.items) or
-            response_language_context_conflicts(response_language_expectation, history_messages.items) or
-            response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
-
         debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
         debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
 
@@ -8161,8 +8102,6 @@ fn processQueuedPromptLoop(
             .token_progress = &summary_accumulator,
             .turn_id = turn_id,
             .step_id = step_ctx.step_id,
-            .response_language_expected = response_language_expectation,
-            .response_language_hold_until_completion = response_language_hold_until_completion,
             .provisional_statuses = .{
                 .presentation_group_id = presentation_group_id,
             },
@@ -8326,16 +8265,13 @@ fn processQueuedPromptLoop(
                 );
                 credential_reload_pending = false;
             }
-            provider_prompt = try build_provider_prompt_with_response_language_control(
+            provider_prompt = try build_provider_prompt_for_runtime(
                 overlay_arena,
                 stable_prefix,
                 ephemeral_overlay.items,
                 history_messages.items,
                 current_user_effective,
                 within_turn_suffix.items,
-                config.origin,
-                config.enforce_response_language,
-                response_language_correction_attempted,
                 active_compaction_handoff,
                 active_compaction_history_tail,
                 compacted_suffix_len,
@@ -9551,13 +9487,7 @@ fn processQueuedPromptLoop(
                 }
             };
 
-            var attempt_completion = response_completion;
-            const response_language_candidate = if (stream_ctx.raw_text.items.len > 0)
-                stream_ctx.raw_text.items
-            else if (attempt_completion.content) |content|
-                content
-            else
-                "";
+            const attempt_completion = response_completion;
             const accepted_partial_assistant = stream_ctx.interruption_source_or(
                 attempt_completion.content orelse "",
             );
@@ -9601,80 +9531,6 @@ fn processQueuedPromptLoop(
             }
 
             const attempt_disposition = settled_disposition;
-            if (streamSucceeded(stream_result) and
-                attempt_disposition == .completed)
-            {
-                const candidate_language = response_language.evidence(response_language_candidate);
-                const language_decision = response_language.decide(.{
-                    .expected = response_language_expectation,
-                    .candidate = candidate_language,
-                    .correction_attempted = response_language_correction_attempted,
-                    .has_tool_calls = attempt_completion.tool_calls.len > 0 or
-                        stream_ctx.saw_tool_start,
-                });
-                switch (language_decision) {
-                    .accept, .undecidable => try stream_ctx.accept_staged_response_language(),
-                    .accept_without_prose => {
-                        try discardCompletionProse(arena, deps.agent_stream_provider, .{
-                            .provider = job.provider,
-                            .model = gateway_model,
-                        }, &stream_result.completed);
-                        attempt_completion = stream_result.completed.completion;
-                        debug_trace.eventf(
-                            "agent",
-                            "response_language_mismatch",
-                            step_ctx,
-                            "expected={s} observed={s} model={s} attempt={d} retry=false tool_calls=true prose_discarded=true",
-                            .{
-                                @tagName(response_language_expectation.?),
-                                @tagName(candidate_language.script.?),
-                                gateway_model,
-                                request_recovery.attempt(),
-                            },
-                        );
-                        stream_ctx.drop_staged_response_language_candidate();
-                    },
-                    .retry_once, .fail_without_commit => {
-                        const observed = candidate_language.script.?;
-                        // `retry_once` is the cap: one correction per turn,
-                        // outside the recovery module.
-                        const can_retry = language_decision == .retry_once;
-                        debug_trace.eventf(
-                            "agent",
-                            "response_language_mismatch",
-                            step_ctx,
-                            "expected={s} observed={s} model={s} attempt={d} retry={s}",
-                            .{
-                                @tagName(response_language_expectation.?),
-                                @tagName(observed),
-                                gateway_model,
-                                request_recovery.attempt(),
-                                if (can_retry) "true" else "false",
-                            },
-                        );
-                        if (can_retry) {
-                            if (deps.report_usage) |report_fn| {
-                                if (attempt_completion.usage.input_tokens != null or
-                                    attempt_completion.usage.output_tokens != null)
-                                {
-                                    report_fn(deps.ctx, attempt_completion.usage);
-                                }
-                            }
-                            stream_ctx.drop_staged_response_language_candidate();
-                            stream_result.deinit(arena);
-                            stream_result_set = false;
-                            response_language_correction_attempted = true;
-                            reset_stream_for_next_attempt = true;
-                            continue;
-                        }
-                        stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
-                        finish_trace.finish("response_language_mismatch");
-                        return error.ResponseLanguageMismatch;
-                    },
-                }
-            }
-
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
 
             const partial_assistant = if (attempt_disposition == .completed)

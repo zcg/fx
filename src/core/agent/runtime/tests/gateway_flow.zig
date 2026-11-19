@@ -6050,45 +6050,25 @@ test "processQueuedPrompt keeps completed history before the final current user 
     try expectGatewayPromptTextCount(&gateway, 0, "Do not re-run, re-answer, or continue earlier user turns", 0);
 }
 
-test "processQueuedPrompt projects response language authority only for root turns" {
+test "processQueuedPrompt leaves response language to the user prompt" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done" }};
 
-    var root_gateway = FakeGateway.init(alloc, &completions);
-    defer root_gateway.deinit();
-    var root_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer root_hooks.deinit();
-    var root_fixture = PromptFixture{};
-    try runFakePrompt(&root_gateway, &root_hooks, root_fixture.config(), root_fixture.job());
-    try expectGatewayPromptTextCount(
-        &root_gateway,
-        0,
-        "Use the response language requested by the current external human.",
-        1,
-    );
-    try expectGatewayPromptFinalUserText(&root_gateway, 0, "user prompt");
-
-    var subagent_gateway = FakeGateway.init(alloc, &completions);
-    defer subagent_gateway.deinit();
-    var subagent_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer subagent_hooks.deinit();
-    var subagent_fixture = PromptFixture{};
-    var subagent_config = subagent_fixture.config();
-    subagent_config.origin = .subagent;
-    try runFakePrompt(
-        &subagent_gateway,
-        &subagent_hooks,
-        subagent_config,
-        subagent_fixture.job(),
-    );
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
     try expectBodyNotContains(
-        &subagent_gateway,
+        &gateway,
         0,
         "Use the response language requested by the current external human.",
     );
+    try expectGatewayPromptFinalUserText(&gateway, 0, "user prompt");
 }
 
-test "processQueuedPrompt holds matching output to completion after conflicting history" {
+test "processQueuedPrompt publishes output as written after mixed-language history" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{ "I will inspect ", "the lockfile next." };
     const completions = [_]FakeCompletion{.{
@@ -6122,14 +6102,13 @@ test "processQueuedPrompt holds matching output to completion after conflicting 
     );
 }
 
-test "processQueuedPrompt retries one clear language mismatch without publishing or persisting it" {
+test "processQueuedPrompt publishes a non-English answer without language retry" {
     const alloc = std.testing.allocator;
-    const rejected_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
-    const accepted_chunks = [_][]const u8{"I will inspect the lockfile next."};
-    const completions = [_]FakeCompletion{
-        .{ .chunks = &rejected_chunks, .content = rejected_chunks[0] },
-        .{ .chunks = &accepted_chunks, .content = accepted_chunks[0] },
-    };
+    const chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const completions = [_]FakeCompletion{.{
+        .chunks = &chunks,
+        .content = chunks[0],
+    }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -6142,66 +6121,14 @@ test "processQueuedPrompt retries one clear language mismatch without publishing
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectGatewayPromptTextCount(
-        &gateway,
-        1,
-        "The previous candidate used a different language",
-        1,
-    );
-    try expectGatewayPromptTailText(
-        &gateway,
-        1,
-        .user,
-        "The previous candidate used a different language",
-    );
-    try expectGatewayPromptTextCount(&gateway, 1, "The lockfile is broken again.", 1);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
-    try std.testing.expectEqualStrings(accepted_chunks[0], hooks.assistant_sources.items[0]);
-    for (hooks.texts.items) |text| {
-        try std.testing.expect(std.mem.find(u8, text, rejected_chunks[0]) == null);
-    }
-    for (hooks.recovery_checkpoints.items) |checkpoint| {
-        try std.testing.expect(std.mem.find(u8, checkpoint.assistant_source, rejected_chunks[0]) == null);
-    }
+    try std.testing.expectEqualStrings(chunks[0], hooks.assistant_sources.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     try std.testing.expectEqualStrings(
-        accepted_chunks[0],
+        chunks[0],
         hooks.history_turns.items[0].assistant.assistant,
     );
-}
-
-test "processQueuedPrompt fails a second clear language mismatch without assistant history" {
-    const alloc = std.testing.allocator;
-    const first_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
-    const second_chunks = [_][]const u8{"Сначала я проверю файл блокировки и манифест."};
-    const completions = [_]FakeCompletion{
-        .{ .chunks = &first_chunks, .content = first_chunks[0] },
-        .{ .chunks = &second_chunks, .content = second_chunks[0] },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    const config = fixture.config();
-    var job = fixture.job();
-    job.prompt = @constCast("The lockfile is broken again.");
-
-    try std.testing.expectError(
-        error.ResponseLanguageMismatch,
-        runFakePrompt(&gateway, &hooks, config, job),
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        hooks.system_notices.items[0],
-        "different language",
-    ) != null);
 }
 
 test "processQueuedPrompt preserves explicit language switches without runtime correction" {

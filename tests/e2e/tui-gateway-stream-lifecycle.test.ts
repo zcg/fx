@@ -2234,31 +2234,23 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   }, TIMEOUT * 2);
 
   test(
-    "clear response language mismatch never reaches TUI scrollback",
+    "non-English model answer reaches TUI scrollback without a language retry",
     async () => {
-      const rejected = "我会先检查锁文件和依赖清单。";
-      const accepted = "I will inspect the lockfile next.";
+      const answer = "我会先检查锁文件和依赖清单。";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
-        "fx-tui-response-language-retry-",
-        [
-          fakeGatewayFinalText(rejected),
-          fakeGatewayFinalText(accepted),
-        ],
+        "fx-tui-response-language-no-retry-",
+        [fakeGatewayFinalText(answer)],
       );
 
       await session!.sendText(
         "The lockfile is broken again. Say what you will inspect next.",
       );
-      await session!.waitForText(accepted, TIMEOUT);
+      await session!.waitForText(answer, TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
 
       const scrollback = await session!.captureFullScrollback();
-      expect(scrollback).toContain(accepted);
-      expect(scrollback).not.toContain(rejected);
-      expect(queuedGateway.requests).toHaveLength(2);
-      expect(queuedGateway.requests[1]!.body).toContain(
-        "The previous candidate used a different language",
-      );
+      expect(scrollback).toContain(answer);
+      expect(queuedGateway.requests).toHaveLength(1);
       expect(session!.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 

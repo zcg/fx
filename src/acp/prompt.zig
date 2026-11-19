@@ -1580,7 +1580,6 @@ fn buildAgentConfig(
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
-        .enforce_response_language = !state.cfg.minimal_kernel,
         .context_limits = state.context_limits,
     };
 }

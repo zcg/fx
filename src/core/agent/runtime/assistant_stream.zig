@@ -20,7 +20,6 @@ const runtime_deps = @import("deps.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
-const response_language = @import("response_language.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -36,7 +35,6 @@ const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationRe
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 const TablePayload = assistant_presentation.TablePayload;
 const CodeBlockPayload = assistant_presentation.CodeBlockPayload;
-const response_language_probe_limit_bytes: usize = 4096;
 
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
@@ -85,10 +83,6 @@ pub const StreamChunkContext = struct {
     published_phase: ?types.TurnPhase = null,
     initial_line_prefix: std.ArrayList(u8) = .empty,
     provisional_statuses: runtime_tool_presentation.ProvisionalToolStatuses = .{},
-    response_language_expected: ?response_language.Script = null,
-    response_language_accepted: bool = false,
-    response_language_hold_until_completion: bool = false,
-    response_language_next_probe_bytes: usize = 5,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -137,9 +131,6 @@ pub const StreamChunkContext = struct {
     }
 
     pub fn beginRecoveryAttempt(self: *StreamChunkContext) !void {
-        if (self.response_language_staging()) {
-            self.drop_staged_response_language_candidate();
-        }
         if (self.raw_text.items.len > 0) {
             try flushAssistantStream(self);
             try self.hooks.push_text(self.hooks.ctx, .{
@@ -159,8 +150,6 @@ pub const StreamChunkContext = struct {
         self.response_started = false;
         self.last_byte_was_newline = false;
         self.trailing_newline_count = 0;
-        self.response_language_accepted = false;
-        self.response_language_next_probe_bytes = 5;
         self.saw_tool_start = false;
         self.saw_provider_tool_start = false;
         self.saw_unrepeatable_provider_tool_start = false;
@@ -171,51 +160,16 @@ pub const StreamChunkContext = struct {
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
-        return if (self.response_language_staging()) "" else self.raw_text.items;
+        return self.raw_text.items;
     }
 
     pub fn accepted_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
-        if (self.response_language_staging()) return "";
         return if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
     }
 
     pub fn interruption_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
-        if (!self.response_language_staging()) {
-            if (self.raw_text.items.len > 0) return self.raw_text.items;
-            return if (fallback.len > 0) fallback else self.interrupted_source.items;
-        }
-        const candidate = if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
-        if (candidate.len == 0) return self.interrupted_source.items;
-        const actual = response_language.evidence(candidate).script orelse return candidate;
-        return if (actual == self.response_language_expected.?) candidate else self.interrupted_source.items;
-    }
-
-    pub fn accept_staged_response_language(self: *StreamChunkContext) !void {
-        if (!self.response_language_staging()) return;
-        self.response_language_accepted = true;
-        try publishAssistantChunkResolved(self, self.raw_text.items);
-    }
-
-    pub fn drop_staged_response_language_candidate(self: *StreamChunkContext) void {
-        if (!self.response_language_staging()) return;
-        if (self.raw_text.items.len > 0) {
-            debug_trace.logf(
-                "agent",
-                "dropping rejected response language candidate bytes={d}",
-                .{self.raw_text.items.len},
-            );
-        }
-        self.raw_text.clearRetainingCapacity();
-        self.initial_line_prefix.clearRetainingCapacity();
-        self.saw_visible_text = false;
-        self.last_byte_was_newline = false;
-        self.trailing_newline_count = 0;
-        self.response_language_next_probe_bytes = 5;
-    }
-
-    fn response_language_staging(self: *const StreamChunkContext) bool {
-        return self.response_language_expected != null and
-            !self.response_language_accepted;
+        if (self.raw_text.items.len > 0) return self.raw_text.items;
+        return if (fallback.len > 0) fallback else self.interrupted_source.items;
     }
 
     /// Restores durable partial source before a restarted turn sends anything.
@@ -229,7 +183,6 @@ pub const StreamChunkContext = struct {
         if (source.len == 0) return;
         if (already_presented) {
             try self.raw_text.appendSlice(self.alloc, source);
-            self.response_language_accepted = true;
             return;
         }
         try streamAssistantChunk(self, source);
@@ -390,27 +343,6 @@ fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !voi
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
     try stream_ctx.raw_text.appendSlice(alloc, chunk);
-    if (stream_ctx.response_language_staging()) {
-        if (stream_ctx.response_language_hold_until_completion) return;
-        if (stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes) {
-            const prefix_len = @min(
-                stream_ctx.raw_text.items.len,
-                response_language_probe_limit_bytes,
-            );
-            const prefix = stream_ctx.raw_text.items[0..prefix_len];
-            if (response_language.evidence(prefix).script == stream_ctx.response_language_expected) {
-                try stream_ctx.accept_staged_response_language();
-            } else if (prefix_len == response_language_probe_limit_bytes) {
-                stream_ctx.response_language_next_probe_bytes = std.math.maxInt(usize);
-            } else {
-                stream_ctx.response_language_next_probe_bytes = @min(
-                    response_language_probe_limit_bytes,
-                    @max(stream_ctx.raw_text.items.len +| 1, stream_ctx.raw_text.items.len *| 2),
-                );
-            }
-        }
-        return;
-    }
     try publishAssistantChunkResolved(stream_ctx, chunk);
 }
 
@@ -490,7 +422,6 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
 }
 
 pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
-    if (stream_ctx.response_language_staging()) return;
     if (!stream_ctx.hooks.render_assistant_text) return;
     const alloc = stream_ctx.alloc;
     stream_ctx.initial_line_prefix.clearRetainingCapacity();
@@ -1225,43 +1156,27 @@ test "recovery starts a fresh response while retaining interrupted evidence" {
     try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.accepted_source());
 }
 
-test "interruption source retains accepted preview until a valid replacement" {
+test "recovery accepts replacement text in any language" {
     const alloc = std.testing.allocator;
     const prior = "The accepted English preview.";
-    const replacement = "The valid English replacement.";
-    const rejected = "我会先检查锁文件和依赖清单。";
-    const cases = [_]struct {
-        prior: []const u8,
-        candidate: []const u8,
-        interruption: []const u8,
-        accepted: []const u8,
-    }{
-        .{ .prior = prior, .candidate = rejected, .interruption = prior, .accepted = "" },
-        .{ .prior = "", .candidate = rejected, .interruption = "", .accepted = "" },
-        .{ .prior = prior, .candidate = "", .interruption = prior, .accepted = "" },
-        .{ .prior = prior, .candidate = replacement, .interruption = replacement, .accepted = replacement },
+    const replacement = "我会先检查锁文件和依赖清单。";
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var hook_set = capture.hooks();
+    hook_set.render_assistant_text = false;
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .turn_id = 1,
+        .alloc = alloc,
     };
+    defer stream_ctx.deinit();
+    try stream_ctx.restoreRecoverySource(prior, true);
+    try stream_ctx.beginRecoveryAttempt();
+    try streamAssistantChunk(&stream_ctx, replacement);
 
-    for (cases) |case| {
-        var capture = StreamCapture{};
-        defer capture.deinit(alloc);
-        var hook_set = capture.hooks();
-        hook_set.render_assistant_text = false;
-        var stream_ctx = StreamChunkContext{
-            .hooks = &hook_set,
-            .turn_id = 1,
-            .alloc = alloc,
-            .response_language_expected = .latin,
-        };
-        defer stream_ctx.deinit();
-        try stream_ctx.restoreRecoverySource(case.prior, true);
-        try stream_ctx.beginRecoveryAttempt();
-        try streamAssistantChunk(&stream_ctx, case.candidate);
-
-        try std.testing.expectEqualStrings(case.interruption, stream_ctx.interruption_source_or(""));
-        try std.testing.expectEqualStrings(case.accepted, stream_ctx.accepted_source());
-        try std.testing.expectEqual(@as(usize, if (case.accepted.len == 0) 0 else 1), capture.source_spans.items.len);
-    }
+    try std.testing.expectEqualStrings(replacement, stream_ctx.interruption_source_or(""));
+    try std.testing.expectEqualStrings(replacement, stream_ctx.accepted_source());
+    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
 }
 
 test "checkpoint recovery restarts Markdown without replaying an unfinished code fence" {

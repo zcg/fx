@@ -96,7 +96,7 @@ function systemKind(content: string): SystemKind {
   if (content.startsWith("Skills provide task instructions") || content.includes("<available_skills>") || content.startsWith("Configured MCP servers")) return "catalog";
   if (content.includes("<project-rules")) return "project";
   if (content.startsWith("<fx-turn-context>")) return "ctx";
-  if (content.startsWith("Runtime context:") || content.startsWith("<response_language_control>")) return "rt";
+  if (content.startsWith("Runtime context:")) return "rt";
   return "other";
 }
 
