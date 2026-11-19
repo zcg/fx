@@ -8,6 +8,8 @@ const secret = @import("../auth/secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const windows_credentials = @import("windows_credentials.zig");
 
+const Allocator = std.mem.Allocator;
+
 const err_sec_success: i32 = 0;
 const err_sec_item_not_found: i32 = -25300;
 const security_framework_path = "/System/Library/Frameworks/Security.framework/Security";
@@ -24,6 +26,8 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
+/// Configured-provider keys, one service per connection's env name.
+pub const provider_key_service_name = "FX_CONFIGURED_PROVIDER_KEY_V1";
 /// The sign-in credentials the MCP engine hands fx to keep, a different format.
 /// Not `FX_MCP_OAUTH_CREDENTIALS_V2`: fx builds that still run read and
 /// rewrite that item (`mcp_host/credentials.zig` says why).
@@ -53,7 +57,7 @@ pub const keychain_process_timeout: std.Io.Timeout = .{
     },
 };
 
-pub const Error = error{
+pub const Error = Allocator.Error || error{
     Cancelled,
     UnsupportedPlatform,
     UserNotSet,
@@ -94,6 +98,10 @@ fn userDefaultKeychainAvailableControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) Error!bool {
     if (!isAvailable()) return false;
+    // Credential Manager has no user default keychain to unlock: the user's
+    // logon is the scope. Asking `/usr/bin/security` for one on Windows can
+    // only fail, so report the store available without spawning a macOS tool.
+    if (comptime windows_credentials.supported) return true;
     return userDefaultKeychainAvailableForCommand(
         alloc,
         &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
@@ -135,10 +143,12 @@ fn userDefaultKeychainAvailableForCommand(
 /// inherit a thinner environment than a shell, so the operating system supplies the
 /// account when `USER` is absent instead of failing the read.
 fn accountName(buf: *AccountBuffer) Error![]const u8 {
-    if (io_mod.getenv("USER")) |user| {
-        if (user.len > 0 and user.len <= buf.len) {
-            @memcpy(buf[0..user.len], user);
-            return buf[0..user.len];
+    for ([_][]const u8{ "USER", "USERNAME" }) |variable| {
+        if (io_mod.getenv(variable)) |user| {
+            if (user.len > 0 and user.len <= buf.len) {
+                @memcpy(buf[0..user.len], user);
+                return buf[0..user.len];
+            }
         }
     }
     if (osAccountName(buf)) |name| {
@@ -387,19 +397,47 @@ pub fn storeInteractive() Error!void {
 }
 
 pub fn storeValue(value: []const u8) Error!void {
+    return storeValueForService(service_name, value);
+}
+
+fn storeValueForService(service: []const u8, value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0) return error.KeychainWriteFailed;
 
     if (comptime windows_credentials.supported) {
         var account_buf: AccountBuffer = undefined;
         const account = try accountName(&account_buf);
-        return windows_credentials.store(std.heap.c_allocator, service_name, account, value) catch |err| switch (err) {
-            error.OutOfMemory => error.KeychainWriteFailed,
-            else => error.KeychainWriteFailed,
-        };
+        return windows_credentials.store(std.heap.c_allocator, service, account, value) catch error.KeychainWriteFailed;
     }
-    if (comptime builtin.target.os.tag == .macos) return storeValueMac(service_name, value);
+    if (comptime builtin.target.os.tag == .macos) return storeValueMac(service, value);
     return error.UnsupportedPlatform;
+}
+
+fn providerKeyServiceAlloc(alloc: std.mem.Allocator, env_name: []const u8) Error![]u8 {
+    if (env_name.len == 0) return error.KeychainWriteFailed;
+    return alloc.print("{s}:{s}", .{ provider_key_service_name, env_name }) catch error.OutOfMemory;
+}
+
+/// Stores one configured provider's key under the env name its settings file
+/// records. The service name, not the OS account, distinguishes connections.
+pub fn storeProviderKey(alloc: std.mem.Allocator, env_name: []const u8, value: []const u8) Error!void {
+    const service = try providerKeyServiceAlloc(alloc, env_name);
+    defer alloc.free(service);
+    return storeValueForService(service, value);
+}
+
+/// Reads the key a configured provider saved under `env_name`.
+pub fn loadProviderKey(alloc: std.mem.Allocator, env_name: []const u8) Error!?[]u8 {
+    const service = try providerKeyServiceAlloc(alloc, env_name);
+    defer alloc.free(service);
+    return loadFromService(alloc, service);
+}
+
+/// Removes a configured provider's saved key, reporting whether one existed.
+pub fn deleteProviderKey(alloc: std.mem.Allocator, env_name: []const u8) Error!bool {
+    const service = try providerKeyServiceAlloc(alloc, env_name);
+    defer alloc.free(service);
+    return deleteServiceItem(alloc, service);
 }
 
 pub fn storeOAuthSession(value: []const u8) Error!void {

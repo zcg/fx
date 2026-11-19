@@ -308,6 +308,11 @@ pub fn admitResizeSignal(
     // `resizeLifecyclePending` true for good, which blocks every frame commit.
     if (!resize_interlock.takeResizePending()) return false;
     shell.render_requests.observeResizeSignal(now_ms, debounce_ms);
+    // A previous stuck resize may have exhausted the refusal budget. A newly
+    // admitted resize is a new lifecycle, so it starts with a fresh budget;
+    // otherwise the next one or two refused frames force it to settle before
+    // its probe has had a chance to answer.
+    shell.resize_refusals = 0;
     debug_trace.logf(
         "frame_schedule",
         "resize_block begin source={s} apply_after_ms={d} pending_reason_count={d}",

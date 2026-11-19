@@ -96,9 +96,10 @@ jobs:
 
   # A stable release waits for the checks AGENTS.md calls authoritative on the
   # same commit, named by SHA and not by branch: `Build & Test` covers the Linux
-  # gate, `E2E (deterministic)` and `Startup Latency` the behavior and budget,
-  # and `macOS arm64` the platform check. A skipped or failed check keeps the
-  # release from publishing while still allowing a manual dispatch to validate.
+  # gate, `Shellcheck` the shell scripts, `E2E (deterministic)` and
+  # `Startup Latency` the behavior and budget, and `macOS arm64` the platform
+  # check. A skipped or failed check keeps the release from publishing while
+  # still allowing a manual dispatch to validate.
   ci-gate:
     needs: check-version
     if: needs.check-version.outputs.publish == 'true'
@@ -114,7 +115,7 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          required=("Build & Test" "E2E (deterministic)" "Startup Latency" "macOS arm64")
+          required=("Build & Test" "Shellcheck" "E2E (deterministic)" "Startup Latency" "macOS arm64")
           deadline=$((SECONDS + 3600))
           while :; do
             report=$(gh api "repos/${REPO}/commits/${SHA}/check-runs" --paginate \

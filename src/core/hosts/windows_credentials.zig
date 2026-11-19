@@ -104,7 +104,7 @@ pub fn store(alloc: std.mem.Allocator, service: []const u8, account: []const u8,
     // A caller may hand a secret with a trailing newline, as a token read from
     // a file has. The Credential Manager keeps bytes verbatim, so it is trimmed
     // here rather than at every read.
-    const blob = std.mem.trimRight(u8, value, "\r\n");
+    const blob = std.mem.trimEnd(u8, value, "\r\n");
     if (blob.len == 0 or blob.len > max_blob_bytes) return error.WriteFailed;
 
     var credential: windows.CREDENTIALW = .{

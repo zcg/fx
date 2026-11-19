@@ -5,6 +5,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const settings_store = @import("../config/settings_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
+const configured_provider_key = @import("../auth/configured_provider_key.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1095,6 +1096,11 @@ pub fn Runtime(comptime App: type) type {
                 .clear_key => {
                     if (try rejectProviderDefinitionMutation(app, agent)) return;
                     const definition = app.provider_selection.definitions.get(target.label()) orelse return;
+                    if (definition.auth == .bearer) {
+                        configured_provider_key.remove(app.alloc, definition.auth.bearer) catch |err| {
+                            debug_trace.logf("auth", "provider key clear failed env={s} err={s}", .{ definition.auth.bearer, @errorName(err) });
+                        };
+                    }
                     _ = try config_runtime.setUserPreferences(app.alloc, .{ .provider_definition = .{
                         .name = definition.id,
                         .protocol = @tagName(definition.protocol),
@@ -1119,6 +1125,13 @@ pub fn Runtime(comptime App: type) type {
                     if (try rejectProviderDefinitionMutation(app, agent)) return;
                     const name = try app.alloc.dupe(u8, target.label());
                     defer app.alloc.free(name);
+                    if (app.provider_selection.definitions.get(name)) |definition| {
+                        if (definition.auth == .bearer) {
+                            configured_provider_key.remove(app.alloc, definition.auth.bearer) catch |err| {
+                                debug_trace.logf("auth", "provider key removal failed env={s} err={s}", .{ definition.auth.bearer, @errorName(err) });
+                            };
+                        }
+                    }
                     _ = config_runtime.setUserPreferences(app.alloc, .{ .remove_provider = name }) catch |err| {
                         debug_trace.logf("provider", "provider remove failed err={s}", .{@errorName(err)});
                         try app.writeDomainNotice(.{
@@ -1189,11 +1202,11 @@ pub fn Runtime(comptime App: type) type {
             const protocol = try app.alloc.dupe(u8, draft.protocol);
             defer app.alloc.free(protocol);
             // The key never goes into the settings file: that file records the
-            // environment variable the key is read from, and the key is put in
-            // the environment here so a saved connection works next start.
+            // environment variable name, and the key goes to the platform
+            // credential store under that name where one is available.
             const key_env = try settings_store.providerKeyEnvName(app.alloc, name);
             defer app.alloc.free(key_env);
-            io_mod.setPersistentEnv(key_env, draft.key) catch |err| {
+            const key_store = configured_provider_key.store(app.alloc, key_env, draft.key) catch |err| {
                 debug_trace.logf("auth", "add provider key store failed env={s} err={s}", .{ key_env, @errorName(err) });
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1206,6 +1219,16 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.cancelAddProvider(app.alloc);
                 return;
             };
+            if (key_store == .environment_required) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = try app.alloc.print(
+                        "Saved {s} without a credential store. Set {s} in your environment before using it.",
+                        .{ name, key_env },
+                    ),
+                }, true);
+            }
             _ = config_runtime.setUserPreferences(app.alloc, .{
                 .provider_definition = .{
                     .name = name,

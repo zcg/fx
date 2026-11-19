@@ -9,15 +9,34 @@ fn exists(path: []const u8) bool {
     return true;
 }
 
+fn reportCandidate(alloc: std.mem.Allocator, parts: []const []const u8) !void {
+    const path = try std.Io.Dir.path.join(alloc, parts);
+    defer alloc.free(path);
+    std.debug.print("{s} -> {}\n", .{ path, exists(path) });
+}
+
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
-    const candidates = [_][]const u8{
-        "C:\\Program Files\\Git\\bin\\bash.exe",
-        "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-        "D:\\Applications\\Scoop\\shims\\bash.exe",
-        "D:\\Applications\\Scoop\\apps\\git\\current\\bin\\bash.exe",
-    };
-    for (candidates) |c| std.debug.print("{s} -> {}\n", .{ c, exists(c) });
+    const bash = "bash.exe";
+    if (io_mod.getenv("ProgramFiles")) |root| {
+        try reportCandidate(alloc, &.{ root, "Git", "bin", bash });
+        try reportCandidate(alloc, &.{ root, "Git", "usr", "bin", bash });
+    }
+    if (io_mod.getenv("ProgramFiles(x86)")) |root| {
+        try reportCandidate(alloc, &.{ root, "Git", "bin", bash });
+        try reportCandidate(alloc, &.{ root, "Git", "usr", "bin", bash });
+    }
+    if (io_mod.getenv("LOCALAPPDATA")) |root| {
+        try reportCandidate(alloc, &.{ root, "Programs", "Git", "bin", bash });
+    }
+    if (io_mod.getenv("SCOOP")) |root| {
+        try reportCandidate(alloc, &.{ root, "shims", bash });
+        try reportCandidate(alloc, &.{ root, "apps", "git", "current", "bin", bash });
+    }
+    if (io_mod.getenv("USERPROFILE")) |root| {
+        try reportCandidate(alloc, &.{ root, "scoop", "shims", bash });
+        try reportCandidate(alloc, &.{ root, "scoop", "apps", "git", "current", "bin", bash });
+    }
 
     const path = io_mod.getenv("PATH") orelse {
         std.debug.print("no PATH\n", .{});

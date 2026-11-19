@@ -19,6 +19,7 @@ const provider_presets = @import("provider_presets.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const stored_login_testing = @import("stored_login_testing.zig");
+const configured_provider_key = @import("configured_provider_key.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -3193,7 +3194,12 @@ pub const Runtime = struct {
         try draft.name.appendSlice(alloc, name);
         try draft.base_url.appendSlice(alloc, definition.base_url);
         draft.protocol = @tagName(definition.protocol);
-        if (definition.auth == .bearer) try draft.key.appendSlice(alloc, definition.auth.bearer);
+        if (definition.auth == .bearer) {
+            if (configured_provider_key.loadSavedKey(alloc, definition.auth.bearer) catch null) |key| {
+                defer secret.zeroAndFree(alloc, key);
+                try draft.key.appendSlice(alloc, key);
+            }
+        }
         draft.field = .name;
     }
 

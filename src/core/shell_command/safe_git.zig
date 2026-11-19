@@ -95,7 +95,7 @@ pub fn prepareWith(arena: Allocator, cwd: []const u8, checks: CheckRunner) Check
     for (filters.names) |name| {
         if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) return refuse(.unsupported_filter_name, cwd);
     }
-    const executable = (try trustedExecutable(arena)) orelse return refuse(.git_missing, cwd);
+    const executable = (try trustedExecutable(arena, cwd)) orelse return refuse(.git_missing, cwd);
     switch (try versionCheck(arena, executable, checks)) {
         .supported => {},
         .too_old => return refuse(.git_too_old, cwd),
@@ -171,24 +171,14 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     return map;
 }
 
-/// The first git found at a fixed system location. git from PATH is never
-/// used, because PATH can include directories a repository controls.
-/// Finds git where fx trusts it to run.
-///
-/// POSIX looks in the fixed system directories only, so a program the
-/// repository or the user's PATH put in front of the real one is never run.
-/// Windows has no fixed set of directories to prefer: an installed program is
-/// found on PATH, which is what every installer and package manager writes,
-/// so that is where fx looks. The safety fx needs there is kept a different
-/// way: `appendCommand` still turns off every program this repository's own
-/// config could name, so a git found on PATH runs without the repository's
-/// hooks, filters, fsmonitor, pager, or signature verifier.
-fn trustedExecutable(arena: Allocator) Allocator.Error!?[]const u8 {
+/// Finds git where the platform normally installs it. On Windows that means
+/// an absolute entry on PATH, because Git can be installed anywhere. A
+/// relative PATH entry or one inside `cwd` is refused: a repository can ship
+/// either, and that is the executable-swap risk this module guards against.
+fn trustedExecutable(arena: Allocator, cwd: []const u8) Allocator.Error!?[]const u8 {
     if (comptime builtin.target.os.tag == .windows) {
         const windows_shell = @import("../shared/windows_shell.zig");
-        // `findProgram` walks PATH honoring PATHEXT, so `git` resolves to the
-        // `git.exe` an installer or package manager put there.
-        return windows_shell.findProgram(arena, "git");
+        return windows_shell.findProgramTrusted(arena, "git", cwd);
     }
     const candidates = [_][]const u8{
         "/usr/bin/git",
@@ -199,10 +189,14 @@ fn trustedExecutable(arena: Allocator) Allocator.Error!?[]const u8 {
         "/run/current-system/sw/bin/git",
     };
     for (candidates) |candidate| {
-        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), candidate, .{ .follow_symlinks = true }) catch continue;
-        if (stat.kind == .file) return candidate;
+        if (fileExists(candidate)) return candidate;
     }
     return null;
+}
+
+fn fileExists(path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = true }) catch return false;
+    return stat.kind == .file;
 }
 
 const VersionCheck = enum { supported, too_old, unknown };
@@ -348,7 +342,7 @@ test "a git check that times out ends safe git's preparation with no decision" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const cwd = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    if (try trustedExecutable(arena) == null) return error.SkipZigTest;
+    if (try trustedExecutable(arena, cwd) == null) return error.SkipZigTest;
 
     const io = io_mod.getIo();
     version_lock.lockUncancelable(io);
@@ -390,9 +384,9 @@ const SentinelRepo = struct {
     };
 
     fn init(arena: Allocator, dir: std.Io.Dir) !SentinelRepo {
-        const git = (try trustedExecutable(arena)) orelse return error.SkipZigTest;
-        if (try versionCheck(arena, git, unbounded_checks) != .supported) return error.SkipZigTest;
         const root = try io_mod.dirRealpathAlloc(arena, dir, ".");
+        const git = (try trustedExecutable(arena, root)) orelse return error.SkipZigTest;
+        if (try versionCheck(arena, git, unbounded_checks) != .supported) return error.SkipZigTest;
         const self: SentinelRepo = .{
             .arena = arena,
             .git = git,

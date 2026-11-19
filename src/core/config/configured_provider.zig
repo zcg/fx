@@ -511,10 +511,11 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
 }
 
 fn parse_auth(value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
+    try check_fields(value, &.{ "type", "env" }, at);
     const kind = try required(value, "type");
     if (kind != .string) return error.InvalidAuth;
     if (std.mem.eql(u8, kind.string, "none")) {
-        if (value.object.contains("key")) return error.InvalidAuth;
+        if (value.object.contains("env")) return error.InvalidAuth;
         return .none;
     }
     if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
@@ -826,7 +827,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","key":"test-router-key"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"TEST_ROUTER_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -844,7 +845,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
-    try std.testing.expectEqualStrings("test-router-key", router.auth.bearer);
+    try std.testing.expectEqualStrings("TEST_ROUTER_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
     const metadata = router.model("openai/gpt-4.1").?;
@@ -974,19 +975,20 @@ test "configured provider invalid schemas fail explicitly" {
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
 }
 
-test "configured provider auth accepts a saved API key or explicit none" {
+test "configured provider auth accepts an env reference or explicit none" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { json: []const u8, err: ParseError }{
         .{ .json = "null", .err = error.InvalidObject },
         .{ .json = "{}", .err = error.MissingField },
         .{ .json = "{\"type\":false}", .err = error.InvalidAuth },
         .{ .json = "{\"type\":\"basic\"}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"none\",\"key\":\"KEY\"}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"none\",\"key\":null}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"none\",\"key\":\"KEY\"}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"none\",\"env\":\"KEY\"}", .err = error.InvalidAuth },
         .{ .json = "{\"type\":\"bearer\"}", .err = error.MissingField },
-        .{ .json = "{\"type\":\"bearer\",\"key\":null}", .err = error.InvalidApiKey },
-        .{ .json = "{\"type\":\"bearer\",\"key\":\"KEY\\n\"}", .err = error.InvalidApiKey },
-        .{ .json = "{\"type\":\"bearer\",\"key\":\"KEY\",\"token\":\"literal\"}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"bearer\",\"key\":null}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"bearer\",\"key\":\"KEY\\n\"}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"bearer\",\"env\":null}", .err = error.InvalidEnvironmentName },
+        .{ .json = "{\"type\":\"bearer\",\"env\":\"1KEY\"}", .err = error.InvalidEnvironmentName },
         .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.UnknownField },
     };
     for (cases) |case| {
@@ -994,7 +996,7 @@ test "configured provider auth accepts a saved API key or explicit none" {
         defer alloc.free(json);
         try std.testing.expectError(case.err, Registry.parse_json(alloc, json));
     }
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"key\":\"_key_2\"}", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value, null)).bearer);
 }

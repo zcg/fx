@@ -223,7 +223,7 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 `scripts/detect-macos-need.sh` decides whether a change needs macOS. It runs the macOS checks when the change touches:
 
-- A Zig file with a macOS, BSD, or Linux code path
+- A Zig file with a macOS, BSD, Linux, or Windows code path
 - `build.zig`
 - The macOS signing script
 - The native SDK addon

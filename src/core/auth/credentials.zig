@@ -6,6 +6,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
+const configured_provider_key = @import("configured_provider_key.zig");
 const io_mod = @import("../shared/io.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
@@ -408,7 +409,20 @@ pub fn resolveForProvider(
         const bound = try provider.bind(registry);
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
-            .bearer => |key| if (key.len == 0) .{} else .{ .credential = .{ .token = try alloc.dupe(u8, key), .source = .configured } },
+            .bearer => |env| blk: {
+                const token = configured_provider_key.resolveKey(alloc, env) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => null,
+                };
+                if (token) |value| {
+                    if (value.len == 0) {
+                        alloc.free(value);
+                        break :blk .{};
+                    }
+                    break :blk .{ .credential = .{ .token = value, .source = .configured } };
+                }
+                break :blk .{};
+            },
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
         };
     }

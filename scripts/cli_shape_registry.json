@@ -121,6 +121,10 @@
       "job": "setting-override",
       "stability": "stable"
     },
+    "FX_SUBAGENT_MAX_DEPTH": {
+      "job": "setting-override",
+      "stability": "stable"
+    },
     "FX_SUBAGENT_MAX_AGENT_STEPS": {
       "job": "setting-override",
       "stability": "stable"

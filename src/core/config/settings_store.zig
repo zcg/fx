@@ -1991,15 +1991,12 @@ fn renamedGroup(
     return &root.getPtr(current).?.object;
 }
 
-/// Saves one named connection under `providers`, creating the object when the
-/// settings have none. An existing connection of the same name is replaced
-/// whole: a half-edited definition is worse than a retyped one.
 /// The environment variable a saved connection's key is read from.
 ///
-/// Derived from the connection name so it is stable across runs: a saved
-/// connection is useless if the name it reads changes every time. Upper case
-/// with anything that is not alphanumeric becoming `_`, which every shell on
-/// every platform can name.
+/// Derived from the connection name so it is stable across runs. Upper case,
+/// with anything that is not alphanumeric becoming `_`. Distinct provider
+/// names can normalize to the same variable, so callers use the credential
+/// store for durable keys; this name is a stable override and reference.
 pub fn providerKeyEnvName(alloc: Allocator, name: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -2011,6 +2008,9 @@ pub fn providerKeyEnvName(alloc: Allocator, name: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Saves one named connection under `providers`, creating the object when the
+/// settings have none. An existing connection of the same name is replaced
+/// whole: a half-edited definition is worse than a retyped one.
 fn putConfiguredProvider(
     arena: Allocator,
     root: *std.json.ObjectMap,
