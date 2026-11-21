@@ -277,9 +277,16 @@ const windows_console = if (!is_windows) struct {} else struct {
     ) callconv(.winapi) c_int;
 };
 
+/// These two tests drive the POSIX poll path through `std.posix.system.pipe2`.
+/// Darwin's `std.posix.system` is `void`, so the symbol does not exist there,
+/// and macOS polls through kqueue rather than the poll path they exercise.
+const supports_poll_tests = switch (builtin.target.os.tag) {
+    .windows, .macos, .ios, .tvos, .watchos, .visionos, .wasi => false,
+    else => true,
+};
+
 test "pollDescriptors reports a pipe becoming readable" {
-    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    if (comptime is_windows) return error.SkipZigTest;
+    if (comptime !supports_poll_tests) return error.SkipZigTest;
     var fds: [2]std.posix.fd_t = undefined;
     switch (std.posix.errno(std.posix.system.pipe2(&fds, .{ .NONBLOCK = true }))) {
         .SUCCESS => {},
@@ -299,8 +306,7 @@ test "pollDescriptors reports a pipe becoming readable" {
 }
 
 test "pollDescriptors reports hang up after the writer closes" {
-    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    if (comptime is_windows) return error.SkipZigTest;
+    if (comptime !supports_poll_tests) return error.SkipZigTest;
     var fds: [2]std.posix.fd_t = undefined;
     switch (std.posix.errno(std.posix.system.pipe2(&fds, .{ .NONBLOCK = true }))) {
         .SUCCESS => {},

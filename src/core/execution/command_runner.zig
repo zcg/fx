@@ -2156,6 +2156,62 @@ fn executeRawBashWithResultCommand(
     return formatCollectedOutput(alloc, result_command, cwd, result);
 }
 
+/// Runs `command` through cmd.exe by writing it to a batch file and letting
+/// cmd execute that file.
+///
+/// cmd does not parse a `/C` argument with the `CommandLineToArgvW` rules that
+/// `std.process` applies when it turns an argv list into a Windows command
+/// line, so a quote inside the command reaches cmd as a literal backslash
+/// quote and the command runs as something else. A batch file has no such
+/// layer: cmd reads the text as written.
+fn executeRawCmdFile(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    invocation: *const shell_resolver.Invocation,
+) !command_contract.RunCommandResult {
+    const io = io_mod.getIo();
+    // A short, unique name in the temporary directory. The file is removed
+    // whether the command succeeds or fails.
+    const dir_path = io_mod.getenv("TEMP") orelse io_mod.getenv("TMP") orelse ".";
+    var name_buffer: [64]u8 = undefined;
+    const name = try std.mem.print(
+        &name_buffer,
+        "fx-{d}-{d}.cmd",
+        .{ io_mod.milliTimestamp(), @as(u32, @truncate(@as(u128, @bitCast(io_mod.nanoTimestamp())))) },
+    );
+    const path = try std.Io.Dir.path.join(scratch, &.{ dir_path, name });
+    defer scratch.free(path);
+
+    // `@echo off` keeps the command from being echoed back as output, which is
+    // the same reason the resolver passes `/Q`.
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "@echo off\r\n");
+        try file.writeStreamingAll(io, command);
+        try file.writeStreamingAll(io, "\r\n");
+    }
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    var argv_buffer: [8][]const u8 = undefined;
+    var len: usize = 0;
+    for (invocation.argv()) |value| {
+        argv_buffer[len] = value;
+        len += 1;
+    }
+    // The last element the resolver appended is the command itself. Replace it
+    // with the batch file path, which needs no quoting beyond what std applies
+    // for a path that may contain spaces.
+    if (len != 0) {
+        argv_buffer[len - 1] = path;
+    }
+    const result = try executeProcess(scratch, cfg, argv_buffer[0..len], cwd);
+    return formatCollectedOutput(alloc, command, cwd, result);
+}
+
 fn executeRawInvocation(
     alloc: Allocator,
     scratch: Allocator,
@@ -2169,6 +2225,20 @@ fn executeRawInvocation(
     // the shell's stdout and stderr are collected the same way POSIX collects
     // them.
     if (builtin.target.os.tag == .wasi) return error.InvalidCommandEnvironment;
+
+    // cmd.exe does not parse its command line with the `CommandLineToArgvW`
+    // rules `std.process` uses to turn an argv list into a Windows command
+    // line. A quote inside the command therefore reaches cmd as a literal
+    // backslash-quote, and a command as ordinary as `dir /b "src"` runs as
+    // something else. The command travels in a batch file instead, which cmd
+    // reads verbatim, so no quoting rule sits between the caller and the
+    // shell.
+    if (comptime builtin.target.os.tag == .windows) {
+        if (shell_resolver.shellKind(invocation.path) == .cmd) {
+            return executeRawCmdFile(alloc, scratch, cfg, command, cwd, invocation);
+        }
+    }
+
     const result = try executeProcessWithScript(
         scratch,
         cfg,

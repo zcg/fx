@@ -550,6 +550,35 @@ pub fn setEnvironBlock(block: std.process.Environ.Block) void {
     global_libc_environ = false;
 }
 
+/// Reads the process environment as UTF-8 on Windows.
+///
+/// The C runtime hands `main` `GetEnvironmentStringsA`, which encodes values in
+/// the system ANSI code page: 936 (GBK) on a Chinese Windows, not UTF-8. Every
+/// reader here parses those bytes as UTF-8, so a path such as `C:\Users\张三`
+/// would arrive as invalid bytes. The process environment block itself holds
+/// UTF-16, so it is read from there and converted once at startup instead.
+///
+/// The returned array and its strings are owned by `alloc`; the caller keeps
+/// them for the process lifetime.
+pub fn windowsEnvironFromPeb(alloc: std.mem.Allocator) ?[*:null]const ?[*:0]const u8 {
+    if (comptime builtin.target.os.tag != .windows) return null;
+    const block = windows_env.GetEnvironmentStringsW() orelse return null;
+    defer _ = windows_env.FreeEnvironmentStringsW(block);
+
+    var strings: std.ArrayList(?[*:0]const u8) = .empty;
+    var offset: usize = 0;
+    while (block[offset] != 0) {
+        const len = std.mem.len(@as([*:0]const u16, block + offset));
+        const wide = block[offset .. offset + len];
+        offset += len + 1;
+        const utf8 = std.unicode.utf16LeToUtf8AllocZ(alloc, wide) catch continue;
+        strings.append(alloc, utf8.ptr) catch continue;
+    }
+    if (strings.items.len == 0) return null;
+    strings.append(alloc, null) catch return null;
+    return @ptrCast(strings.items.ptr);
+}
+
 /// Installs the environment `main` received. libc never frees that array,
 /// so it stays readable even after the process changes its environment.
 pub fn setRawEnviron(raw: RawEnviron) void {
@@ -2254,6 +2283,12 @@ pub fn isTty(fd: std.posix.fd_t) bool {
 /// Durable secrets belong in the platform credential store. The name still
 /// matches the one settings record, so a credential-store read can fall back
 /// to a variable an outer shell supplied explicitly.
+///
+/// On Windows `SetEnvironmentVariableW` updates the process environment block
+/// but not the C runtime's copy of it, and `getenv` here reads the runtime's
+/// copy first. That made a value written here invisible to the rest of the
+/// process until it restarted, so the runtime copy is refreshed through
+/// `_wputenv_s` right after.
 pub fn setProcessEnv(name: []const u8, value: []const u8) error{ OutOfMemory, Unsupported, Failed }!void {
     if (comptime builtin.target.os.tag == .windows) {
         const alloc = std.heap.c_allocator;
@@ -2262,6 +2297,7 @@ pub fn setProcessEnv(name: []const u8, value: []const u8) error{ OutOfMemory, Un
         const value_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, value) catch return error.OutOfMemory;
         defer alloc.free(value_wide);
         if (windows_env.SetEnvironmentVariableW(name_wide, value_wide.ptr) == 0) return error.Failed;
+        if (windows_env._wputenv_s(name_wide.ptr, value_wide.ptr) != 0) return error.Failed;
         return;
     }
     if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
@@ -2280,6 +2316,11 @@ pub fn unsetProcessEnv(name: []const u8) error{ OutOfMemory, Unsupported, Failed
         const name_wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return error.OutOfMemory;
         defer alloc.free(name_wide);
         if (windows_env.SetEnvironmentVariableW(name_wide, null) == 0) return error.Failed;
+        // Removing through the runtime as well, so `getenv` stops returning the
+        // value this process just cleared. `_wputenv_s` removes a variable when
+        // it is handed an empty value, not a null one.
+        const empty: [1:0]u16 = .{0};
+        if (windows_env._wputenv_s(name_wide.ptr, &empty) != 0) return error.Failed;
         return;
     }
     if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
@@ -2291,6 +2332,12 @@ pub fn unsetProcessEnv(name: []const u8) error{ OutOfMemory, Unsupported, Failed
 
 const windows_env = if (builtin.target.os.tag != .windows) struct {} else struct {
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
+    extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*:0]u16;
+    extern "kernel32" fn FreeEnvironmentStringsW(block: [*:0]u16) callconv(.winapi) i32;
+    /// Keeps the C runtime's private copy of the environment in step with the
+    /// process block. `getenv` reads that copy, so a value set only through
+    /// `SetEnvironmentVariableW` would not be visible to it.
+    extern "c" fn _wputenv_s(name: [*:0]const u16, value: ?[*:0]const u16) c_int;
 };
 
 const posix_env = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) struct {} else struct {

@@ -52,7 +52,7 @@ jobs:
         run: |
           # Build files and benchmarks hold Zig too, so the check covers more
           # than src/ (docs/audit/2026-11-06-full-review.md section 4.12).
-          zig fmt --check src/ build.zig benchmarks/*.zig
+          zig fmt --check src/ build.zig benchmarks/*.zig scripts/windows/*.zig
 
       - name: Validate PGSO corpus classification
         run: |
@@ -172,9 +172,8 @@ jobs:
         run: zig build test -Doptimize=ReleaseSafe -Dwindows-tests
 
       - name: Smoke test fresh binary
-        run: |
-          .\zig-out\bin\fx.exe --version
-          .\zig-out\bin\fx.exe help
+        shell: bash
+        run: scripts/smoke-binary.sh zig-out/bin/fx.exe
 
       - name: Save Zig cache
         uses: ./.github/actions/save-zig-cache

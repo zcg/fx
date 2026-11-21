@@ -11,7 +11,12 @@ const Allocator = std.mem.Allocator;
 
 /// Names the backend that answers on this platform so operators can tell where a
 /// stored key lives without knowing how the backend is selected.
-const backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
+const backend_label = if (builtin.target.os.tag == .macos)
+    "macOS Keychain"
+else if (builtin.target.os.tag == .windows)
+    "Windows Credential Manager"
+else
+    "profile file (not encrypted)";
 
 const max_key_file_bytes: usize = 8 * 1024;
 
@@ -35,13 +40,13 @@ fn isDisabled() bool {
 /// Returns the stored key, or null when no key is stored. An error means the store
 /// could not be read, which callers must keep distinct from absence.
 fn load(alloc: Allocator) LoadError!?[]u8 {
-    if (comptime builtin.target.os.tag == .macos) return loadFromKeychain(alloc);
+    if (native_keychain_is_available()) return loadFromKeychain(alloc);
     return loadFromProfile(alloc);
 }
 
 fn store(alloc: Allocator, value: []const u8) StoreError!void {
     if (value.len == 0) return error.StoredKeyWriteFailed;
-    if (comptime builtin.target.os.tag == .macos) {
+    if (native_keychain_is_available()) {
         keychain.storeValue(value) catch |err| return writeFailed("keychain", err);
         return;
     }
@@ -51,11 +56,16 @@ fn store(alloc: Allocator, value: []const u8) StoreError!void {
 /// Let the platform credential store own terminal input when it supports a
 /// secure prompt, keeping plaintext out of the fx process.
 fn storeInteractive() StoreError!bool {
-    if (comptime builtin.target.os.tag == .macos) {
-        keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
-        return true;
-    }
-    return false;
+    // Only macOS can prompt for a secret without the caller writing it; the
+    // Windows credential API takes the value from the process.
+    if (comptime builtin.target.os.tag != .macos) return false;
+    keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
+    return true;
+}
+
+/// Whether this platform has a real credential store behind `keychain`.
+fn native_keychain_is_available() bool {
+    return keychain.isAvailable();
 }
 
 fn isDisabledCallback(_: ?*anyopaque) bool {
@@ -64,7 +74,7 @@ fn isDisabledCallback(_: ?*anyopaque) bool {
 
 fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
     if (isDisabled()) return .missing;
-    if (comptime builtin.target.os.tag == .macos) {
+    if (native_keychain_is_available()) {
         return keychain.contains() catch .unavailable;
     }
     return presenceInProfile();
@@ -213,8 +223,10 @@ fn writeFailed(step: []const u8, err: anyerror) StoreError {
 test "stored key backend label names the platform store" {
     if (comptime builtin.target.os.tag == .macos) {
         try std.testing.expectEqualStrings("macOS Keychain", backend_label);
+    } else if (comptime builtin.target.os.tag == .windows) {
+        try std.testing.expectEqualStrings("Windows Credential Manager", backend_label);
     } else {
-        try std.testing.expectEqualStrings("profile file", backend_label);
+        try std.testing.expectEqualStrings("profile file (not encrypted)", backend_label);
     }
     try std.testing.expectEqualStrings(backend_label, provider.backend_label);
 }

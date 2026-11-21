@@ -32,11 +32,12 @@ pub fn enableShadowVt(shell: anytype, alloc: Allocator) !void {
 }
 
 pub fn disableShadowVt(shell: anytype) void {
-    if (shell.shadow_vt) |grid| {
+    const shell_ptr = if (@typeInfo(@TypeOf(shell)) == .pointer) shell else @constCast(&shell);
+    if (shell_ptr.shadow_vt) |grid| {
         grid.deinit();
-        if (shell.shadow_vt_alloc) |alloc| alloc.destroy(grid);
-        shell.shadow_vt = null;
-        shell.shadow_vt_alloc = null;
+        if (shell_ptr.shadow_vt_alloc) |alloc| alloc.destroy(grid);
+        shell_ptr.shadow_vt = null;
+        shell_ptr.shadow_vt_alloc = null;
     }
 }
 

@@ -18,6 +18,7 @@ const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
+const transcript_io = @import("../../ui/transcript/io.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -1018,12 +1019,24 @@ pub fn Runtime(comptime App: type) type {
                 .scrollback_handoff => try app_session_runtime.Runtime(App).giveUpScrollbackHandoff(app, "refusal_budget"),
                 .dimensions_invalid => {
                     // The terminal has not reported a usable size for a whole
-                    // budget. Its geometry may have changed while the query
-                    // failed, so an incremental diff against the stored shadow
-                    // could paint at the wrong size. A full reset repaints from
-                    // row one and rebuilds the shadow, and drops invalidations
-                    // recorded against the previous geometry.
-                    try app.shell.requestTerminalReset(&app.metrics);
+                    // budget, so its geometry may have changed while the query
+                    // failed and an incremental diff against the stored shadow
+                    // could paint at the wrong size. Dropping the shadow makes
+                    // the next frame rebuild it and repaint every band row.
+                    //
+                    // A full terminal reset would do that too, but it clears the
+                    // terminal's scrollback, and a terminal that loses its
+                    // scrollback clamps the viewport to the top: the user is
+                    // scrolled away from what they were reading, and any
+                    // selection they made goes with it. This path runs on a
+                    // budget the user did not ask for, so it must not move their
+                    // view.
+                    if (comptime @hasField(App, "footer_viewport")) {
+                        transcript_io.disableShadowVt(app.shell);
+                        app.shell.render_requests.clearPendingInvalidations();
+                        app.shell.footer_viewport.has_frame = false;
+                        try app.shell.initViewportWithReservedRows(&app.metrics, 1, app.shell.min_visible_viewport_rows);
+                    }
                 },
                 .resize_lifecycle => {
                     debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d}", .{

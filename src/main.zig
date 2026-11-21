@@ -4111,7 +4111,15 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         try windowsRawArgs(arena.allocator())
     else
         rawArgs(c_argc, c_argv);
-    const raw_env: RawEnviron = @ptrCast(c_envp);
+    // The C runtime hands over `GetEnvironmentStringsA`, so on a Windows whose
+    // ANSI code page is not UTF-8 (936 on a Chinese install) every non-ASCII
+    // value would reach the UTF-8 readers here as invalid bytes. The process
+    // environment block holds UTF-16, so it is converted once instead. The
+    // arena outlives every early return below.
+    const raw_env: RawEnviron = if (args_arena) |*arena| blk: {
+        const block = io_mod.windowsEnvironFromPeb(arena.allocator()) orelse break :blk @as(RawEnviron, @ptrCast(c_envp));
+        break :blk @ptrCast(block);
+    } else @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under fx's folder too.
     try useFxHomeFromEnv(raw_env);
 

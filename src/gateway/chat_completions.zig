@@ -8,6 +8,7 @@ const provider_set = @import("../core/gateway/provider_set.zig");
 const catalog = @import("../core/gateway/model_catalog.zig");
 const model_listing = @import("model_listing.zig");
 const listing_cache = @import("../core/gateway/model_listing_cache.zig");
+const configured_provider_key = @import("../core/auth/configured_provider_key.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
@@ -434,10 +435,25 @@ fn fetchListing(alloc: Allocator, definition: *const definitions.Definition, can
 }
 
 /// The token the provider's own listing accepts, or null when it needs none.
+///
+/// `auth.bearer` holds the name of the environment variable that carries the
+/// key, not the key itself. Sending the name would put it in an
+/// `Authorization` header and fail every listing with a 401, so the value is
+/// resolved the same way the request path resolves it.
 fn listingToken(alloc: Allocator, definition: *const definitions.Definition) !?[]u8 {
     switch (definition.auth) {
         .none => return null,
-        .bearer => |key| return if (key.len == 0) error.MissingConfiguredProviderCredential else try alloc.dupe(u8, key),
+        .bearer => |env_name| {
+            if (env_name.len == 0) return error.MissingConfiguredProviderCredential;
+            const token = configured_provider_key.resolveKey(alloc, env_name) catch
+                return error.MissingConfiguredProviderCredential;
+            const resolved = token orelse return error.MissingConfiguredProviderCredential;
+            if (resolved.len == 0) {
+                alloc.free(resolved);
+                return error.MissingConfiguredProviderCredential;
+            }
+            return resolved;
+        },
     }
 }
 

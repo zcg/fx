@@ -140,7 +140,14 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_paths = b.addOptions();
-    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
+    // A Windows build names its artifact `fx.exe`, and a development build
+    // names it `fx-dev.exe`, so the path a test opens must come from the same
+    // place the artifact name does rather than a hardcoded `fx`.
+    const product_name = if (target.result.os.tag == .windows)
+        (if (optimize == .debug) "fx-dev.exe" else "fx.exe")
+    else
+        "fx";
+    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, product_name));
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);
@@ -215,6 +222,12 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_session_manager_tests.step);
         test_step.dependOn(&run_session_manager_hook_tests.step);
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
+    } else {
+        // The suites are not built on Windows without the flag, so a bare
+        // `zig build test` would exit zero having run nothing. Report that
+        // instead of a green build that proves nothing.
+        const no_suites = b.addFail("on Windows the unit suites need -Dwindows-tests");
+        test_step.dependOn(&no_suites.step);
     }
 
     const fuzz_step = b.step(

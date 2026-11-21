@@ -316,12 +316,15 @@ pub fn admitResizeSignal(
     // sets it the same way, and leaving a set bit behind would make
     // `resizeLifecyclePending` true for good, which blocks every frame commit.
     if (!resize_interlock.takeResizePending()) return false;
+    // A newly admitted resize starts with a fresh budget, because the frames
+    // the previous lifecycle refused must not be charged against this one. It
+    // only resets when no lifecycle is still open: during a continuous drag
+    // every poll admits a resize, and clearing the shared budget on each one
+    // would keep the frame gates from ever reaching it, so nothing would force
+    // a repaint no matter how long the drag lasted.
+    const was_idle = lifecycleIdle(shell);
     shell.render_requests.observeResizeSignal(now_ms, debounce_ms);
-    // A previous stuck resize may have exhausted the refusal budget. A newly
-    // admitted resize is a new lifecycle, so it starts with a fresh budget;
-    // otherwise the next one or two refused frames force it to settle before
-    // its probe has had a chance to answer.
-    shell.resize_refusals = 0;
+    if (was_idle) shell.resize_refusals = 0;
     debug_trace.logf(
         "frame_schedule",
         "resize_block begin source={s} apply_after_ms={d} pending_reason_count={d}",
@@ -796,6 +799,12 @@ fn applyResizeWithLayoutResolved(
     if (shell.render_requests.pending_settled_width_reflow or size_changed) {
         try shell.requestTerminalResetAfterResize(metrics, history_row_delta);
     }
+    // The geometry is settled now, so close the lifecycle here. A target with
+    // no window-change signal has no later event that would clear `resize_dirty`
+    // on this pass, and every frame commit is refused while it is set: a drag
+    // that admits a resize on each poll would paint nothing until it stopped.
+    // The reset request above is what repaints to the new geometry.
+    shell.render_requests.completeResizeGeometry(false);
     try requestRedraw(shell, metrics, mode);
 }
 
