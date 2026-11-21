@@ -481,7 +481,7 @@ pub const Store = struct {
             durable_mode = if (comptime io_mod.modeIsEnforced) (try durable_home.stat(zio)).permissions.toMode() & 0o777 else 0;
             tightened_home = true;
         }
-        if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
+        if (mode == .read_only and durableModeWritableByGroupOrOther(@intCast(durable_mode))) {
             return error.PrivateStatePermissionsUnsupported;
         }
 
