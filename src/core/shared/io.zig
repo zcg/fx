@@ -816,6 +816,14 @@ pub fn awakeMilliTimestamp() i64 {
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
+/// Nanoseconds on the awake clock. A wall-clock step (NTP, a manual change)
+/// must not stretch or shorten a busy wait, so the writer measures its wait
+/// against this monotonic source.
+pub fn awakeNanoTimestamp() i128 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(ts.nanoseconds);
+}
+
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
@@ -1812,7 +1820,9 @@ pub fn setsockopt(fd: std.posix.fd_t, level: i32, name: i32, value: []const u8) 
         }
         return;
     }
-    std.posix.setsockopt(fd, level, name, value) catch return error.SocketOptionFailed;
+    // POSIX names the option as an unsigned 32-bit value; the callers here
+    // pass the same i32 they hand Winsock, so narrow it at this one border.
+    std.posix.setsockopt(fd, level, @intCast(name), value) catch return error.SocketOptionFailed;
 }
 
 const winsock = if (builtin.target.os.tag != .windows) struct {} else struct {

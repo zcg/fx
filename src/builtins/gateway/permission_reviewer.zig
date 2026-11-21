@@ -649,10 +649,10 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
     var unexpected_fake = FakeStream{ .outcomes = &.{ .unexpected_error, .valid } };
     const unexpected_config = testConfig(&unexpected_fake, null);
     const recovered = try reviewGatewayConfig(unexpected_config, std.testing.allocator, testRequest(), reviewer_model);
-    try std.testing.expectEqual(
-        std.meta.Tag(permission_auto_classifier.ParseOutcome).clear,
-        std.meta.activeTag(recovered),
-    );
+    switch (recovered) {
+        .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
+        .evidence_incomplete, .invalid => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqual(@as(usize, 2), unexpected_fake.calls);
 
     var cancelled_fake = FakeStream{ .outcomes = &.{.cancelled} };

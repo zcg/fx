@@ -67,8 +67,12 @@ pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) ter
     if (comptime builtin.target.os.tag == .windows) {
         if (comptime @hasField(@TypeOf(shell.*), "frame_writer")) {
             if (shell.frame_writer) |*writer| {
-                const result = writer.*.submit(bytes, 4 * std.time.ns_per_ms) catch |err| {
-                    return recordPartialFrame(metrics, &.{}, err);
+                const result = writer.*.submit(bytes, 4 * std.time.ns_per_ms) catch |err| switch (err) {
+                    // A frame is already in flight. That is a stall, not a
+                    // write failure: the shadow must not commit, and fx must
+                    // not treat it as a terminal recovery failure.
+                    error.WriterBusy => return .{ .stalled = writer.*.currentSequence() },
+                    else => return recordPartialFrame(metrics, &.{}, err),
                 };
                 return switch (result) {
                     .done => |outcome| switch (outcome) {
@@ -213,6 +217,9 @@ test "writeFrameBytes reports a terminal that hung up as a hang-up" {
             try std.testing.expectEqual(@as(usize, 0), partial.accepted_bytes);
             try std.testing.expectEqual(error.TerminalHungUp, partial.err);
         },
+        // This fake shell has no frame writer, so a write goes straight to the
+        // file and can never stall.
+        .stalled => return error.TestUnexpectedResult,
     }
 }
 
@@ -233,6 +240,7 @@ test "writeFrameBytes keeps the error of a write that fails another way" {
             try std.testing.expectEqual(@as(usize, 0), partial.accepted_bytes);
             try std.testing.expect(partial.err != error.TerminalHungUp);
         },
+        .stalled => return error.TestUnexpectedResult,
     }
 }
 

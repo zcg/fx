@@ -240,6 +240,24 @@ fn windowsSocketProbe(fd: std.posix.fd_t) ?Events {
     };
 }
 
+/// Writes one byte into a pipe the POSIX readiness tests created by hand. Zig
+/// 0.17 removed `std.posix.write`, so the descriptor is used through the file
+/// type that owns the same handle.
+fn writeTestFd(fd: std.posix.fd_t, bytes: []const u8) void {
+    if (comptime is_windows) return;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    _ = file.writeStreamingAll(std.testing.io, bytes) catch {};
+}
+
+/// Closes a pipe descriptor the POSIX readiness tests create by hand. Zig 0.17
+/// removed `std.posix.close`, so the descriptor is closed through the file type
+/// that owns the same handle.
+fn closeTestFd(fd: std.posix.fd_t) void {
+    if (comptime is_windows) return;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    file.close(std.testing.io);
+}
+
 const windows_wait = if (!is_windows) struct {} else struct {
     const object_0: u32 = 0x00000000;
     const timeout: u32 = 0x00000102;
@@ -267,14 +285,14 @@ test "pollDescriptors reports a pipe becoming readable" {
         .SUCCESS => {},
         else => return error.SkipZigTest,
     }
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    defer closeTestFd(fds[0]);
+    defer closeTestFd(fds[1]);
 
     var watches = [_]Watch{.{ .fd = fds[0] }};
     try std.testing.expectEqual(@as(usize, 0), try pollDescriptors(&watches, .now));
 
     const byte = [_]u8{0x41};
-    _ = try std.posix.write(fds[1], &byte);
+    writeTestFd(fds[1], &byte);
     try std.testing.expectEqual(@as(usize, 1), try pollDescriptors(&watches, .now));
     try std.testing.expect(watches[0].events.readable);
     try std.testing.expect(hasInput(fds[0]));
@@ -288,8 +306,8 @@ test "pollDescriptors reports hang up after the writer closes" {
         .SUCCESS => {},
         else => return error.SkipZigTest,
     }
-    defer std.posix.close(fds[0]);
-    std.posix.close(fds[1]);
+    defer closeTestFd(fds[0]);
+    closeTestFd(fds[1]);
 
     var watches = [_]Watch{.{ .fd = fds[0] }};
     const ready = try pollDescriptors(&watches, .{ .milliseconds = 100 });

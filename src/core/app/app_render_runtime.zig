@@ -1051,6 +1051,18 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "frame_writer_started")) {
                 if (app.frame_writer_started) {
                     if (app.frame_writer_state.takeCompletion()) |done| {
+                        // The abandoned frame finished while the terminal was
+                        // blocked. If it failed, its bytes never reached the
+                        // screen; either way the visible grid is unknown, so
+                        // the next pass repaints from current state.
+                        switch (done.outcome) {
+                            .complete => {},
+                            .partial => |partial| debug_trace.logf(
+                                "frame_writer",
+                                "recovery sequence={d} accepted_bytes={d} err={s}",
+                                .{ done.sequence, partial.accepted_bytes, @errorName(partial.err) },
+                            ),
+                        }
                         debug_trace.logf("frame_writer", "recovery sequence={d}", .{done.sequence});
                         try app.shell.requestTerminalReset(&app.metrics);
                         activeRenderRequests(app).stall_logged = false;
@@ -3861,7 +3873,17 @@ const CoordinatorFaultTestApp = struct {
             cols: u16 = 80,
         } = .{},
         render_requests: render_request.RenderRequestState = .{},
+
+        /// Stands in for the real shell's full repaint request. The forced-gate
+        /// path calls it when the terminal has not reported a usable size for a
+        /// whole refusal budget.
+        pub fn requestTerminalReset(self: *@This(), _: *anyopaque) !void {
+            self.terminal_reset_pending = true;
+        }
     } = .{},
+    /// The real app carries render metrics beside the shell; the forced-gate
+    /// path passes them to `requestTerminalReset`.
+    metrics: struct {} = .{},
     fault: CoordinatorFault = .committed,
     attempts: usize = 0,
     injected_reason: ?render_request.Reason = null,

@@ -7,7 +7,10 @@ const is_macos = builtin.target.os.tag == .macos;
 
 var wrapped_vtable: std.Io.VTable = undefined;
 var wrapped_original_vtable: ?*const std.Io.VTable = null;
-const preferred_inherited_fd_target: std.posix.fd_t = if (is_macos) 64 else undefined;
+/// The descriptor number Darwin's inherited-fd machinery prefers to hand a
+/// child. Only macOS reads it; every other target gets the same value so the
+/// shared test below can name it without evaluating `undefined`.
+const preferred_inherited_fd_target: std.posix.fd_t = 64;
 pub fn wrap(original: std.Io) std.Io {
     if (comptime !is_macos) return original;
     if (wrapped_original_vtable) |original_vtable| {
@@ -476,7 +479,7 @@ test "Darwin spawn resolves argv through parent PATH and replaces the child envi
 }
 
 test "Darwin explicit inherited descriptor avoids low user descriptors" {
-    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    if (comptime !is_macos) return error.SkipZigTest;
     const io = try darwin_io();
     for ([_]std.posix.fd_t{
         0,

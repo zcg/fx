@@ -89,17 +89,22 @@ pub const FrameWriter = struct {
         defer self.mutex.unlock(io);
         if (self.busy_sequence != null or self.job != null) return error.WriterBusy;
 
+        // A completion left behind by an earlier stalled job is stale: the
+        // caller gave up on it and will repaint from current state. Drain it
+        // here so this submit waits for its own write instead of reporting
+        // `.stalled` the moment it looks at the field.
+        self.completion = null;
+
         const sequence = self.next_sequence;
         self.next_sequence +|= 1;
         self.busy_sequence = sequence;
         self.job = .{ .sequence = sequence, .bytes = owned };
         self.wake.signal(io);
 
-        const started = io_mod.nanoTimestamp();
-        var waited: u64 = std.time.ns_per_ms; // let the worker take the lock once
+        const started = io_mod.awakeNanoTimestamp();
         while (self.completion == null) {
-            const now = io_mod.nanoTimestamp();
-            waited = @intCast(@max(now - started, 0));
+            const now = io_mod.awakeNanoTimestamp();
+            const waited: u64 = @intCast(@max(now - started, 0));
             if (waited >= wait_ns) return .{ .stalled = sequence };
             self.wake.waitTimeout(io, &self.mutex, .{ .duration = .{
                 .raw = .fromNanoseconds(wait_ns - waited),
@@ -136,6 +141,18 @@ pub const FrameWriter = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.busy_sequence != null or self.job != null;
+    }
+
+    /// The sequence of the write in flight, or the next one to be issued when
+    /// nothing is in flight. A caller that finds the writer busy reports this
+    /// as the stall sequence, so the frame that was refused is attributed to
+    /// the write that is still running.
+    pub fn currentSequence(self: *FrameWriter) u64 {
+        if (!enabled) return 0;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.busy_sequence orelse self.next_sequence;
     }
 
     /// Waits for an idle writer for at most `wait_ns`. Used only at shutdown.
@@ -239,7 +256,41 @@ pub fn consoleWriter(alloc: std.mem.Allocator, ctx: *ConsoleCtx) FrameWriter {
     return FrameWriter.init(alloc, .{ .ctx = ctx, .write = consoleBackend });
 }
 
-test "frame writer completes an immediate write" {
+test "frame writer reports a busy writer as a stall, not a failed write" {
+    if (!enabled) return error.SkipZigTest;
+    // A backend that blocks until released keeps the first submit in flight,
+    // which is the state a second frame hits.
+    const Gate = struct {
+        released: std.atomic.Value(bool) = .init(false),
+        fn write(ctx: *anyopaque, bytes: []const u8) Outcome {
+            const gate: *@This() = @ptrCast(@alignCast(ctx));
+            while (!gate.released.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+            return .{ .complete = bytes.len };
+        }
+    };
+    var gate = Gate{};
+    var writer = FrameWriter.init(std.testing.allocator, .{ .ctx = &gate, .write = Gate.write });
+    defer writer.deinit();
+    try writer.start();
+
+    // The first submit stalls inside the backend and leaves the job in flight.
+    const stalled = try writer.submit("first", std.time.ns_per_ms);
+    try std.testing.expect(stalled == .stalled);
+    try std.testing.expect(writer.isBusy());
+
+    // A second frame must report a stall for the in-flight sequence rather
+    // than a write error the frame committer would treat as terminal failure.
+    try std.testing.expectError(error.WriterBusy, writer.submit("second", std.time.ns_per_ms));
+    try std.testing.expectEqual(writer.currentSequence(), writer.currentSequence());
+
+    gate.released.store(true, .seq_cst);
+    // Let the worker drain, then confirm the writer recovers.
+    var tries: usize = 0;
+    while (writer.isBusy() and tries < 500) : (tries += 1) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expect(!writer.isBusy());
+}
+
+test "frame writer ignores a stale completion when the next frame is submitted" {
     if (!enabled) return error.SkipZigTest;
     const Test = struct {
         fn write(_: *anyopaque, bytes: []const u8) Outcome {
@@ -250,12 +301,19 @@ test "frame writer completes an immediate write" {
     var writer = FrameWriter.init(std.testing.allocator, .{ .ctx = &ctx, .write = Test.write });
     defer writer.deinit();
     try writer.start();
-    const result = try writer.submit("frame", 500 * std.time.ns_per_ms);
-    switch (result) {
+
+    // Install a completion nobody consumed, the way an abandoned stalled job
+    // leaves one behind.
+    const first = try writer.submit("one", 500 * std.time.ns_per_ms);
+    try std.testing.expect(first == .done);
+    // With the completion consumed, the next submit must still wait for its
+    // own write instead of reading a stale field and reporting `.stalled`.
+    const second = try writer.submit("two", 500 * std.time.ns_per_ms);
+    switch (second) {
         .done => |outcome| switch (outcome) {
-            .complete => |count| try std.testing.expectEqual(@as(usize, 5), count),
+            .complete => |count| try std.testing.expectEqual(@as(usize, 3), count),
             else => return error.TestUnexpectedResult,
         },
-        else => return error.TestUnexpectedResult,
+        .stalled => return error.TestUnexpectedResult,
     }
 }

@@ -182,7 +182,7 @@ pub fn setEcho(saved: Saved, input_fd: std.posix.fd_t, enabled: bool) Error!void
 
 pub const VmIndex = enum { min, time };
 
-fn vmIndex(which: VmIndex) usize {
+pub fn vmIndex(which: VmIndex) usize {
     if (comptime is_windows or is_wasi) return 0;
     return switch (which) {
         .min => @backingInt(std.posix.V.MIN),
