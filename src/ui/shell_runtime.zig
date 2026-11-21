@@ -228,8 +228,11 @@ pub const TerminalState = struct {
     }
 
     pub fn enableBracketedPaste(_: TerminalState) !void {
-        var stdout_file = std.Io.File.stdout();
-        try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.bracketed_paste_enable_sequence);
+        // A console screen-buffer handle needs WriteConsoleW, which is what
+        // writeFd uses on Windows. std.Io.File.stdout().writeStreamingAll
+        // issues NtWriteFile and fails with INVALID_HANDLE on conhost, leaving
+        // bracketed paste disabled after a terminal reset.
+        try io_mod.writeFd(io_mod.stdoutHandle(), ui_terminal.bracketed_paste_enable_sequence);
     }
 
     pub fn enableThemeNotifications(_: TerminalState) !void {

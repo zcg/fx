@@ -295,15 +295,13 @@ pub fn collectResizeFacts(
         return;
     }
 
-    shell.layout = next_layout;
+    // A changed size needs the canonical settled resize path: it clears
+    // invalidations recorded against the old geometry and requests the reset
+    // replay that reflows history to the new width. Applying `shell.layout`
+    // directly here leaves stale pre-reset ranges behind, which fail frame
+    // validation against the smaller terminal instead of being repainted.
+    try applyResizeWithLayoutResolved(shell, metrics, next_layout, true, null);
     shell.terminal_dimensions_invalid = false;
-    // The geometry was just measured from the terminal, so it is settled: the
-    // next frame paints it, and nothing waits for a budget that only exists
-    // to unstick resizes whose applying pass never ran.
-    shell.render_requests.completeResizeGeometry(false);
-    try recordOwnedBandInvalidation(shell, .resize);
-    metrics.debounced_resizes += 1;
-    try requestRedraw(shell, metrics, .replay_viewport);
 }
 
 pub fn admitResizeSignal(

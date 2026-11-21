@@ -938,6 +938,9 @@ fn deleteServiceItem(
 
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
+    if (comptime windows_credentials.supported) {
+        return windows_credentials.remove(alloc, service, account) catch error.KeychainDeleteFailed;
+    }
     const result = std.process.run(alloc, io_mod.getIo(), .{
         .argv = &.{
             "/usr/bin/security",

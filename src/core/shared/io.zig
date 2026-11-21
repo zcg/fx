@@ -2095,12 +2095,12 @@ const WindowsRecordEvent = extern union {
 };
 
 pub const WindowsKeyEventRecord = extern struct {
-    key_down: i32,
-    repeat_count: u16,
-    virtual_key_code: u16,
-    virtual_scan_code: u16,
-    unicode_char: u16,
-    control_key_state: u32,
+    key_down: i32 = 0,
+    repeat_count: u16 = 0,
+    virtual_key_code: u16 = 0,
+    virtual_scan_code: u16 = 0,
+    unicode_char: u16 = 0,
+    control_key_state: u32 = 0,
 };
 
 /// How many records one probe peeks. A burst of resize records from a window

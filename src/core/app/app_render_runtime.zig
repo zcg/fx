@@ -1018,12 +1018,12 @@ pub fn Runtime(comptime App: type) type {
                 .scrollback_handoff => try app_session_runtime.Runtime(App).giveUpScrollbackHandoff(app, "refusal_budget"),
                 .dimensions_invalid => {
                     // The terminal has not reported a usable size for a whole
-                    // budget. Paint with the stored geometry, which is what the
-                    // frame would have shown anyway, and let the next resize
-                    // pass re-query and correct it.
-                    app.shell.terminal_dimensions_invalid = false;
-                    app.shell.render_requests.request(.transcript);
-                    app.shell.render_requests.request(.footer);
+                    // budget. Its geometry may have changed while the query
+                    // failed, so an incremental diff against the stored shadow
+                    // could paint at the wrong size. A full reset repaints from
+                    // row one and rebuilds the shadow, and drops invalidations
+                    // recorded against the previous geometry.
+                    try app.shell.requestTerminalReset(&app.metrics);
                 },
                 .resize_lifecycle => {
                     debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d}", .{

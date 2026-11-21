@@ -290,16 +290,18 @@ pub fn findProgramTrusted(alloc: Allocator, name: []const u8, workspace: []const
 fn envVar(alloc: Allocator, name: []const u8) ?[]u8 {
     const name_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch return null;
     defer alloc.free(name_w);
-    var buffer: [32 * 1024]u8 = undefined;
+    // GetEnvironmentVariableW's size argument is a count of UTF-16 code units,
+    // not bytes: passing a byte count here lets a long value write past this
+    // buffer. Keep the storage as WCHARs throughout.
+    var buffer: [32 * 1024]u16 = undefined;
     const written = GetEnvironmentVariableW(name_w.ptr, &buffer, buffer.len);
     if (written == 0 or written > buffer.len) return null;
-    const wide: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, buffer[0 .. written * @sizeOf(u16)]));
-    return std.unicode.utf16LeToUtf8Alloc(alloc, wide) catch null;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, buffer[0..written]) catch null;
 }
 
 extern "kernel32" fn GetEnvironmentVariableW(
     name: [*:0]const u16,
-    buffer: [*]u8,
+    buffer: [*]u16,
     size: windows.DWORD,
 ) callconv(.winapi) windows.DWORD;
 

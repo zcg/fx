@@ -56,19 +56,36 @@ pub fn store(alloc: Allocator, env_name: []const u8, value: []const u8) !StoreRe
         // Other code in this process may read the env var before the next
         // credential resolution; durable storage is the credential store.
         try io_mod.setProcessEnv(env_name, value);
+        try noteFxSetEnv(alloc, env_name);
         return .credential_store;
     }
     try io_mod.setProcessEnv(env_name, value);
+    try noteFxSetEnv(alloc, env_name);
     return .environment_required;
 }
 
-/// Removes a saved key. An env var the user set still wins by design and is
-/// deliberately left alone.
+fn noteFxSetEnv(alloc: Allocator, env_name: []const u8) !void {
+    const owned = try alloc.dupe(u8, env_name);
+    errdefer alloc.free(owned);
+    try fx_set_env_names.put(alloc, owned, {});
+}
+
+/// Removes a saved key and the in-process value `store` may have set. An
+/// environment variable supplied by the outer shell is deliberately left
+/// alone: it is not fx's to delete and still wins by design.
 pub fn remove(alloc: Allocator, env_name: []const u8) !void {
     if (env_name.len == 0) return;
+    if (fx_set_env_names.fetchRemove(env_name)) |entry| {
+        alloc.free(entry.key);
+        io_mod.unsetProcessEnv(env_name) catch {};
+    }
     if (!native_keychain.isAvailable() or native_keychain.isDisabled()) return;
     _ = native_keychain.deleteProviderKey(alloc, env_name) catch |err| switch (err) {
         error.KeychainItemNotFound => false,
         else => return err,
     };
 }
+
+/// Env names fx wrote into this process via `store`. Only these may be
+/// removed on clear; a variable from the outer shell is the user's own.
+var fx_set_env_names: std.StringHashMapUnmanaged(void) = .empty;
