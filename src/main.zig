@@ -3848,13 +3848,16 @@ const App = struct {
                 if (self.shell.sessionScrollbackHandoffPending()) {
                     // These passes are refused before `flushRequestedFrame`
                     // runs, so the frame gates' own budget never sees them.
-                    // Count them here: a handoff that stopped progressing
-                    // must give up after a whole budget instead of holding
-                    // every frame for the rest of the session.
-                    self.shell.resize_refusals +|= 1;
-                    if (self.shell.resize_refusals >= RenderAppRuntime.max_frame_refusals) {
-                        try SessionAppRuntime.giveUpScrollbackHandoff(self, "refusal_budget");
-                        self.shell.resize_refusals = 0;
+                    // Count them only while no other gate holds the frame: a
+                    // resize being applied is already bounded by that gate's
+                    // budget, and counting its wait here would kill a healthy
+                    // handoff just because a resize happened to overlap it.
+                    if (shell_runtime.resizeLifecycleIdle(&self.shell)) {
+                        self.shell.resize_refusals +|= 1;
+                        if (self.shell.resize_refusals >= RenderAppRuntime.max_frame_refusals) {
+                            try SessionAppRuntime.giveUpScrollbackHandoff(self, "refusal_budget");
+                            self.shell.resize_refusals = 0;
+                        }
                     }
                     return;
                 }
