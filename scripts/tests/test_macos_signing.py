@@ -636,8 +636,11 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         )[0]
         self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
         self.assertIn("environment: apple-signing", sign_release)
+        # The release also waits for the CI gate, which holds it back until the
+        # commit's required checks pass.
         self.assertIn(
-            "needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]",
+            "needs: [check-version, ci-gate, package-linux, build-macos-x86_64, "
+            "sign-macos-arm64]",
             release,
         )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
