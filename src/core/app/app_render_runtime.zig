@@ -965,77 +965,108 @@ pub fn Runtime(comptime App: type) type {
             return picker_state.model_picker_speed_options[speed_index % picker_state.model_picker_speed_options.len];
         }
 
-        /// How many frames a resize may refuse before the block is dropped.
-        /// A resize being applied refuses one or two, so a higher count means
-        /// the pass that applies it is stuck.
-        const max_resize_refusals: u8 = 8;
+        /// Which gate, if any, held this pass's frame back. A scrollback
+        /// handoff refuses while it still has rows to push; a resize being
+        /// applied refuses until its probe answers; an invalid layout refuses
+        /// until the terminal reports a usable size again.
+        const FrameGate = enum { scrollback_handoff, dimensions_invalid, resize_lifecycle };
+
+        /// How many passes a gate may refuse the frame before it is forced
+        /// open. A resize being applied refuses one or two, and a scrollback
+        /// handoff pushes at most one screenful per pass, so a higher count
+        /// means the pass that would resolve the gate is stuck and nothing
+        /// will resolve it on its own. Counting refusals rather than reading a
+        /// clock keeps the rule exact.
+        const max_frame_refusals: u8 = 8;
 
         fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, speed_index: usize) bool {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
-        pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
+        /// The gate holding this pass's frame back, or null when the pass may
+        /// paint. A handoff whose recorded size no longer matches the layout
+        /// can no longer finish, so it is dropped here rather than held.
+        fn heldFrameGate(app: *App) ?FrameGate {
             if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
                 if (app.shell.sessionScrollbackHandoffPending()) {
-                    // A handoff is planned against one geometry and one set of
-                    // rows. Either can move under it, and a handoff that can no
-                    // longer finish must not keep every frame refused for the
-                    // rest of the session, so one whose recorded size no longer
-                    // matches the layout is dropped here.
                     if (comptime @hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff")) {
                         if (app.shell.pending_session_scrollback_handoff) |handoff| {
                             if (handoff.terminal_cols != app.shell.layout.cols or
                                 handoff.terminal_rows != app.shell.layout.rows)
                             {
                                 app.shell.cancelSessionScrollbackHandoff("layout_changed_before_frame");
-                            } else {
-                                debug_trace.logf("frame_schedule", "flush_refused scrollback_handoff remaining={d}", .{handoff.remaining_rows});
-                                return;
+                                return null;
                             }
+                            return .scrollback_handoff;
                         }
-                    } else return;
+                        return null;
+                    }
+                    return null;
                 }
             }
-            if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) {
+            if (app.shell.terminal_dimensions_invalid) return .dimensions_invalid;
+            if (comptime @hasField(@TypeOf(app.shell), "pending_resize_observation")) {
+                if (shell_runtime.resizeBlocksFrameCommit(&app.shell)) return .resize_lifecycle;
+            }
+            return null;
+        }
+
+        /// Forces a gate that has refused a whole budget of passes open, so the
+        /// screen cannot stay frozen past the budget whatever the gate is. The
+        /// next resize pass re-queries the terminal and corrects any stale
+        /// geometry the forced frame painted with.
+        fn forceFrameGateOpen(app: *App, held: FrameGate) !void {
+            debug_trace.logf("frame_schedule", "flush_gate_forced gate={s} refusals={d}", .{
+                @tagName(held),
+                app.shell.resize_refusals,
+            });
+            switch (held) {
+                .scrollback_handoff => try app_session_runtime.Runtime(App).giveUpScrollbackHandoff(app, "refusal_budget"),
+                .dimensions_invalid => {
+                    // The terminal has not reported a usable size for a whole
+                    // budget. Paint with the stored geometry, which is what the
+                    // frame would have shown anyway, and let the next resize
+                    // pass re-query and correct it.
+                    app.shell.terminal_dimensions_invalid = false;
+                    app.shell.render_requests.request(.transcript);
+                    app.shell.render_requests.request(.footer);
+                },
+                .resize_lifecycle => {
+                    debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d}", .{
+                        app.shell.render_requests.resize_apply_after_ms,
+                    });
+                    app.shell.render_requests.completeResizeGeometry(false);
+                    app.shell.pending_resize_observation = null;
+                },
+            }
+            app.shell.resize_refusals = 0;
+        }
+
+        pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
+            if (app.shell.layout.rows == 0 or app.shell.layout.cols == 0) {
                 // A frame is refused here while the terminal has no usable
-                // size, and only a later resize clears the flag. Recorded so a
-                // frozen screen names the gate that held it.
-                debug_trace.logf("frame_schedule", "flush_refused dimensions_invalid={} rows={d} cols={d}", .{
-                    app.shell.terminal_dimensions_invalid,
+                // size. Nothing can be painted into zero rows or columns, so
+                // no budget applies; a resize that reports a usable size lifts
+                // the refusal.
+                debug_trace.logf("frame_schedule", "flush_refused empty_layout rows={d} cols={d}", .{
                     app.shell.layout.rows,
                     app.shell.layout.cols,
                 });
                 return;
             }
-            const has_resize_lifecycle =
-                @hasField(@TypeOf(app.shell), "pending_resize_observation");
-            if (comptime has_resize_lifecycle) {
-                if (shell_runtime.resizeBlocksFrameCommit(&app.shell)) {
-                    // A resize blocks the next frame until it is applied, and
-                    // the pass that applies it can be waiting on a probe the
-                    // terminal will not answer. A block that has refused this
-                    // many frames in a row is not a resize in progress, it is a
-                    // resize nothing will ever apply, and the screen would stay
-                    // frozen for the rest of the session. Counting refusals
-                    // rather than reading a clock keeps the rule exact: a resize
-                    // that is being applied refuses at most a frame or two.
-                    if (app.shell.resize_refusals >= max_resize_refusals) {
-                        debug_trace.logf("frame_schedule", "flush_resize_overdue apply_after_ms={d} refusals={d}", .{
-                            app.shell.render_requests.resize_apply_after_ms,
-                            app.shell.resize_refusals,
-                        });
-                        app.shell.render_requests.completeResizeGeometry(false);
-                        app.shell.pending_resize_observation = null;
-                        app.shell.resize_refusals = 0;
-                    } else {
-                        app.shell.resize_refusals +|= 1;
-                        debug_trace.logf("frame_schedule", "flush_refused resize_lifecycle pending_after_ms={d} refusals={d}", .{
-                            app.shell.render_requests.resize_apply_after_ms,
-                            app.shell.resize_refusals,
-                        });
-                        return;
-                    }
+            if (heldFrameGate(app)) |held| {
+                if (app.shell.resize_refusals >= max_frame_refusals) {
+                    try forceFrameGateOpen(app, held);
+                } else {
+                    app.shell.resize_refusals +|= 1;
+                    debug_trace.logf("frame_schedule", "flush_refused gate={s} refusals={d}", .{
+                        @tagName(held),
+                        app.shell.resize_refusals,
+                    });
+                    return;
                 }
+            } else {
+                app.shell.resize_refusals = 0;
             }
             const render_requests = activeRenderRequests(app);
             var attempt = (try render_requests.beginAttempt()) orelse return;
@@ -1057,6 +1088,8 @@ pub fn Runtime(comptime App: type) type {
             );
             defer attempt.deinit();
 
+            const has_resize_lifecycle =
+                @hasField(@TypeOf(app.shell), "pending_resize_observation");
             const resize_commit = if (comptime has_resize_lifecycle)
                 shell_runtime.pendingResizeFrameCommit(
                     &app.shell,

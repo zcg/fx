@@ -4887,9 +4887,10 @@ pub const TranscriptRuntime = struct {
     /// Pre-paint cursor evidence retained from live geometry through the
     /// matching canonical reset commit.
     pending_resize_observation: ?ResizeObservation = null,
-    /// How many frames in a row a resize has refused. A resize that is being
-    /// applied refuses one or two; a count that keeps climbing means nothing
-    /// is going to apply it, and the screen would stay frozen.
+    /// How many frames in a row a frame gate has refused. A resize being
+    /// applied, a scrollback handoff mid-push, or an invalid layout refuses
+    /// one or two; a count that keeps climbing means nothing is going to
+    /// resolve the gate, and the screen would stay frozen.
     resize_refusals: u8 = 0,
     /// Forces the next viewport diff paint to start from a real terminal
     /// clear. This is reserved for resize/reflow repair; normal streamed

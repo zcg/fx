@@ -919,7 +919,7 @@ pub fn Runtime(comptime App: type) type {
         /// its frame already pushed some rows into scrollback, the terminal
         /// is cleared and the transcript printed again, as after a resize, so
         /// the switch's next handoff does not push those rows a second time.
-        fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
+        pub fn giveUpScrollbackHandoff(app: *App, reason: []const u8) !void {
             if (comptime !@hasField(@TypeOf(app.shell), "pending_session_scrollback_handoff") or !@hasField(App, "metrics")) return;
             const pending = app.shell.pending_session_scrollback_handoff orelse return;
             app.shell.cancelSessionScrollbackHandoff(reason);
