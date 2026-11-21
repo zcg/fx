@@ -4446,7 +4446,16 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
 
 const default_command_output_block_cap: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
-const resume_publication_rows_per_frame: u32 = 64;
+/// How many restored rows one frame may push into terminal scrollback while
+/// a resume is publishing. The batch bounds one frame's paint, so the loop
+/// stays responsive; the value still decides how long entering a long
+/// session takes, since Windows waits up to 150 ms between passes: at 64
+/// rows a frame, a 20,000-row session crawled for about 45 seconds. A
+/// screenful of rows costs a few milliseconds to paint, so a much larger
+/// batch keeps every session's resume inside a couple of seconds while the
+/// per-frame bound still yields to input before any single paint grows
+/// unbounded.
+const resume_publication_rows_per_frame: u32 = 400;
 
 pub const PaintTraceState = struct {
     transcript_top: u16 = 0,
@@ -5142,6 +5151,14 @@ pub const TranscriptRuntime = struct {
 
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {
         return if (self.notebook.pending_resume_source) |*source| source.bytes else &.{};
+    }
+
+    /// Whether a resume is still publishing restored rows into scrollback.
+    /// The event loop keeps its active pass cadence while this is true, so a
+    /// long session's resume runs at 8 ms per frame instead of the idle
+    /// poll's 150 ms, which is what made entering a long session crawl.
+    pub fn resumePublicationPending(self: *const TranscriptRuntime) bool {
+        return self.notebook.pending_resume_source != null;
     }
 
     pub fn committedRowProvenance(

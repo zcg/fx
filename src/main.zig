@@ -262,6 +262,11 @@ fn nativeLoopPollTimeoutMs(
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
     file_listing_hold_pending: bool,
+    /// A resume is still publishing restored rows into scrollback: each
+    /// frame carries a bounded batch, so the loop keeps its active cadence
+    /// until the newest content is on screen instead of pausing 150 ms
+    /// between batches.
+    resume_publication_pending: bool,
     /// A time-bounded drain put events back: run the next iteration without
     /// waiting for input.
     next_iteration_due: bool,
@@ -271,7 +276,8 @@ fn nativeLoopPollTimeoutMs(
         auth_refresh_active or
         skills_refresh_active or
         transcript_page_work_active or
-        file_listing_hold_pending)
+        file_listing_hold_pending or
+        resume_publication_pending)
         @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
     else
         default_timeout_ms;
@@ -1381,6 +1387,7 @@ const App = struct {
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
                 InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+                self.shell.resumePublicationPending(),
                 self.takeDrainContinuationDue(),
             );
             // A target that reports a resize only by polling takes every pass
@@ -4860,15 +4867,16 @@ test "process io connects through a reachable address while fx tasks hold every 
 test "focused UI workers retain a bounded native poll timeout" {
     const focused = focused_ui_worker_poll_timeout_ms;
     const idle = min_idle_poll_timeout_ms;
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false));
-    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
-    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
-    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
-    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
-    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
-    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
-    try std.testing.expectEqual(idle, nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
-    try std.testing.expectEqual(idle, nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, true, false, false, false, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, true, false, false, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, true, false, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, true, false, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, false, true, false, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, false, false, false, false, false, true, false));
+    try std.testing.expectEqual(focused, nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
+    try std.testing.expectEqual(idle, nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
+    try std.testing.expectEqual(idle, nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
