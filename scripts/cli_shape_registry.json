@@ -404,6 +404,10 @@
     "FX_WEB_SEARCH_BACKEND": {
       "job": "internal",
       "stability": "internal"
+    },
+    "FX_PROVIDER_": {
+      "job": "setting-override",
+      "stability": "stable"
     }
   },
   "not_env": {
@@ -413,7 +417,8 @@
     "FX_OAUTH_PENDING_REVOCATIONS_V1": "Keychain service name for the fx login's kept sign-outs, not an env var",
     "FX_OAUTH_SESSION_V1": "Keychain service name for the fx OAuth session, not an env var",
     "FX_PARITY_LOG": "Set for the fake shell in a unit test; fx never reads it",
-    "FX_TEST_AI_GATEWAY_API_KEY": "Keychain service name used by keychain tests, not an env var"
+    "FX_TEST_AI_GATEWAY_API_KEY": "Keychain service name used by keychain tests, not an env var",
+    "FX_CONFIGURED_PROVIDER_KEY_V1": "Keychain service name for configured provider keys, not an env var"
   },
   "external_env": [
     "AI_GATEWAY_API_KEY",
@@ -436,14 +441,15 @@
     "PATH",
     "SHELL",
     "SSH_CONNECTION",
+    "TEMP",
     "TERM",
     "TERM_PROGRAM",
+    "TMP",
     "TMPDIR",
     "TMUX",
     "TMUX_PANE",
     "TYPESAFE_API_KEY",
     "TYPESAFE_BASE_URL",
-    "USER",
     "USERPROFILE",
     "WAYLAND_DISPLAY",
     "XDG_CONFIG_HOME",
