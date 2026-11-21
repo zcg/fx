@@ -30,10 +30,13 @@ mkdir -p "$work/model" "$work/tmp" "$work/states"
 cp "$(dirname "$spec")"/*.tla "$work/model/"
 cp "$cfg" "$work/model/"
 
+# tlc_find assigns these when it finds a working Java and jar.
+# shellcheck disable=SC2154
 echo "run-tlc.sh: java=$tlc_java jar=$tlc_jar work=$work" >&2
 set +e
 (
     cd "$work/model" &&
+# shellcheck disable=SC2154
         "$tlc_java" -XX:+UseParallelGC -Xmx512m "-Djava.io.tmpdir=$work/tmp" -cp "$tlc_jar" tlc2.TLC \
             -workers 1 -metadir "$work/states" -config "$(basename "$cfg")" "$@" "$(basename "$spec")"
 )

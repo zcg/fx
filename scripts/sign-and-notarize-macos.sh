@@ -165,12 +165,18 @@ if ! "${xcrun_bin}" notarytool log "${submission_id}" \
     "${notary_log_path}"; then
     fail_stage "notarization log retrieval"
 fi
+# The jq program uses single quotes on purpose: $cdhash is bound by --arg,
+# so it must not expand in the shell.
+# shellcheck disable=SC2016
 if ! "${jq_bin}" -e \
     '.status == "Accepted" and ((.issues // []) | length == 0)' \
     "${notary_log_path}" >/dev/null; then
     echo "Apple notarization log contains issues" >&2
     exit 1
 fi
+# The jq program uses single quotes on purpose: $cdhash is bound by --arg,
+# so it must not expand in the shell.
+# shellcheck disable=SC2016
 if ! "${jq_bin}" -e \
     --arg cdhash "${signed_cdhash}" \
     '.ticketContents // [] | any(.cdhash == $cdhash)' \
