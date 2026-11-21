@@ -950,7 +950,6 @@ test "the credential file is private, and one this fx can't read is never writte
     try testing.expectEqual(std.Io.File.Kind.named_pipe, (try tmp.dir.statFile(testing.io, test_path, .{ .follow_symlinks = false })).kind);
 }
 
-
 test "a refused login removes only its own: one another fx saved since stays" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

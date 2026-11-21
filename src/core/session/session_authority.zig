@@ -244,7 +244,6 @@ test "session files open without waiting on a FIFO" {
     try std.testing.expectEqual(@as(?[]u8, null), try readOptionalSessionFile(alloc, &dir, "missing.json", 16));
 }
 
-
 /// Reports whether `name` exists directly under the session dir, mapping
 /// unsafe link/dir shapes to `error.SessionPathUnsafe`.
 pub fn entryExistsRelative(

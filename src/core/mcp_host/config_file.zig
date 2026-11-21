@@ -381,7 +381,6 @@ test "a linked config file is never edited, whether a symlink or a hard link" {
     try testing.expectEqualStrings("{}", shared);
 }
 
-
 test "read returns a file's text, follows a symlink, and refuses a fifo without blocking" {
     if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
     const alloc = testing.allocator;

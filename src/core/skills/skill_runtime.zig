@@ -4351,7 +4351,6 @@ fn createTempSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, li
     };
 }
 
-
 fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8) !void {
     if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) {
         return error.SkipZigTest;

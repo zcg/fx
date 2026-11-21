@@ -148,12 +148,46 @@ jobs:
           cache-key: ${{ steps.zig.outputs.cache-key }}
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
+  # Windows has no SIGWINCH and uses MSVC/UCRT, so its I/O and link paths do not
+  # exist on the Linux and macOS runners. Build and run the opt-in Windows
+  # suites on a native runner so a Windows-only regression fails the PR.
+  windows:
+    name: Windows native build and tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.1"
+          cache-key: ci-windows-ReleaseSafe
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Test
+        run: zig build test -Doptimize=ReleaseSafe -Dwindows-tests
+
+      - name: Smoke test fresh binary
+        run: |
+          .\zig-out\bin\fx.exe --version
+          .\zig-out\bin\fx.exe help
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
   # The SDK jobs are part of this required check because Publish libfx relies
   # on them instead of rerunning the package qualification before publishing.
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-mcp-host, tla-transcript-window, tla-subagent]
+    needs: [zig_mode, windows, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-mcp-host, tla-transcript-window, tla-subagent]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -161,7 +195,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 10 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 11 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)

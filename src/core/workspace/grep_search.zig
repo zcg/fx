@@ -1060,7 +1060,6 @@ test "grep search skips a symlink to a FIFO instead of waiting for a writer" {
     try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "docs/real.txt"));
 }
 
-
 test "grep search scans a file root of any size" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

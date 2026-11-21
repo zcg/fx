@@ -1064,7 +1064,6 @@ test "missing session ID error and unsupported schema error" {
     );
 }
 
-
 test "reads of an empty or missing home find nothing and create nothing" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

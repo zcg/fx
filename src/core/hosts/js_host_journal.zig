@@ -12,7 +12,6 @@ fn fx_journal_flush_unlinked() callconv(.c) i32 {
     unreachable;
 }
 
-
 pub fn flush() error{JournalFlushFailed}!void {
     if (fx_journal_flush() != 0) return error.JournalFlushFailed;
 }

@@ -503,7 +503,6 @@ pub fn listActionableCatalog(
     return catalog;
 }
 
-
 test "catalog cache ignores a FIFO without blocking" {
     if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
