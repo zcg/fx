@@ -977,7 +977,7 @@ pub fn Runtime(comptime App: type) type {
         /// means the pass that would resolve the gate is stuck and nothing
         /// will resolve it on its own. Counting refusals rather than reading a
         /// clock keeps the rule exact.
-        const max_frame_refusals: u8 = 8;
+        pub const max_frame_refusals: u8 = 8;
 
         fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, speed_index: usize) bool {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
@@ -1042,7 +1042,27 @@ pub fn Runtime(comptime App: type) type {
             app.shell.resize_refusals = 0;
         }
 
+        /// How long frames may stay pending without a commit before one
+        /// watchdog line names the stall. The loop can be wedged outside this
+        /// function, in a console write or read that the terminal is not
+        /// answering; the first pass after such a wedge reports how long
+        /// nothing was painted, and a gate that refuses in place reports each
+        /// 3 s while it holds.
+        const frame_stall_report_ms: i64 = 3000;
+
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
+            const render_requests = activeRenderRequests(app);
+            if (render_requests.hasPending() and render_requests.last_commit_ms > 0) {
+                const stalled_ms = io_mod.milliTimestamp() - render_requests.last_commit_ms;
+                if (stalled_ms > frame_stall_report_ms and !render_requests.stall_logged) {
+                    render_requests.stall_logged = true;
+                    debug_trace.logf(
+                        "watchdog",
+                        "frame_stall ms={d} pending_reasons={d} refusals={d}",
+                        .{ stalled_ms, render_requests.pendingReasonCount(), app.shell.resize_refusals },
+                    );
+                }
+            }
             if (app.shell.layout.rows == 0 or app.shell.layout.cols == 0) {
                 // A frame is refused here while the terminal has no usable
                 // size. Nothing can be painted into zero rows or columns, so
@@ -1068,7 +1088,6 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 app.shell.resize_refusals = 0;
             }
-            const render_requests = activeRenderRequests(app);
             var attempt = (try render_requests.beginAttempt()) orelse return;
             const snapshot = attempt.snapshot;
             var reason_buf: [128]u8 = undefined;
@@ -1151,7 +1170,11 @@ pub fn Runtime(comptime App: type) type {
 
             if (!result.is_committed()) {
                 input_completion_runtime.CompletionRuntime(App).distrustFilePicker(app);
-                render_requests.resetInputPendingAbortStreak();
+                // A shadow refusal is not an input-driven abort, so it does
+                // not reset the input-pending streak: a refusal that repeats
+                // while input keeps landing must still reach the bound that
+                // stops aborting builds, or the two conditions ping-pong into
+                // passes that never commit anything.
                 attempt.restore();
                 debug_trace.logf(
                     "frame_schedule",

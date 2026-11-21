@@ -180,7 +180,14 @@ fn windowsPoll(watches: []Watch, timeout: Timeout) error{Unsupported}!usize {
 
 fn windowsProbe(fd: std.posix.fd_t) error{Unsupported}!Events {
     var event_count: u32 = 0;
-    if (windows_console.GetNumberOfConsoleInputEvents(fd, &event_count) != 0) return .{ .readable = event_count > 0 };
+    if (windows_console.GetNumberOfConsoleInputEvents(fd, &event_count) != 0) {
+        // The record count includes window, focus, and menu records, which a
+        // byte-stream read filters out and never returns: trusting the count
+        // would report readable on a lone resize record and block the caller
+        // in a read until the next keypress. Only a deliverable key counts.
+        if (event_count == 0) return .{};
+        return .{ .readable = io_mod.consoleKeysPending(fd) };
+    }
 
     // A signaled pipe handle does not prove bytes are waiting. Peek without
     // consuming them so the next read cannot block after this probe.

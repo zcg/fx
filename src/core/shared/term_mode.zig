@@ -75,8 +75,16 @@ pub fn enableRaw(saved: Saved, input_fd: std.posix.fd_t, output_fd: std.posix.fd
         // echo, and Ctrl+C processing are all cleared, which is what fx's key
         // handling expects, and virtual terminal input is turned on so a key and
         // a paste arrive as the ANSI byte stream the input parser reads.
-        const raw_input = windows_enable_window_input |
-            windows_enable_extended_flags |
+        //
+        // Window changes are deliberately not enabled. `ENABLE_WINDOW_INPUT`
+        // makes the console enqueue resize, focus, and menu records, but the
+        // byte-stream read fx uses (`ReadConsoleA`) filters those records out
+        // and returns only when a character is available: one such record with
+        // no key behind it would leave the loop blocked in a read until the
+        // next keypress, with no output at all. fx learns of a resize by
+        // polling the console size every pass instead, so the records would
+        // never be read and would only wedge the loop.
+        const raw_input = windows_enable_extended_flags |
             windows_enable_virtual_terminal_input;
         if (!setMode(input_fd, raw_input)) return error.Unexpected;
 
@@ -214,6 +222,9 @@ fn windowsGetConsoleOutputCP() u32 {
 const windows_enable_processed_input: u32 = 0x0001;
 const windows_enable_line_input: u32 = 0x0002;
 const windows_enable_echo_input: u32 = 0x0004;
+/// `ENABLE_WINDOW_INPUT`. Deliberately never set: see the comment in
+/// `enableRaw`. Left named so a future change cannot reintroduce it by
+/// inventing the value.
 const windows_enable_window_input: u32 = 0x0008;
 const windows_enable_extended_flags: u32 = 0x0080;
 const windows_enable_processed_output: u32 = 0x0001;

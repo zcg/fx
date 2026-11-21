@@ -3838,7 +3838,19 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             if (self.shell.sessionScrollbackHandoffPending()) {
                 try SessionAppRuntime.settlePendingLiveSessionTransition(self, self.screenAgent());
-                if (self.shell.sessionScrollbackHandoffPending()) return;
+                if (self.shell.sessionScrollbackHandoffPending()) {
+                    // These passes are refused before `flushRequestedFrame`
+                    // runs, so the frame gates' own budget never sees them.
+                    // Count them here: a handoff that stopped progressing
+                    // must give up after a whole budget instead of holding
+                    // every frame for the rest of the session.
+                    self.shell.resize_refusals +|= 1;
+                    if (self.shell.resize_refusals >= RenderAppRuntime.max_frame_refusals) {
+                        try SessionAppRuntime.giveUpScrollbackHandoff(self, "refusal_budget");
+                        self.shell.resize_refusals = 0;
+                    }
+                    return;
+                }
             }
         }
         _ = try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history);

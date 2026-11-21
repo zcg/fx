@@ -285,11 +285,22 @@ pub fn collectResizeFacts(
         return;
     };
     if (next_layout.rows == shell.layout.rows and next_layout.cols == shell.layout.cols and !shell.terminal_dimensions_invalid) {
+        // The terminal reports the size fx already has, so whatever admitted
+        // this resize lifecycle, the geometry is settled now. Close the
+        // lifecycle here: `resize_dirty` refuses every frame commit, and a
+        // no-signal target has no later event that would clear it, so leaving
+        // it set would hold the screen for a whole refusal budget after every
+        // admitted-but-unchanged size.
+        shell.render_requests.completeResizeGeometry(false);
         return;
     }
 
     shell.layout = next_layout;
     shell.terminal_dimensions_invalid = false;
+    // The geometry was just measured from the terminal, so it is settled: the
+    // next frame paints it, and nothing waits for a budget that only exists
+    // to unstick resizes whose applying pass never ran.
+    shell.render_requests.completeResizeGeometry(false);
     try recordOwnedBandInvalidation(shell, .resize);
     metrics.debounced_resizes += 1;
     try requestRedraw(shell, metrics, .replay_viewport);

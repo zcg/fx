@@ -109,6 +109,11 @@ pub const RenderRequestState = struct {
     next_animation_generation: u64 = 1,
     consecutive_input_pending_aborts: u8 = 0,
     observed_compaction_revision: u64 = 0,
+    /// When the last frame committed. The watchdog compares it with the
+    /// current time while requests are pending, so a stall — a stuck gate or
+    /// a loop wedged in a console call — leaves one named trace line.
+    last_commit_ms: i64 = 0,
+    stall_logged: bool = false,
 
     pub fn observeCompactionRevision(self: *RenderRequestState, revision: u64) void {
         if (self.observed_compaction_revision == revision) return;
@@ -326,6 +331,8 @@ pub const RenderRequestState = struct {
         self.attempt_has_invalidations = false;
         self.attempt_affects_approval = false;
         self.attempt_active = false;
+        self.last_commit_ms = committed_at_ms;
+        self.stall_logged = false;
         self.resetInputPendingAbortStreak();
     }
 
