@@ -26,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("io.zig");
+const pathing = @import("../workspace/pathing.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -264,21 +265,80 @@ fn bashFromRegistry(alloc: Allocator) !?[]u8 {
 pub fn findProgramTrusted(alloc: Allocator, name: []const u8, workspace: []const u8) !?[]u8 {
     const path = envVar(alloc, "PATH") orelse return null;
     defer alloc.free(path);
-    const pathing = @import("../workspace/pathing.zig");
+
+    const workspace_canonical = canonicalizeForTrust(alloc, workspace) catch null;
+    defer if (workspace_canonical) |value| alloc.free(value);
+
     var it = std.mem.splitScalar(u8, path, ';');
     while (it.next()) |dir| {
         if (dir.len == 0 or !std.Io.Dir.path.isAbsolute(dir)) continue;
-        if (pathing.pathInside(workspace, dir)) continue;
-        const bare = try std.Io.Dir.path.join(alloc, &.{ dir, name });
+
+        const dir_canonical = canonicalizeForTrust(alloc, dir) catch null;
+        defer if (dir_canonical) |value| alloc.free(value);
+
+        if (insideTrustedWorkspace(workspace, workspace_canonical, dir, dir_canonical)) continue;
+
+        const lookup_dir = dir_canonical orelse dir;
+        const bare = try std.Io.Dir.path.join(alloc, &.{ lookup_dir, name });
         defer alloc.free(bare);
-        if (try existingFile(alloc, bare)) |found| return found;
+
+        if (try existingTrustedFile(alloc, bare, workspace, workspace_canonical)) |found| return found;
         for (program_extensions) |extension| {
             const with_extension = try std.mem.concat(alloc, u8, &.{ bare, extension });
             defer alloc.free(with_extension);
-            if (try existingFile(alloc, with_extension)) |found| return found;
+            if (try existingTrustedFile(alloc, with_extension, workspace, workspace_canonical)) |found| return found;
         }
     }
     return null;
+}
+
+/// Best-effort canonical path. A failure is "no evidence", never "untrusted":
+/// ordinary PATH entries on network drives or temporarily unavailable paths
+/// must keep working. OOM still propagates through the caller.
+fn canonicalizeForTrust(alloc: Allocator, path: []const u8) !?[]u8 {
+    return io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+fn insideTrustedWorkspace(
+    workspace: []const u8,
+    workspace_canonical: ?[]const u8,
+    raw: []const u8,
+    canonical: ?[]const u8,
+) bool {
+    if (pathing.pathInside(workspace, raw)) return true;
+    if (canonical) |value| if (pathing.pathInside(workspace, value)) return true;
+    if (workspace_canonical) |root| {
+        if (pathing.pathInside(root, raw)) return true;
+        if (canonical) |value| if (pathing.pathInside(root, value)) return true;
+    }
+    return false;
+}
+
+/// Opens the candidate and returns the path of the handle actually opened, so
+/// an 8.3 short name or a junction cannot hide a workspace-owned executable.
+/// Candidates whose canonical path is unavailable are skipped: the trusted
+/// lookup promises a canonical executable path.
+fn existingTrustedFile(
+    alloc: Allocator,
+    candidate: []const u8,
+    workspace: []const u8,
+    workspace_canonical: ?[]const u8,
+) !?[]u8 {
+    var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), candidate, .{}) catch return null;
+    defer file.close(io_mod.getIo());
+    const canonical = io_mod.openedFilePathAlloc(alloc, file) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    errdefer alloc.free(canonical);
+    if (insideTrustedWorkspace(workspace, workspace_canonical, candidate, canonical)) {
+        alloc.free(canonical);
+        return null;
+    }
+    return canonical;
 }
 
 /// Reads an environment variable through Win32 directly.

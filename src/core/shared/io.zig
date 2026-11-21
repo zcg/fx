@@ -2920,7 +2920,10 @@ fn standardizeWindowsDosPath(alloc: std.mem.Allocator, wide: []const u16) ![]u8 
 /// unresolvable handles fail closed.
 pub fn openedFilePathAlloc(alloc: std.mem.Allocator, file: std.Io.File) ![]u8 {
     const stat = try file.stat(getIo());
-    if (stat.kind != .file or stat.nlink == 0) return error.HandlePathUnavailable;
+    // Windows leaves nlink at zero for handles opened without backup intent,
+    // which is the ordinary case. It is "not reported", not "deleted": let
+    // handlePathAlloc decide whether the handle has usable path evidence.
+    if (stat.kind != .file or (comptime builtin.target.os.tag != .windows and stat.nlink == 0)) return error.HandlePathUnavailable;
     const path = try handlePathAlloc(alloc, file.handle);
     errdefer alloc.free(path);
     if (!std.Io.Dir.path.isAbsolute(path)) return error.HandlePathUnavailable;
