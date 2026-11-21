@@ -52,6 +52,14 @@ tar -xzf "$capture" -C "$extract_dir"
 archive_matches="$({
   grep -R -a -n -E '/Users/[^/[:space:]]+/|team_[A-Za-z0-9]{24}' "$extract_dir" || true
 } | grep -Ev '/Users/(guest|example|tester|private|me)/|team_000000000000000000000000' || true)"
+# A grep that prints 'Binary file ... matches' instead of the matching text tells
+# this check nothing: the filter above cannot see which path or identifier it
+# found. Ask those files again with -o so the match itself is what gets compared.
+if grep -q '^Binary file ' <<<"$archive_matches"; then
+  archive_matches="$({
+    grep -R -a -o -E '/Users/[^/[:space:]]+/|team_[A-Za-z0-9]{24}' "$extract_dir" || true
+  } | grep -Ev '/Users/(guest|example|tester|private|me)/|team_000000000000000000000000' || true)"
+fi
 if [[ -n "$archive_matches" ]]; then
   printf 'Render fixture contains personal or internal data:\n%s\n' "$archive_matches" >&2
   exit 1
