@@ -159,6 +159,11 @@ pub const FrameWriter = struct {
         return true;
     }
 
+    /// Stops the writer and joins the worker. `WriteConsoleW` cannot be
+    /// cancelled: if a write is already blocked in the console, the worker
+    /// will never return, so joining here would hang shutdown. The caller
+    /// should `quiesce` first and, when it returns false, abandon the thread
+    /// with `detach` and let process exit reclaim it.
     pub fn deinit(self: *FrameWriter) void {
         if (!enabled) return;
         const io = io_mod.getIo();
@@ -173,6 +178,16 @@ pub const FrameWriter = struct {
         if (self.job) |job| self.alloc.free(job.bytes);
         self.job = null;
         self.* = undefined;
+    }
+
+    /// Gives up ownership of the worker without joining it. Only for the
+    /// shutdown path where a console write is already stuck: the process is
+    /// about to exit, so the operating system will reclaim the thread and the
+    /// console handle. The caller must not free this struct or its allocator
+    /// while the worker may still be running.
+    pub fn detach(self: *FrameWriter) void {
+        self.thread = null;
+        self.stop = true;
     }
 
     fn workerMain(self: *FrameWriter) void {

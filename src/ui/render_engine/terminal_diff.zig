@@ -869,10 +869,21 @@ fn recoverPartialFrame(
             return error.TerminalSyncRecoveryFailed;
         },
         .stalled => {
-            // The writer is blocked; cleanup cannot be written now either.
-            // Leave the shadow untouched and let the recovery repaint handle
-            // the terminal once the writer drains.
-            return error.TerminalSyncRecoveryFailed;
+            // The writer is blocked, so cleanup cannot be written now either.
+            // This is not a terminal failure: it is the same transient state
+            // as the frame's own stalled write. Leave the shadow untouched
+            // and retry after the writer drains, instead of ending fx.
+            return .{
+                .bytes_written = 0,
+                .changed_cells = changed_cells,
+                .full_repaint = full_repaint,
+                .scroll_commit_receipt = input.scroll_plan.commit(0),
+                .committed_cursor_row = input.previous.cursor_row,
+                .committed_cursor_col = input.previous.cursor_col,
+                .committed_cursor_visible = input.previous.cursor_visible,
+                .shadow_state = .terminal_partial_write,
+                .next_invalidation = input.repaint_window.retryInvalidations(.partial_write),
+            };
         },
     }
     try repairAcceptedScroll(

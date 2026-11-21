@@ -1379,8 +1379,14 @@ const App = struct {
         }
         defer if (self.frame_writer_started) {
             self.shell.frame_writer = null;
-            _ = self.frame_writer_state.quiesce(100 * std.time.ns_per_ms);
-            self.frame_writer_state.deinit();
+            if (self.frame_writer_state.quiesce(100 * std.time.ns_per_ms)) {
+                self.frame_writer_state.deinit();
+            } else {
+                // A console write that never finishes cannot be joined: the
+                // interactive path exits the process immediately afterwards,
+                // so the OS reclaims the worker and the console handle.
+                self.frame_writer_state.detach();
+            }
             self.frame_writer_started = false;
         };
         const callbacks = RenderAppRuntime.eventLoopCallbacks(self);
