@@ -2042,17 +2042,7 @@ pub fn bytesWaiting(fd: std.posix.fd_t) !usize {
     if (isConsoleHandle(fd)) {
         var count: u32 = 0;
         if (windows_console_input.GetNumberOfConsoleInputEvents(fd, &count) == 0) return 0;
-        if (count == 0) return 0;
-        // The record count includes window, focus, and menu records, which a
-        // byte-stream read filters out and never returns. Report a byte only
-        // when a record the read can deliver is pending, or a probe that acts
-        // on this count would block on a read that waits for a keypress.
-        var records: [windows_console_record_batch]WindowsConsoleRecord = undefined;
-        var read: u32 = 0;
-        if (windows_console_input.PeekConsoleInputW(fd, &records, records.len, &read) == 0 or read == 0) {
-            return @intCast(count);
-        }
-        return if (consoleRecordsIndicateKey(records[0..read])) 1 else 0;
+        return @intCast(count);
     }
     var available: u32 = 0;
     if (windows_console_input.PeekNamedPipe(fd, null, 0, null, &available, null) == 0) return 0;
@@ -2061,12 +2051,6 @@ pub fn bytesWaiting(fd: std.posix.fd_t) !usize {
 
 const windows_console_input = if (builtin.target.os.tag != .windows) struct {} else struct {
     extern "kernel32" fn GetNumberOfConsoleInputEvents(handle: std.os.windows.HANDLE, count: *u32) callconv(.winapi) i32;
-    extern "kernel32" fn PeekConsoleInputW(
-        console_input: std.os.windows.HANDLE,
-        records: [*]WindowsConsoleRecord,
-        length: u32,
-        read: *u32,
-    ) callconv(.winapi) i32;
     extern "kernel32" fn PeekNamedPipe(
         pipe: std.os.windows.HANDLE,
         buffer: ?*anyopaque,
@@ -2076,113 +2060,6 @@ const windows_console_input = if (builtin.target.os.tag != .windows) struct {} e
         bytes_left: ?*u32,
     ) callconv(.winapi) i32;
 };
-
-/// A console input record, laid out as `INPUT_RECORD` from `consoleapi.h`.
-/// The event union is 16 bytes on every record type, keyed by `event_type`.
-pub const WindowsConsoleRecord = extern struct {
-    event_type: u32,
-    event: WindowsRecordEvent,
-
-    /// `KEY_EVENT`, the only record whose bytes a `ReadConsoleA` delivers.
-    pub const key_event: u32 = 0x0001;
-};
-
-const WindowsRecordEvent = extern union {
-    key: WindowsKeyEventRecord,
-    /// Every event union member fits here, so a caller can read any record
-    /// without caring which one it is.
-    raw: [16]u8,
-};
-
-pub const WindowsKeyEventRecord = extern struct {
-    key_down: i32 = 0,
-    repeat_count: u16 = 0,
-    virtual_key_code: u16 = 0,
-    virtual_scan_code: u16 = 0,
-    unicode_char: u16 = 0,
-    control_key_state: u32 = 0,
-};
-
-/// How many records one probe peeks. A burst of resize records from a window
-/// drag can exceed this; the batch is then sampled, which is enough, because
-/// a drag always also carries real keys once the user touches the keyboard,
-/// and a sample of 64 covers every pending non-key record in practice.
-const windows_console_record_batch: u32 = 64;
-
-/// Whether any record in the batch is one a byte-stream console read will
-/// actually deliver. `ReadConsoleA` and `ReadFile` consume only key records
-/// that produce characters and silently skip the rest, so a buffer holding
-/// resize, focus, or menu records alone yields no bytes and a read that waits
-/// on it blocks until the next keypress. A key-down record for a bare
-/// modifier key is also skipped: the virtual terminal input translation
-/// turns it into no bytes.
-pub fn consoleRecordsIndicateKey(records: []const WindowsConsoleRecord) bool {
-    for (records) |record| {
-        if (record.event_type != WindowsConsoleRecord.key_event) continue;
-        const key = record.event.key;
-        if (key.key_down == 0) continue;
-        switch (key.virtual_key_code) {
-            0x10, // VK_SHIFT
-            0x11, // VK_CONTROL
-            0x12, // VK_MENU
-            0x14, // VK_CAPITAL
-            0x5b,
-            0x5c, // VK_LWIN, VK_RWIN
-            0x5d, // VK_APPS
-            0x90,
-            0x91, // VK_NUMLOCK, VK_SCROLL
-            => continue,
-            else => {},
-        }
-        return true;
-    }
-    return false;
-}
-
-/// Whether `fd`'s console input buffer holds a record a byte-stream read can
-/// deliver right now, without consuming anything. False when the buffer holds
-/// only records a read would skip, which is what keeps a probe from sending
-/// the caller into a read that waits for a keypress.
-pub fn consoleKeysPending(fd: std.posix.fd_t) bool {
-    if (comptime builtin.target.os.tag != .windows) return false;
-    var records: [windows_console_record_batch]WindowsConsoleRecord = undefined;
-    var read: u32 = 0;
-    if (windows_console_input.PeekConsoleInputW(fd, &records, records.len, &read) == 0) return true;
-    if (read == 0) return false;
-    return consoleRecordsIndicateKey(records[0..read]);
-}
-
-test "console record gating waits only for records a read delivers" {
-    const zero_event: [16]u8 = @splat(0);
-    const key_down = WindowsConsoleRecord{
-        .event_type = WindowsConsoleRecord.key_event,
-        .event = .{ .key = .{ .key_down = 1, .virtual_key_code = 'A' } },
-    };
-    const key_up = WindowsConsoleRecord{
-        .event_type = WindowsConsoleRecord.key_event,
-        .event = .{ .key = .{ .key_down = 0, .virtual_key_code = 'A' } },
-    };
-    const modifier = WindowsConsoleRecord{
-        .event_type = WindowsConsoleRecord.key_event,
-        .event = .{ .key = .{ .key_down = 1, .virtual_key_code = 0x10 } },
-    };
-    const window_resize = WindowsConsoleRecord{
-        .event_type = 0x0010, // WINDOW_BUFFER_SIZE_EVENT
-        .event = .{ .raw = zero_event },
-    };
-    const focus = WindowsConsoleRecord{
-        .event_type = 0x0010 + 1, // FOCUS_EVENT
-        .event = .{ .raw = zero_event },
-    };
-
-    try std.testing.expect(consoleRecordsIndicateKey(&.{key_down}));
-    try std.testing.expect(consoleRecordsIndicateKey(&.{ window_resize, focus, key_down }));
-    try std.testing.expect(!consoleRecordsIndicateKey(&.{window_resize}));
-    try std.testing.expect(!consoleRecordsIndicateKey(&.{ focus, window_resize }));
-    try std.testing.expect(!consoleRecordsIndicateKey(&.{key_up}));
-    try std.testing.expect(!consoleRecordsIndicateKey(&.{ modifier, window_resize }));
-    try std.testing.expect(!consoleRecordsIndicateKey(&.{}));
-}
 
 pub fn isConsoleHandle(fd: std.posix.fd_t) bool {
     if (comptime builtin.target.os.tag != .windows) return false;

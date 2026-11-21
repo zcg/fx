@@ -1045,6 +1045,20 @@ pub fn Runtime(comptime App: type) type {
         const frame_stall_report_ms: i64 = 3000;
 
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
+            // A stalled Windows console writer keeps its completion here. Once
+            // it drains, the visible terminal is unknown: force a full repaint
+            // from current state rather than replaying the abandoned bytes.
+            if (comptime @hasField(App, "frame_writer_started")) {
+                if (app.frame_writer_started) {
+                    if (app.frame_writer_state.takeCompletion()) |done| {
+                        debug_trace.logf("frame_writer", "recovery sequence={d}", .{done.sequence});
+                        try app.shell.requestTerminalReset(&app.metrics);
+                        activeRenderRequests(app).stall_logged = false;
+                        return;
+                    }
+                    if (app.frame_writer_state.isBusy()) return;
+                }
+            }
             const render_requests = activeRenderRequests(app);
             if (render_requests.hasPending() and render_requests.last_commit_ms > 0) {
                 const stalled_ms = io_mod.milliTimestamp() - render_requests.last_commit_ms;

@@ -188,6 +188,7 @@ const paste_framing = @import("core/input/paste_framing.zig");
 const registered_entities = @import("core/input/registered_entities.zig");
 const ui_render = @import("ui/render.zig");
 const shell_runtime = @import("ui/shell_runtime.zig");
+const frame_writer = @import("ui/frame_writer.zig");
 const resize_runtime = @import("ui/resize_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
@@ -610,6 +611,11 @@ const App = struct {
 
     alloc: Allocator,
     terminal: TerminalState = .{},
+    /// Windows console frame writer. Owned here so its worker thread outlives
+    /// every frame sink pointer and is joined before the allocator is freed.
+    frame_writer_ctx: frame_writer.ConsoleCtx = .{ .fd = undefined },
+    frame_writer_state: frame_writer.FrameWriter = undefined,
+    frame_writer_started: bool = false,
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
         app_api_key_validator,
@@ -1362,6 +1368,21 @@ const App = struct {
     }
 
     pub fn run(self: *App) !void {
+        if (comptime frame_writer.enabled) {
+            if (io_mod.isConsoleHandle(self.shell.stdout_file.handle)) {
+                self.frame_writer_ctx = .{ .fd = self.shell.stdout_file.handle };
+                self.frame_writer_state = frame_writer.consoleWriter(self.alloc, &self.frame_writer_ctx);
+                try self.frame_writer_state.start();
+                self.frame_writer_started = true;
+                self.shell.frame_writer = &self.frame_writer_state;
+            }
+        }
+        defer if (self.frame_writer_started) {
+            self.shell.frame_writer = null;
+            _ = self.frame_writer_state.quiesce(100 * std.time.ns_per_ms);
+            self.frame_writer_state.deinit();
+            self.frame_writer_started = false;
+        };
         const callbacks = RenderAppRuntime.eventLoopCallbacks(self);
         while (true) {
             const exit_cause = try event_loop.run(

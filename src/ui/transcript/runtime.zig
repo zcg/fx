@@ -7,6 +7,7 @@ const managed_execution = @import("../../core/execution/managed_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const frame_writer = @import("../frame_writer.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
@@ -4772,6 +4773,7 @@ const transcript_screen_fields = [_][:0]const u8{
     "resize_history_row_delta",
     "pending_resize_observation",
     "resize_refusals",
+    "frame_writer",
     "viewport_clear_pending",
     "terminal_reset_pending",
     "render_requests",
@@ -4896,6 +4898,10 @@ pub const TranscriptRuntime = struct {
     /// Pre-paint cursor evidence retained from live geometry through the
     /// matching canonical reset commit.
     pending_resize_observation: ?ResizeObservation = null,
+    /// Optional Windows console writer. The App owns the writer and its
+    /// context; the frame sink only borrows the pointer. Every other platform
+    /// and every test shell leaves this null and keeps the synchronous write.
+    frame_writer: ?*frame_writer.FrameWriter = null,
     /// How many frames in a row a frame gate has refused. A resize being
     /// applied, a scrollback handoff mid-push, or an invalid layout refuses
     /// one or two; a count that keeps climbing means nothing is going to
@@ -11665,13 +11671,14 @@ pub const TranscriptRuntime = struct {
         self: *TranscriptRuntime,
         metrics: *Metrics,
     ) void {
-        switch (transcript_io.writeFrameBytes(self, metrics, "\x07")) {
+        switch (transcript_io.writeFrameBytesDirect(self, metrics, "\x07")) {
             .complete => {},
             .partial => |partial| debug_trace.logf(
                 "notifications",
                 "terminal bell write failed accepted_bytes={d} err={s}",
                 .{ partial.accepted_bytes, @errorName(partial.err) },
             ),
+            .stalled => unreachable, // direct writes never use the frame writer
         }
     }
 
@@ -11681,13 +11688,14 @@ pub const TranscriptRuntime = struct {
         metrics: *Metrics,
         report: []const u8,
     ) void {
-        switch (transcript_io.writeFrameBytes(self, metrics, report)) {
+        switch (transcript_io.writeFrameBytesDirect(self, metrics, report)) {
             .complete => {},
             .partial => |partial| debug_trace.logf(
                 "program_status",
                 "report write failed accepted_bytes={d} err={s}",
                 .{ partial.accepted_bytes, @errorName(partial.err) },
             ),
+            .stalled => unreachable, // direct writes never use the frame writer
         }
     }
 

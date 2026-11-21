@@ -181,12 +181,14 @@ fn windowsPoll(watches: []Watch, timeout: Timeout) error{Unsupported}!usize {
 fn windowsProbe(fd: std.posix.fd_t) error{Unsupported}!Events {
     var event_count: u32 = 0;
     if (windows_console.GetNumberOfConsoleInputEvents(fd, &event_count) != 0) {
-        // The record count includes window, focus, and menu records, which a
-        // byte-stream read filters out and never returns: trusting the count
-        // would report readable on a lone resize record and block the caller
-        // in a read until the next keypress. Only a deliverable key counts.
-        if (event_count == 0) return .{};
-        return .{ .readable = io_mod.consoleKeysPending(fd) };
+        // Count-based readiness. We deliberately do not pre-filter records
+        // here: under ENABLE_VIRTUAL_TERMINAL_INPUT the console turns many key
+        // combinations into bytes whose input records do not map one-to-one,
+        // and filtering them made ordinary keys (arrows, Ctrl+C) unreadable.
+        // The original stall came from ENABLE_WINDOW_INPUT records, which the
+        // raw-mode setup no longer enables at all, so there is nothing left
+        // for a filter to guard against.
+        return .{ .readable = event_count > 0 };
     }
 
     // A signaled pipe handle does not prove bytes are waiting. Peek without

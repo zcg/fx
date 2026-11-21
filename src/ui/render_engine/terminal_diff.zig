@@ -69,6 +69,16 @@ pub const FrameSinkWriteResult = union(enum) {
         /// as `transcript/io.zig` writeFrameBytes does.
         err: anyerror,
     },
+    /// A Windows console write is still in flight. The frame must not be
+    /// committed or fed to the shadow terminal; the writer's completion will
+    /// trigger a full repaint from current state once the terminal drains.
+    stalled: u64,
+};
+
+pub const FrameSinkWriteResultOps = struct {
+    pub fn isCommitted(result: FrameSinkWriteResult) bool {
+        return result == .complete;
+    }
 };
 
 pub const FrameSink = struct {
@@ -543,6 +553,24 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     );
     switch (sink_result) {
         .complete => {},
+        .stalled => |sequence| {
+            debug_trace.logf(
+                "frame_commit",
+                "wire_frame bytes={d} writer_stalled sequence={d} shadow_unchanged=true",
+                .{ wire_frame_bytes.len, sequence },
+            );
+            return .{
+                .bytes_written = 0,
+                .changed_cells = changed_cells,
+                .full_repaint = full_repaint,
+                .scroll_commit_receipt = input.scroll_plan.commit(0),
+                .committed_cursor_row = input.previous.cursor_row,
+                .committed_cursor_col = input.previous.cursor_col,
+                .committed_cursor_visible = input.previous.cursor_visible,
+                .shadow_state = .terminal_partial_write,
+                .next_invalidation = paint_plan.FrameInvalidationSet.empty(),
+            };
+        },
         .partial => |partial| {
             debug_trace.logf(
                 "frame_commit",
@@ -840,6 +868,12 @@ fn recoverPartialFrame(
             }
             return error.TerminalSyncRecoveryFailed;
         },
+        .stalled => {
+            // The writer is blocked; cleanup cannot be written now either.
+            // Leave the shadow untouched and let the recovery repaint handle
+            // the terminal once the writer drains.
+            return error.TerminalSyncRecoveryFailed;
+        },
     }
     try repairAcceptedScroll(
         input.surface.alloc,
@@ -929,6 +963,7 @@ fn acceptedBytesForSinkResult(bytes: []const u8, result: FrameSinkWriteResult) !
             partial.accepted_bytes
         else
             error.InvalidFrameSinkProgress,
+        .stalled => 0,
     };
 }
 

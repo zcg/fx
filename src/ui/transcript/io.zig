@@ -40,6 +40,19 @@ pub fn disableShadowVt(shell: anytype) void {
     }
 }
 
+/// Writes a small out-of-band sequence (bell, program status) without going
+/// through the frame writer. These bytes must not queue behind a stalled frame
+/// and must not appear as a frame commit result.
+pub fn writeFrameBytesDirect(shell: anytype, metrics: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
+    if (comptime builtin.target.os.tag == .windows) {
+        io_mod.writeFd(shell.stdout_file.handle, bytes) catch |err| {
+            return recordPartialFrame(metrics, &.{}, err);
+        };
+        return recordCompleteFrame(metrics, bytes);
+    }
+    return writeFrameBytes(shell, metrics, bytes);
+}
+
 /// Writes `bytes` to the terminal. A write that fails because the terminal
 /// hung up reports `error.TerminalHungUp` (`terminalHungUp`), so the frame
 /// commit can close fx as a hang-up; every other failure reports its own
@@ -52,6 +65,24 @@ pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) ter
     // path only for a handle that is not one, so this goes through it on every
     // platform and the loop below never runs on Windows.
     if (comptime builtin.target.os.tag == .windows) {
+        if (comptime @hasField(@TypeOf(shell.*), "frame_writer")) {
+            if (shell.frame_writer) |*writer| {
+                const result = writer.*.submit(bytes, 4 * std.time.ns_per_ms) catch |err| {
+                    return recordPartialFrame(metrics, &.{}, err);
+                };
+                return switch (result) {
+                    .done => |outcome| switch (outcome) {
+                        .complete => |count| recordCompleteFrame(metrics, bytes[0..count]),
+                        .partial => |partial| recordPartialFrame(
+                            metrics,
+                            bytes[0..@min(partial.accepted_bytes, bytes.len)],
+                            partial.err,
+                        ),
+                    },
+                    .stalled => |sequence| .{ .stalled = sequence },
+                };
+            }
+        }
         io_mod.writeFd(shell.stdout_file.handle, bytes) catch |err| {
             return recordPartialFrame(metrics, &.{}, err);
         };
