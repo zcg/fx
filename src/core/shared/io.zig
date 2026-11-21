@@ -571,6 +571,10 @@ pub fn windowsEnvironFromPeb(alloc: std.mem.Allocator) ?[*:null]const ?[*:0]cons
         const len = std.mem.len(@as([*:0]const u16, block + offset));
         const wide = block[offset .. offset + len];
         offset += len + 1;
+        // A per-drive current directory is stored as `=C:=C:\dir`. It has no
+        // name a child could inherit, and its leading `=` would reach the
+        // environment map as an empty key, so it is left out here.
+        if (wide.len == 0 or wide[0] == '=') continue;
         const utf8 = std.unicode.utf16LeToUtf8AllocZ(alloc, wide) catch continue;
         strings.append(alloc, utf8.ptr) catch continue;
     }
@@ -763,8 +767,23 @@ fn mapFromRaw(alloc: std.mem.Allocator, raw: RawEnviron) CloneEnvironMapError!st
     const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
     var map = std.process.Environ.Map.init(alloc);
     errdefer map.deinit();
-    try map.putPosixBlock(.{ .slice = entries });
+    // Windows keeps a per-drive current directory in the environment block as
+    // `=C:=C:\dir`. Its first character is the separator, so the POSIX block
+    // reader would hand `put` an empty key and trip its assert. Those entries
+    // are not variables a child should inherit by name, so they are skipped.
+    try putEntries(&map, entries);
     return map;
+}
+
+fn putEntries(map: *std.process.Environ.Map, entries: []const [*:0]const u8) std.mem.Allocator.Error!void {
+    for (entries) |entry| {
+        var key_end: usize = 0;
+        while (entry[key_end] != 0 and entry[key_end] != '=') : (key_end += 1) {}
+        if (key_end == 0 or entry[key_end] == 0) continue;
+        var value_end = key_end + 1;
+        while (entry[value_end] != 0) : (value_end += 1) {}
+        map.put(entry[0..key_end], entry[key_end + 1 .. value_end]) catch |err| return err;
+    }
 }
 
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
