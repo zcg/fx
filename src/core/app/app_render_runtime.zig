@@ -82,7 +82,6 @@ fn set_transcript_assistant_tail_writable(
 pub const VisualEpochResetTrigger = enum {
     native_clear_probe,
     ctrl_l,
-    redraw_command,
 };
 
 const FrameAttemptResult = struct {
@@ -465,9 +464,9 @@ pub fn Runtime(comptime App: type) type {
                         "native_clear_recovery_skipped reason=history_uncommitted",
                         .{},
                     ),
-                    .ctrl_l, .redraw_command => debug_trace.logf(
+                    .ctrl_l => debug_trace.logf(
                         "render",
-                        "visual_epoch_reset_skipped reason=history_uncommitted",
+                        "visual_epoch_reset_skipped trigger=ctrl_l reason=history_uncommitted",
                         .{},
                     ),
                 }
@@ -485,11 +484,6 @@ pub fn Runtime(comptime App: type) type {
                 .ctrl_l => debug_trace.logf(
                     "render",
                     "visual_epoch_reset_requested trigger=ctrl_l",
-                    .{},
-                ),
-                .redraw_command => debug_trace.logf(
-                    "render",
-                    "visual_epoch_reset_requested trigger=redraw_command",
                     .{},
                 ),
             }

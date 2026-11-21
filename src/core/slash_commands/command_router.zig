@@ -7,7 +7,6 @@ const SlashRegistry = command_specs.SlashRegistry;
 pub const ParsedCommand = union(enum) {
     quit,
     clear_screen,
-    redraw_screen,
     new_session,
     launch_instance: []const u8,
     close_instance,
@@ -53,7 +52,6 @@ pub const CommandHandlers = struct {
     ctx: *anyopaque,
     quit: *const fn (ctx: *anyopaque) anyerror!void,
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
-    redraw_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     launch_instance: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     close_instance: *const fn (ctx: *anyopaque) anyerror!void,
@@ -105,7 +103,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
     return switch (kind) {
         .quit => .quit,
         .clear_screen => .clear_screen,
-        .redraw_screen => .redraw_screen,
         .new_session => .new_session,
         .launch_instance => .{ .launch_instance = payload },
         .close_instance => .close_instance,
@@ -173,7 +170,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
     switch (parse(registry, cmd)) {
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
-        .redraw_screen => try handlers.redraw_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
         .launch_instance => |rest| try handlers.launch_instance(handlers.ctx, rest),
         .close_instance => try handlers.close_instance(handlers.ctx),
@@ -270,11 +266,6 @@ test "parse distinguishes new and reset lifecycle commands" {
     try std.testing.expectEqual(ParsedCommand.reset_session, parse(testSlashRegistry(), "/reset"));
 }
 
-test "parse routes the redraw command without a payload" {
-    try std.testing.expectEqual(ParsedCommand.redraw_screen, parse(testSlashRegistry(), "/redraw"));
-    try std.testing.expectEqual(ParsedCommand.redraw_screen, parse(testSlashRegistry(), "/redraw "));
-}
-
 test "parse recognizes interactive resume" {
     try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
 }
@@ -292,6 +283,8 @@ test "parse recognizes logout" {
 }
 
 test "parse rejects removed slash commands" {
+    // `/redraw` was added and removed in the same release window.
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/redraw"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/pr ready for review"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/issue flaky test"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/changes"));
@@ -525,7 +518,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .ctx = ctx,
         .quit = unexpectedNoPayload,
         .clear_screen = unexpectedNoPayload,
-        .redraw_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
         .launch_instance = unexpectedPayload,
         .close_instance = unexpectedNoPayload,
