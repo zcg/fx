@@ -27,7 +27,9 @@ done
 # shellcheck source=../../lib/tlc.sh
 . "$here/../../lib/tlc.sh"
 tlc_find
+# shellcheck disable=SC2154 # tlc_find assigns this
 java=$tlc_java
+# shellcheck disable=SC2154 # tlc_find assigns this
 jar=$tlc_jar
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/session-manager-trace.XXXXXX")

@@ -178,23 +178,22 @@ done
 # config, and each witness breaks RunsOnOwner: NoNames is routing without
 # names, as before them, and NoOwnerCheck a worker that runs any session it
 # is handed.
-for config in send; do
-    echo "== AgentRouting ($config)"
-    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
-        -metadir "$work/agents-$config" -dump dot,actionlabels "graphs/agents-$config" \
-        -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
-        cat "$work/agents-$config.log"; status=1; continue
-    fi
+config=send
+echo "== AgentRouting ($config)"
+if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+    -metadir "$work/agents-$config" -dump dot,actionlabels "graphs/agents-$config" \
+    -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
+    cat "$work/agents-$config.log"; status=1
+else
     grep -E 'distinct states|depth of' "$work/agents-$config.log"
-done
-for config in drains-send; do
-    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/agents-$config" \
-        -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
-        echo "== AgentRouting ($config): Drains holds"
-    else
-        cat "$work/agents-$config.log"; status=1
-    fi
-done
+fi
+config=drains-send
+if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/agents-$config" \
+    -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
+    echo "== AgentRouting ($config): Drains holds"
+else
+    cat "$work/agents-$config.log"; status=1
+fi
 if "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -simulate num=20000 -depth 50 -deadlock -workers auto -cleanup \
     -metadir "$work/agents-sim" -config AgentRouting-sim.cfg AgentRouting.tla > "$work/agents-sim.log" 2>&1; then
     echo "== AgentRouting (simulation): $(grep -E 'states checked' "$work/agents-sim.log" | tail -1)"

@@ -59,7 +59,15 @@ const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1
 // The composer and the image preview read clicks only. Motion costs a report
 // per pointer cell and, if the process dies with the mode still on, leaves the
 // shell printing those reports as text, so the session never asks for it.
-const session_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
+//
+// It also takes the left button away from the terminal: while a process holds
+// `?1000h`, dragging with the button down goes to the process instead of
+// starting the terminal's own selection, and this session has no selection UI
+// of its own to replace it. The only clicks inline mode acts on are inside the
+// composer, which the terminal reports as ordinary keystrokes once the pointer
+// is over it anyway, so the reports are not worth the lost drag-select.
+const session_mouse_tracking_enter = "";
+const session_mouse_tracking_exit = "";
 
 /// Original handlers, written at bootstrap and restored at shutdown.
 /// Signal context never mutates them.
@@ -1823,6 +1831,11 @@ pub fn setSessionMouseTracking(
     metrics: *Metrics,
     enabled: bool,
 ) void {
+    // Inline mode no longer takes the pointer, so there is nothing to enter or
+    // leave. The switch stays so callers keep one shape and so a future owner
+    // can turn it back on from one place.
+    _ = .{ terminal, shell, metrics, enabled };
+    if (comptime session_mouse_tracking_enter.len == 0) return;
     if (terminal.session_mouse_tracking == enabled) return;
     if (terminal.alternate_screen_owner != .none) return;
     if (enabled) {

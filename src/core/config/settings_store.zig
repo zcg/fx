@@ -474,8 +474,8 @@ pub const Store = struct {
             }
         }
         var tightened_home = false;
-        if (mode == .read_only and tighten and durableModeWritableByGroupOrOther(durable_mode)) {
-            io_mod.setPermissions(durable_home, io_mod.permissionsForMode(withoutGroupOrOtherWrite(durable_mode))) catch {
+        if (mode == .read_only and tighten and durableModeWritableByGroupOrOther(@intCast(durable_mode))) {
+            io_mod.setPermissions(durable_home, io_mod.permissionsForMode(withoutGroupOrOtherWrite(@intCast(durable_mode)))) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
             durable_mode = if (comptime io_mod.modeIsEnforced) (try durable_home.stat(zio)).permissions.toMode() & 0o777 else 0;
