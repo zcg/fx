@@ -211,7 +211,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
         build_options.git_commit,
     );
     return alloc.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}𝒇x{s}{s} {s} · Run /help for commands · ctrl+l redraws" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
 }
@@ -952,7 +952,7 @@ test "welcomeMessage keeps only the app name bright" {
         build_options.git_commit,
     );
     const expected = try std.testing.allocator.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}𝒇x{s}{s} {s} · Run /help for commands · ctrl+l redraws" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
     defer std.testing.allocator.free(expected);

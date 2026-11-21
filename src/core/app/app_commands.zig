@@ -4,6 +4,7 @@ const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_render_runtime = @import("app_render_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -282,6 +283,7 @@ pub fn Handlers(comptime App: type) type {
                 .ctx = @ptrCast(app),
                 .quit = commandQuit,
                 .clear_screen = commandClearScreen,
+                .redraw_screen = commandRedrawScreen,
                 .new_session = commandNewSession,
                 .launch_instance = commandLaunchInstance,
                 .close_instance = commandCloseInstance,
@@ -430,6 +432,19 @@ pub fn Handlers(comptime App: type) type {
         fn commandClearScreen(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try clearSessionForClearCommand(app);
+        }
+
+        /// `/redraw` repaints the whole screen through the same visual-epoch
+        /// reset Ctrl+L runs, so a screen a resize or a damaged frame left
+        /// wrong recovers without giving up the session.
+        fn commandRedrawScreen(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (try app_render_runtime.Runtime(App).resetVisualEpoch(app, .redraw_command)) return;
+            try app.writeDomainNotice(.{
+                .topic = "render",
+                .tone = .warning,
+                .body = "The screen was not redrawn: the previous turn is still being saved. Try /redraw again in a moment.",
+            }, true);
         }
 
         fn commandResetSession(ctx: *anyopaque) !void {
