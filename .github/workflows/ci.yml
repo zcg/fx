@@ -36,8 +36,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - optimize: ReleaseSafe
-            test_timeout_seconds: 1500
+          # Debug keeps the whole gate inside a free runner's budget. The
+          # ReleaseSafe build of the same code runs in the release workflow,
+          # where a candidate binary is actually shipped.
+          - optimize: Debug
+            test_timeout_seconds: 2400
     steps:
       - uses: actions/checkout@v4
 
@@ -163,13 +166,13 @@ jobs:
         uses: ./.github/actions/setup-zig
         with:
           version: "0.17.1"
-          cache-key: ci-windows-ReleaseSafe
+          cache-key: ci-windows-Debug
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=Debug
 
       - name: Test
-        run: zig build test -Doptimize=ReleaseSafe -Dwindows-tests
+        run: zig build test -Doptimize=Debug -Dwindows-tests
 
       - name: Smoke test fresh binary
         shell: bash
@@ -197,7 +200,7 @@ jobs:
           jq -e 'length == 11 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
-    name: Build fx (ReleaseSafe)
+    name: Build fx (Debug)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -211,13 +214,13 @@ jobs:
         uses: ./.github/actions/setup-zig
         with:
           version: "0.17.1"
-          cache-key: ci-build-ReleaseSafe
+          cache-key: ci-build-Debug
 
       # Other runners execute this binary, and their CPUs can differ from this
       # one. A native build can emit instructions such as AVX-512 that those
       # runners lack, so target the baseline CPU like the release builds do.
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+        run: zig build -Doptimize=Debug -Dcpu=baseline
 
       - name: Smoke test fresh binary
         run: scripts/smoke-binary.sh zig-out/bin/fx
