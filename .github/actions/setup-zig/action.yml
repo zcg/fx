@@ -40,13 +40,20 @@ runs:
         PREFIX: zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ inputs.cache-key }}-
         BUILD_HASH: ${{ hashFiles('build.zig', 'build.zig.zon') }}
       run: |
-        # Compare resolved absolute paths, not string concatenations: on
-        # Windows the workspace uses backslashes while the concatenated
-        # expectation uses a forward slash, so a plain string compare would
-        # reject a correct cache path.
-        expected="$(cd "$GITHUB_WORKSPACE" && pwd -P)/.zig-cache"
+        # The two variables must name the same directory the cache steps save
+        # and restore. Git Bash on Windows reports paths as /d/a/... while the
+        # action exports D:\a\..., so both sides are normalised before the
+        # comparison instead of comparing two spellings of one path.
+        normalise() {
+          if command -v cygpath >/dev/null 2>&1; then
+            cygpath -u "$1"
+          else
+            printf '%s' "$1"
+          fi
+        }
+        expected="$(normalise "$GITHUB_WORKSPACE")/.zig-cache"
         for dir in "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"; do
-          actual="$(cd "$dir" 2>/dev/null && pwd -P || printf '%s' "$dir")"
+          actual="$(normalise "$dir")"
           if [ "$actual" != "$expected" ]; then
             printf '::error::Zig cache is %s, not %s; update the cache path.\n' "$actual" "$expected"
             exit 1

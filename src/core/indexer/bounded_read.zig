@@ -170,10 +170,21 @@ test "user reads follow a final symlink to a regular file and still refuse the r
     try std.testing.expect(try readUserAbsolute(alloc, linked_fifo, 16) == .unavailable);
 }
 
-/// POSIX only. A Windows build gets a failure, and the test that asks for a
-/// FIFO skips instead of the linker asking for a symbol that is not there.
 /// POSIX only. A Windows build gets a stub that reports failure, so the test
-/// that asks for a FIFO skips instead of asking the linker for the symbol.
-const posix_symbols = @import("../shared/posix_symbols.zig");
-
-const mkfifo = posix_symbols.mkfifo;
+/// that asks for a FIFO skips instead of asking the linker for a symbol that is
+/// not there.
+///
+/// Declared here rather than taken from `shared/posix_symbols.zig`: the indexer
+/// may import only the standard library, its own files, `io.zig` and
+/// `debug_trace.zig`, and the boundary check enforces that.
+const mkfifo = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
+    struct {
+        fn stub(path: [*:0]const u8, mode: std.c.mode_t) c_int {
+            _ = .{ path, mode };
+            return -1;
+        }
+    }.stub
+else
+    struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    }.mkfifo;
