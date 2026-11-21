@@ -2132,7 +2132,10 @@ fn executeRawBashWithResultCommand(
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
     if (builtin.target.os.tag == .windows) {
-        const argv = [_][]const u8{ "cmd", "/C", execution_command };
+        // `/D` skips AutoRun registry commands and `/Q` keeps cmd's own
+        // banner out of the result. Both are what the user shell resolver
+        // already uses for the normal, non-legacy path.
+        const argv = [_][]const u8{ "cmd", "/D", "/Q", "/C", execution_command };
         const result = try executeProcess(scratch, cfg, &argv, cwd);
         return formatCollectedOutput(alloc, result_command, cwd, result);
     }

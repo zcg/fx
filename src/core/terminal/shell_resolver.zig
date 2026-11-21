@@ -21,18 +21,22 @@ pub const ShellKind = enum { bash, zsh, pwsh, powershell, cmd };
 
 pub fn shellKind(path: []const u8) ?ShellKind {
     const basename = std.Io.Dir.path.basename(path);
+    // Windows paths are case-insensitive: C:\Tools\Pwsh.EXE is pwsh too.
+    if (comptime builtin.target.os.tag == .windows) {
+        if (std.ascii.eqlIgnoreCase(basename, "bash")) return .bash;
+        if (std.ascii.eqlIgnoreCase(basename, "bash.exe")) return .bash;
+        if (std.ascii.eqlIgnoreCase(basename, "zsh")) return .zsh;
+        if (std.ascii.eqlIgnoreCase(basename, "pwsh")) return .pwsh;
+        if (std.ascii.eqlIgnoreCase(basename, "pwsh.exe")) return .pwsh;
+        if (std.ascii.eqlIgnoreCase(basename, "powershell")) return .powershell;
+        if (std.ascii.eqlIgnoreCase(basename, "powershell.exe")) return .powershell;
+        if (std.ascii.eqlIgnoreCase(basename, "cmd")) return .cmd;
+        if (std.ascii.eqlIgnoreCase(basename, "cmd.exe")) return .cmd;
+        return null;
+    }
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "bash.exe")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
-    // Windows has no POSIX shell; the ones it does have are named here so a
-    // configured shell resolves instead of falling back to a path that does
-    // not exist on the platform.
-    if (std.mem.eql(u8, basename, "pwsh")) return .pwsh;
-    if (std.mem.eql(u8, basename, "pwsh.exe")) return .pwsh;
-    if (std.mem.eql(u8, basename, "powershell")) return .powershell;
-    if (std.mem.eql(u8, basename, "powershell.exe")) return .powershell;
-    if (std.mem.eql(u8, basename, "cmd")) return .cmd;
-    if (std.mem.eql(u8, basename, "cmd.exe")) return .cmd;
     return null;
 }
 
