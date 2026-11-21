@@ -5185,6 +5185,9 @@ fn windowsProcessIsAlive(pid: u32) bool {
 }
 
 fn posixProcessIsAlive(pid: u32) bool {
+    // A WASM build has no processes at all, so there is never a live one to
+    // report. `std.posix.kill` does not exist there.
+    if (comptime builtin.target.cpu.arch.isWasm()) return false;
     // Signal 0 asks whether the process exists without delivering anything.
     std.posix.kill(@intCast(pid), @fromBackingInt(@intCast(0))) catch |err| return err != error.ProcessNotFound;
     return true;

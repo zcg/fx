@@ -1454,7 +1454,9 @@ fn existingFilePermissions(path: []const u8) ?std.Io.File.Permissions {
 /// must not claim a restriction it did not apply; `privateStateIsRestricted`
 /// reports the difference to callers that verify it.
 pub inline fn permissionsForMode(mode: u32) std.Io.File.Permissions {
-    if (comptime modeIsEnforced) return std.Io.File.Permissions.fromMode(mode);
+    // `fromMode` takes the platform's own mode type: u16 on aarch64-macos,
+    // u32 elsewhere. Narrow it at this one border rather than at every caller.
+    if (comptime modeIsEnforced) return std.Io.File.Permissions.fromMode(@intCast(mode));
     return switch (mode & 0o040) {
         0 => .default_file,
         else => .default_dir,
