@@ -557,6 +557,7 @@ pub fn snapshotCaptureScript(
     const template = switch (kind) {
         .zsh => zsh_capture_script,
         .bash => bash_capture_script,
+        else => unreachable, // snapshot capture is POSIX-only by contract
     };
     return std.mem.replaceOwned(u8, alloc, template, "@NONCE@", nonce);
 }

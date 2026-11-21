@@ -638,7 +638,7 @@ fn cleanupCompletedForegroundTarget(
         foreground_target_cleanup_wait_ms)
     {
         try refreshForegroundTargetTree(descendants, target_pid);
-        cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+        cleanup.record(descendants.signalAttached(.kill, command_session));
         if (descendants.anyAttachedAlive(command_session)) {
             empty_scans = 0;
         } else {
@@ -648,7 +648,7 @@ fn cleanupCompletedForegroundTarget(
         io_mod.sleep(std.time.ns_per_ms);
     }
     try refreshForegroundTargetTree(descendants, target_pid);
-    cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+    cleanup.record(descendants.signalAttached(.kill, command_session));
     return cleanup;
 }
 
@@ -684,7 +684,7 @@ fn advanceForegroundTargetTermination(
         .begin_graceful => {
             termination_started_ms.* = now_ms;
             const count = descendants.signalOutsideProcessGroup(
-                std.posix.SIG.TERM,
+                .terminate,
                 @intCast(io_mod.currentProcessId()),
             );
             debug_trace.logf(
@@ -718,7 +718,7 @@ fn waitForForegroundTargetDescendants(
             forceKillForegroundTargetDescendants(descendants);
         }
         if (forced.*) {
-            _ = descendants.signalAll(std.posix.SIG.KILL);
+            _ = descendants.signalAll(.kill);
         }
         if (descendants.anyAlive()) {
             empty_scans = 0;
@@ -739,7 +739,7 @@ fn waitForForegroundTargetDescendants(
 fn forceKillForegroundTargetDescendants(
     descendants: *process_tree.Tracker,
 ) void {
-    const count = descendants.signalAll(std.posix.SIG.KILL);
+    const count = descendants.signalAll(.kill);
     debug_trace.logf(
         "core",
         "captured command force-killed tracked descendants count={d}",

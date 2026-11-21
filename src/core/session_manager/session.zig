@@ -5186,7 +5186,7 @@ fn windowsProcessIsAlive(pid: u32) bool {
 
 fn posixProcessIsAlive(pid: u32) bool {
     // Signal 0 asks whether the process exists without delivering anything.
-    std.posix.kill(@intCast(pid), 0) catch |err| return err != error.ProcessNotFound;
+    std.posix.kill(@intCast(pid), @fromBackingInt(@intCast(0))) catch |err| return err != error.ProcessNotFound;
     return true;
 }
 

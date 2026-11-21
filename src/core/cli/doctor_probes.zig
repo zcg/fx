@@ -345,7 +345,7 @@ fn killTree(pid: ChildPid) void {
     // stopped and did not kill, cannot let the child run again.
     killGroup(pid);
     if (!outside_group) return;
-    const outside = tree.signalOutsideProcessGroupChecked(.KILL, pid);
+    const outside = tree.signalOutsideProcessGroupChecked(.kill, pid);
     if (outside.incomplete) debug_trace.logf("doctor", "check {d}: some processes it started outside its group could not be killed", .{pid});
 }
 

@@ -255,14 +255,14 @@ fn signalProcess(
         error.ProcessNotFound => return error.ProcessNotFound,
         else => return error.ProcessIdentityUnavailable,
     };
-    if (tracker.signalAll(std.posix.SIG.TERM) == 0) {
+    if (tracker.signalAll(.terminate) == 0) {
         return error.ProcessNotFound;
     }
     const started_ms = io_mod.milliTimestamp();
     while (tracker.anyAlive() and io_mod.milliTimestamp() - started_ms < 250) {
         io_mod.sleep(25 * std.time.ns_per_ms);
     }
-    if (tracker.anyAlive()) _ = tracker.signalAll(std.posix.SIG.KILL);
+    if (tracker.anyAlive()) _ = tracker.signalAll(.kill);
 }
 
 test "native process provider delegates tree signaling to the neutral tracker" {

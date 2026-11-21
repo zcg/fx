@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("image_attachments.zig");
@@ -91,21 +92,25 @@ pub fn Commands(comptime App: type) type {
             // user action, and ending the session because the temporary folder
             // is unwritable or the clipboard is held would lose the draft.
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
-                switch (err) {
-                    // Nothing on the clipboard to attach. A terminal that sends
-                    // Ctrl+V as a plain key press still pastes its text right
-                    // after this, so a notice would only add noise.
-                    error.NoClipboardImage => return,
-                    // Another program held the clipboard past the retry budget.
-                    error.ClipboardBusy => return reportClipboardNotice(app, .neutral, "the clipboard is busy; try again"),
-                    else => {
-                        const line = app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)}) catch {
-                            return reportClipboardNotice(app, .@"error", "failed to paste clipboard image");
-                        };
-                        defer app.alloc.free(line);
-                        return reportClipboardNotice(app, .@"error", line);
-                    },
+                // ClipboardBusy exists only on Windows. Branching at comptime
+                // keeps that error out of other targets' error sets entirely.
+                if (comptime builtin.target.os.tag == .windows) {
+                    if (err == error.ClipboardBusy) {
+                        return reportClipboardNotice(app, .neutral, "the clipboard is busy; try again");
+                    }
                 }
+                // NoClipboardImage is produced only on Windows and macOS;
+                // Linux reports Unsupported. Keep that case out of targets
+                // whose error set does not contain it.
+                if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .macos) {
+                    if (err == error.NoClipboardImage) return;
+                }
+                if (err == error.Unsupported) return;
+                const line = app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)}) catch {
+                    return reportClipboardNotice(app, .@"error", "failed to paste clipboard image");
+                };
+                defer app.alloc.free(line);
+                return reportClipboardNotice(app, .@"error", line);
             };
             defer loaded.deinit(app.alloc);
             switch (insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary) catch |err| {

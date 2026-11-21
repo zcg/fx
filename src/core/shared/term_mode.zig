@@ -185,8 +185,8 @@ pub const VmIndex = enum { min, time };
 fn vmIndex(which: VmIndex) usize {
     if (comptime is_windows or is_wasi) return 0;
     return switch (which) {
-        .min => std.posix.V.MIN,
-        .time => std.posix.V.TIME,
+        .min => @backingInt(std.posix.V.MIN),
+        .time => @backingInt(std.posix.V.TIME),
     };
 }
 

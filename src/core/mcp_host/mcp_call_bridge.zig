@@ -244,7 +244,7 @@ fn acceptLoop() void {
             debug_trace.logf("mcp-call", "bridge accept loop ended err={s}", .{@errorName(err)});
             return;
         };
-        if (wait == .timeout) continue;
+        if (!wait.readable) continue;
         const stream = listener.accept(io) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept failed err={s}", .{@errorName(err)});
             continue;

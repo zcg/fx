@@ -2256,11 +2256,11 @@ pub fn setProcessEnv(name: []const u8, value: []const u8) error{ OutOfMemory, Un
     }
     if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
     const alloc = std.heap.c_allocator;
-    const name_z = alloc.dupeZ(u8, name) catch return error.OutOfMemory;
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return error.OutOfMemory;
     defer alloc.free(name_z);
-    const value_z = alloc.dupeZ(u8, value) catch return error.OutOfMemory;
+    const value_z = alloc.dupeSentinel(u8, value, 0) catch return error.OutOfMemory;
     defer alloc.free(value_z);
-    if (std.c.setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.Failed;
+    if (posix_env.setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.Failed;
 }
 
 /// Removes an environment variable from the current process.
@@ -2274,7 +2274,7 @@ pub fn unsetProcessEnv(name: []const u8) error{ OutOfMemory, Unsupported, Failed
     }
     if (comptime builtin.target.os.tag == .wasi) return error.Unsupported;
     const alloc = std.heap.c_allocator;
-    const name_z = alloc.dupeZ(u8, name) catch return error.OutOfMemory;
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return error.OutOfMemory;
     defer alloc.free(name_z);
     if (posix_env.unsetenv(name_z.ptr) != 0) return error.Failed;
 }
@@ -2284,6 +2284,7 @@ const windows_env = if (builtin.target.os.tag != .windows) struct {} else struct
 };
 
 const posix_env = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) struct {} else struct {
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 };
 
@@ -2800,7 +2801,7 @@ pub fn openedFilePathAlloc(alloc: std.mem.Allocator, file: std.Io.File) ![]u8 {
     // Windows leaves nlink at zero for handles opened without backup intent,
     // which is the ordinary case. It is "not reported", not "deleted": let
     // handlePathAlloc decide whether the handle has usable path evidence.
-    if (stat.kind != .file or (comptime builtin.target.os.tag != .windows and stat.nlink == 0)) return error.HandlePathUnavailable;
+    if (stat.kind != .file or (builtin.target.os.tag != .windows and stat.nlink == 0)) return error.HandlePathUnavailable;
     const path = try handlePathAlloc(alloc, file.handle);
     errdefer alloc.free(path);
     if (!std.Io.Dir.path.isAbsolute(path)) return error.HandlePathUnavailable;
